@@ -1,0 +1,7 @@
+# Tests are a dev-only artifact (need extra deps: torch, tensorflow, the
+# upstream hexagdly package, conftest.py for sys.path setup). setuptools'
+# default sdist heuristic sweeps up top-level test_*.py files but not their
+# shared, non-test_-prefixed helper module (tests/_hex_reference.py), which
+# would leave a source download with broken tests. Exclude the whole
+# directory instead of half-including it -- clone the repo to run tests.
+prune tests

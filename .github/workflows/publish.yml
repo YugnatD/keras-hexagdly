@@ -1,0 +1,45 @@
+name: Publish to PyPI
+
+# Triggered by pushing a tag like v0.1.0. Uses PyPI Trusted Publishing (OIDC):
+# no API token is stored anywhere -- PyPI verifies this workflow's identity
+# directly. See https://docs.pypi.org/trusted-publishers/ to register it
+# (one-time setup on pypi.org, no code change needed here).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build sdist and wheel
+        run: |
+          pip install build
+          python -m build
+      - name: Check distribution metadata
+        run: |
+          pip install twine
+          twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
