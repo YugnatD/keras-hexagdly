@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keras-hexagdly"
+version = "0.1.0"
+description = "Keras 3 port of HexagDLy: hexagonal convolution and pooling for hexagonally sampled data"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Tanguy Dietrich" },
+]
+requires-python = ">=3.9"
+keywords = ["keras", "tensorflow", "hexagonal", "convolution", "cnn", "astroparticle physics"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "keras>=3.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "tensorflow",
+    "torch",
+    "hexagdly",
+]
+
+[project.urls]
+Homepage = "https://github.com/YugnatD/keras-hexagdly"
+Original = "https://github.com/ai4iacts/hexagdly"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E741",  # ambiguous variable name -- the layers mirror PyTorch HexagDLy's
+             # math-notation variable names (i, l, kh, kw) on purpose
+]
