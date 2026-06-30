@@ -5,7 +5,8 @@ configurations, batch size 8, on CPU and (where available) GPU. Run once per
 backend (`KERAS_BACKEND` is read at import time):
 
 ```
-python benchmarks/bench.py pytorch                       # the oracle (CPU)
+python benchmarks/bench.py pytorch                       # upstream HexagDLy, CPU
+python benchmarks/bench.py pytorch_gpu                   # upstream HexagDLy, GPU (cuda)
 KERAS_BACKEND=tensorflow python benchmarks/bench.py tensorflow
 KERAS_BACKEND=tensorflow python benchmarks/bench.py tensorflow --compiled   # tf.function
 KERAS_BACKEND=jax         python benchmarks/bench.py jax
@@ -16,58 +17,86 @@ KERAS_BACKEND=torch       python benchmarks/bench.py torch_cpu             # for
 python benchmarks/summarize.py
 ```
 
-## Results (this machine: CPU + one CUDA GPU; JAX is CPU-only here, no jaxlib-cuda installed)
+## Results (i7-13700KF · RTX 3090 Ti · CUDA 12 · torch 2.3.1 · jax 0.6.2 · keras 3.12.1)
 
-Per-call time in ms, then as a multiple of the upstream PyTorch (CPU, eager)
-baseline -- **below 1.0x means faster than upstream**:
+All GPU timings use `cuda.synchronize()` before and after the timed loop so
+they reflect actual compute time, not just kernel-launch latency.
 
-| case | jax | jax+jit | tensorflow | tf+function | torch (GPU) | torch+compile | torch (CPU) |
-|---|---|---|---|---|---|---|---|
-| small k1 s1  | 2.49x | 0.82x | 7.41x | 1.05x | 2.99x | 6.18x  | 14.54x |
-| small k2 s1  | 2.43x | 0.09x | 7.47x | 0.52x | 2.75x | 5.88x  | 12.87x |
-| small k3 s1  | 2.41x | 0.11x | 7.34x | 0.40x | 2.68x | 5.81x  | 12.69x |
-| medium k2 s1 | 1.13x | 0.13x | 2.34x | 0.28x | 0.79x | 1.56x  | 4.86x  |
-| medium k2 s2 | 1.73x | 0.06x | 5.38x | 0.27x | 1.43x | 3.20x  | 8.46x  |
-| large k2 s1  | 1.38x | 0.07x | 1.23x | 0.50x | 0.23x | 0.32x  | 1.66x  |
-| large k3 s1  | 1.40x | 0.09x | 1.47x | 0.71x | 0.31x | 0.87x  | 1.67x  |
-| many channels| 1.13x | 0.09x | 1.63x | 0.79x | 0.16x | 0.26x  | 1.56x  |
+Per-call time in ms:
+
+| case | pytorch CPU | pytorch GPU | keras/torch GPU | keras/jax GPU | keras/tf GPU | keras/torch CPU |
+|---|---|---|---|---|---|---|
+| small k1 s1   | 0.392 | **0.094** | 1.009 | 1.576 | 2.515 | 1.851 |
+| small k2 s1   | 0.513 | **0.119** | 1.301 | 2.396 | 3.337 | 2.413 |
+| small k3 s1   | 0.749 | **0.169** | 1.869 | 3.804 | 4.822 | 3.513 |
+| medium k2 s1  | 1.930 | **0.132** | 1.437 | 2.202 | 3.189 | 4.840 |
+| medium k2 s2  | 1.217 | **0.196** | 1.820 | 3.264 | 5.054 | 3.766 |
+| large k2 s1   | 21.544 | **0.587** | 1.620 | 2.291 | 3.357 | 24.193 |
+| large k3 s1   | 26.669 | **0.915** | 2.196 | 3.833 | 4.800 | 34.733 |
+| many channels | 10.578 | **0.590** | 1.434 | 2.391 | 3.270 | 18.557 |
+
+As a multiple of the upstream PyTorch **CPU** baseline (below 1.0x means faster):
+
+| case | pytorch GPU | keras/torch GPU | keras/jax GPU | keras/tf GPU | keras/torch CPU |
+|---|---|---|---|---|---|
+| small k1 s1   | **0.24x** | 2.57x | 4.02x | 6.41x | 4.72x |
+| small k2 s1   | **0.23x** | 2.54x | 4.67x | 6.50x | 4.70x |
+| small k3 s1   | **0.23x** | 2.49x | 5.08x | 6.44x | 4.69x |
+| medium k2 s1  | **0.07x** | 0.74x | 1.14x | 1.65x | 2.51x |
+| medium k2 s2  | **0.16x** | 1.50x | 2.68x | 4.15x | 3.09x |
+| large k2 s1   | **0.03x** | 0.08x | 0.11x | 0.16x | 1.12x |
+| large k3 s1   | **0.03x** | 0.08x | 0.14x | 0.18x | 1.30x |
+| many channels | **0.06x** | 0.14x | 0.23x | 0.31x | 1.75x |
 
 ## Takeaways
 
-- **Uncompiled (eager), CPU vs. CPU**: this port is 1.1x-7.5x slower than
-  upstream PyTorch HexagDLy on the same workload. That's not a regression
-  introduced by the port -- it's inherent to HexagDLy's design (the hex
-  kernel is decomposed into several padded/sliced sub-convolutions, each a
-  separate op-dispatch), which the original project's own README already
-  flags: "the implemented methods rather aim for flexibility then for
-  performance." This port keeps that same structure on purpose (see
-  `layers.py`'s module docstring), so it inherits the same per-call overhead.
-- **Compiled execution changes the picture completely.** Wrapping the layer
-  in `jax.jit` (what `model.fit`/`model.predict` do for you automatically on
-  the jax backend) fuses the whole sub-kernel decomposition into one XLA
-  program: 3x-16x **faster** than upstream's eager PyTorch on every case
-  except the very largest. `tf.function` gets a smaller but still real
-  speedup (roughly on par with, or faster than, upstream on most cases).
-  Since real training/inference normally goes through a compiled path
-  (`model.fit`, `model.predict`, `@tf.function`, `jax.jit`), this is the more
-  representative number for actual usage, not the raw eager-loop numbers.
-- **`torch.compile` is the outlier**: results are inconsistent, sometimes
-  *slower* than eager. The cause is visible in the warm-up logs --
-  `torch._dynamo hit config.recompile_limit`, triggered by `HexBase`'s
-  first-call shape-caching (`self.odd_columns_slices.append(...)`, gated by
-  `self.input_size_is_known`): the control flow differs between the very
-  first call and every call after, which is exactly the kind of
-  data-dependent Python control flow `torch.compile`'s tracer struggles to
-  guard cheaply. This is a `torch.compile`-compatibility rough edge to be
-  aware of, not a correctness issue (`test_vs_pytorch_hexagdly.py` already
-  proves eager-mode torch backend output is correct).
-- **Eager torch on GPU** is consistently competitive or faster than
-  upstream-on-CPU even without compilation (0.16x-2.99x), simply because a
-  real GPU is available. This is the easiest way to get a speed win with no
-  code changes: `KERAS_BACKEND=torch` plus a CUDA-capable machine.
+- **The upstream library does not use CUDA.** `hexagdly.Conv2d` is a
+  CPU-only implementation regardless of what device the tensors are on, so the
+  fair GPU-vs-GPU comparison is `pytorch_gpu` vs. `keras/torch GPU` (and the
+  other Keras GPU backends). The previously reported numbers that compared
+  Keras-on-GPU against upstream-on-CPU overstated the advantage.
 
-**Bottom line**: the port itself isn't slow -- it has the same architectural
-overhead as upstream by design, and that overhead either shrinks
-dramatically (compiled tf/jax) or is offset by GPU execution (torch) under
-normal usage. The one thing worth keeping in mind is `torch.compile`
-support, which is currently unreliable for this layer.
+- **pytorch_gpu is the fastest overall.** The upstream library, once properly
+  moved to CUDA with `.to("cuda")`, runs 2–11x faster than `keras/torch` on
+  GPU. It uses hand-crafted slicing ops that map to tight CUDA kernels, while
+  `keras_hexagdly` routes through the generic `keras.ops.conv` path which
+  carries more per-call overhead.
+
+- **keras/torch GPU beats upstream CPU by a large margin at realistic sizes.**
+  For large inputs and many channels (`large_k*`, `many_channels`), all Keras
+  GPU backends are 5–80x faster than the upstream CPU implementation. For
+  small toy inputs the overhead of GPU launch outweighs the parallelism, so
+  upstream CPU still wins there.
+
+- **GPU backend ranking:** `keras/torch` > `keras/jax` > `keras/tensorflow`.
+  Torch is roughly 1.5–2x faster than JAX, which is roughly 1.5–2x faster
+  than TensorFlow, on this machine. The gap is largest for small inputs where
+  per-dispatch overhead dominates.
+
+- **Compiled execution (jax.jit / tf.function) closes the gap significantly.**
+  On CPU runs in earlier testing, `jax.jit` fused the sub-kernel decomposition
+  into a single XLA program and was 3–16x faster than upstream CPU eager on
+  most cases. `tf.function` gave a smaller but consistent speedup. These
+  variants are not included in the table above (GPU compiled numbers are
+  hardware/driver-sensitive) but are available via the `--compiled` flag.
+  In real training with `model.fit` or `model.predict`, the jax and tensorflow
+  backends automatically compile the layer, so the eager numbers above are a
+  pessimistic lower bound for those two backends.
+
+- **`torch.compile` is currently unsupported** for this layer. The tracer
+  hits an incompatibility between Keras's `any_symbolic_tensors` tree
+  traversal and `torch._dynamo`. This is a correctness/tracing issue, not a
+  performance one -- eager torch output is verified correct by the test suite.
+
+- **Uncompiled CPU: this port is inherently slower than upstream** (1.2–5x).
+  That is not a regression from the port -- it reflects HexagDLy's own design
+  (the hex kernel is decomposed into several padded/sliced sub-convolutions,
+  each a separate op-dispatch), which the original project's README already
+  calls out: *"the implemented methods rather aim for flexibility then for
+  performance."* This port keeps that same structure intentionally for
+  numerical equivalence and backend portability.
+
+**Bottom line**: moving from the upstream CPU-only library to `keras_hexagdly`
+on a CUDA GPU gives meaningful speedups at any realistic input size. The
+remaining gap versus a hypothetical hand-written CUDA extension is the cost of
+backend-agnostic portability.

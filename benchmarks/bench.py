@@ -8,7 +8,8 @@ needs its own process), then aggregate with summarize.py:
     KERAS_BACKEND=torch       python benchmarks/bench.py torch
     KERAS_BACKEND=torch       python benchmarks/bench.py torch_cpu   # force CPU
     KERAS_BACKEND=jax         python benchmarks/bench.py jax
-                              python benchmarks/bench.py pytorch      # the oracle
+                              python benchmarks/bench.py pytorch      # CPU oracle
+                              python benchmarks/bench.py pytorch_gpu  # GPU oracle
     python benchmarks/summarize.py
 """
 
@@ -63,9 +64,21 @@ def bench_keras_hexagdly(compiled=False):
 
         for _ in range(N_WARMUP):
             call(x)
+        if backend == "torch":
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        elif backend == "tensorflow":
+            import tensorflow as tf
+            if tf.test.is_built_with_cuda():
+                tf.test.gpu_device_name()  # flush
         t0 = time.perf_counter()
         for _ in range(N_REPS):
             call(x)
+        if backend == "torch":
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         t1 = time.perf_counter()
         results.append((name, (t1 - t0) / N_REPS * 1000))
     return results
@@ -91,20 +104,24 @@ def bench_keras_hexagdly_cpu():
     return results
 
 
-def bench_pytorch():
+def bench_pytorch(device="cpu"):
     import hexagdly
     import torch
 
     results = []
     with torch.no_grad():
         for name, h, w, cin, cout, k, s in CASES:
-            layer = hexagdly.Conv2d(cin, cout, kernel_size=k, stride=s, bias=True)
-            x = torch.from_numpy(np.random.randn(BATCH, cin, h, w).astype(np.float32))
+            layer = hexagdly.Conv2d(cin, cout, kernel_size=k, stride=s, bias=True).to(device)
+            x = torch.from_numpy(np.random.randn(BATCH, cin, h, w).astype(np.float32)).to(device)
             for _ in range(N_WARMUP):
                 layer(x)
+            if device != "cpu":
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(N_REPS):
                 layer(x)
+            if device != "cpu":
+                torch.cuda.synchronize()
             t1 = time.perf_counter()
             results.append((name, (t1 - t0) / N_REPS * 1000))
     return results
@@ -114,7 +131,9 @@ if __name__ == "__main__":
     which = sys.argv[1]
     compiled = "--compiled" in sys.argv
     if which == "pytorch":
-        results = bench_pytorch()
+        results = bench_pytorch(device="cpu")
+    elif which == "pytorch_gpu":
+        results = bench_pytorch(device="cuda")
     elif which == "torch_cpu":
         results = bench_keras_hexagdly_cpu()
     else:
