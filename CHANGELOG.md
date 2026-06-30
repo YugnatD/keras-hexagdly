@@ -3,7 +3,30 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [0.1.0] - Unreleased
+## [0.1.1] - 2026-06-30
+
+The package code is unchanged from 0.1.0 (same API, same outputs); this release
+is packaging metadata plus repo-only additions.
+
+### Changed
+
+- Packaging metadata: expanded PyPI keywords, classifiers, and project URLs, and
+  a more search-friendly one-line description, to improve discoverability.
+
+### Added
+
+- `notebooks/cta_lst_hexconv_gamma_vs_noise.ipynb`: a self-contained example
+  training a hexagonal 3-D CNN on real CTA LST camera geometry and simulated
+  events (streamed from `ctapipe`) to separate gamma showers from night-sky
+  background, including a visualisation of the learned kernels.
+
+### Fixed
+
+- Example notebooks now read layer outputs via `keras.ops.convert_to_numpy`
+  instead of `np.asarray`, so they no longer crash on a GPU-resident tensor
+  under the torch/jax backends.
+
+## [0.1.0] - 2026-06-29
 
 Initial release: a Keras 3 port of [HexagDLy](https://github.com/ai4iacts/hexagdly).
 

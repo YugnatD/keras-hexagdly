@@ -4,21 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keras-hexagdly"
-version = "0.1.0"
-description = "Keras 3 port of HexagDLy: hexagonal convolution and pooling for hexagonally sampled data"
+version = "0.1.1"
+description = "Hexagonal convolution and pooling layers for Keras 3 (TensorFlow / JAX / PyTorch) — a HexagDLy port"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
     { name = "Tanguy Dietrich" },
 ]
 requires-python = ">=3.9"
-keywords = ["keras", "tensorflow", "hexagonal", "convolution", "cnn", "astroparticle physics"]
+keywords = [
+    "keras", "tensorflow", "jax", "pytorch",
+    "hexagonal", "hexagonal-convolution", "hexagonal-grid",
+    "convolution", "cnn", "deep-learning", "neural-networks",
+    "geometric-deep-learning", "equivariant", "hexagdly",
+    "astroparticle-physics", "iact", "cherenkov",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
     "keras>=3.0",
@@ -35,7 +49,10 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/YugnatD/keras-hexagdly"
-Original = "https://github.com/ai4iacts/hexagdly"
+Source = "https://github.com/YugnatD/keras-hexagdly"
+Issues = "https://github.com/YugnatD/keras-hexagdly/issues"
+Changelog = "https://github.com/YugnatD/keras-hexagdly/blob/main/CHANGELOG.md"
+"Original (HexagDLy)" = "https://github.com/ai4iacts/hexagdly"
 
 [tool.setuptools.packages.find]
 where = ["src"]

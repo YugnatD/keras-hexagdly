@@ -18,4 +18,4 @@ __all__ = [
     "ring_maps_2d",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
