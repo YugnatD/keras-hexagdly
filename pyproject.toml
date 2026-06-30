@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "keras-hexagdly"
@@ -54,8 +54,8 @@ Issues = "https://github.com/YugnatD/keras-hexagdly/issues"
 Changelog = "https://github.com/YugnatD/keras-hexagdly/blob/main/CHANGELOG.md"
 "Original (HexagDLy)" = "https://github.com/ai4iacts/hexagdly"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/keras_hexagdly"]
 
 [tool.ruff]
 line-length = 100

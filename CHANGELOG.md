@@ -3,6 +3,49 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.0] - 2026-06-30
+
+### Added
+
+- `src/keras_hexagdly/indexed.py`: neighbor-table builder and indexed forward
+  references for all four layer types (`Conv2d`, `MaxPool2d`, `Conv3d`,
+  `MaxPool3d`). Derives the `(N_out, K)` neighbor table empirically by firing
+  single-pixel impulses through the existing `call()` path — no coordinate
+  assumptions, exact by construction. Provides NumPy reference implementations
+  (`indexed_conv2d_forward`, `indexed_maxpool2d_forward`, etc.) that match
+  `call()` bit-for-bit and double as C-simulation oracles.
+
+- `src/keras_hexagdly/hls4ml_ext.py`: hls4ml export bridge. A single public
+  function `patch_model_for_hls(model)` returns a new Keras model where every
+  hex layer is replaced by stock hls4ml-native ops — no custom HLS layer
+  needed. Replacement mapping:
+  - `Conv2d`    → `Reshape` + `EinsumDense('amc,mcno->ano')` + `Reshape`
+  - `MaxPool2d` → `Reshape` + `EinsumDense` (gather) + `MaxPooling1D(K,K)` + `Reshape`
+  - `Conv3d`    → per-depth-tap `EinsumDense('abmc,mcno->abno')` + `Add` + `Reshape`
+  - `MaxPool3d` → `NotImplementedError` (pending; workaround documented)
+  The original model and its weights are never modified; `hls4ml` is an
+  optional dependency, never imported at training time.
+
+- `tests/test_indexed_equivalence.py`: 75 equivalence tests covering all layer
+  types, kernel sizes (1–3), strides (1–2), both weight modes
+  (`share_neighbors=True/False`), border pixels, and all-negative inputs.
+
+- `tests/test_hls4ml_ext.py`: 29 patch-model tests in two tiers — Keras
+  float32 equivalence (always runs) and hls4ml C-simulation via g++
+  (auto-skipped when hls4ml is not installed).
+
+- `notebooks/keras_hexagdly_hls4ml_export.ipynb`: end-to-end notebook showing
+  training a hex CNN, patching it for hls4ml, verifying bit-identical outputs,
+  running C-simulation, and (optionally) full RTL synthesis with Vitis HLS
+  2024.2 — including the PATH/shim setup for the `vivado_hls` → `vitis_hls`
+  rename.
+
+### Changed
+
+- Build backend switched from `setuptools` to `hatchling` to fix a long-standing
+  `UNKNOWN.egg-info` issue: `pip install -e .` now creates a proper editable
+  install without polluting the repo root with a stale egg-info directory.
+
 ## [0.1.1] - 2026-06-30
 
 The package code is unchanged from 0.1.0 (same API, same outputs); this release
