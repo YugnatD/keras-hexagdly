@@ -169,6 +169,37 @@ def _maxpool2d_replacement(layer, x):
     )(pooled)
 
 
+def _maxpool2d_gather(layer, x):
+    """MaxPool2d with strategy='gather' -> Reshape + HexGather + HexMaxPool + Reshape.
+
+    HexGather replaces the large EinsumDense selection matrix with a tiny
+    (N_out, K) integer index table.  HexMaxPool takes the max over K slots.
+    Border slots were set to 0 by HexGather — matches hexagdly zero-padding.
+    """
+    from keras_hexagdly.hex_gather import HexGather, HexMaxPool
+
+    H, W = int(x.shape[1]), int(x.shape[2])
+    C    = int(x.shape[3])
+    N_in = H * W
+
+    nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
+    N_out = H_out * W_out
+
+    x_flat = keras.layers.Reshape(
+        (N_in, C), name=f"{layer.name}_reshape_in"
+    )(x)
+
+    gathered = HexGather(
+        neighbor_idx=nbr, name=f"{layer.name}_gather"
+    )(x_flat)                                           # (B, N_out, K, C)
+
+    pooled = HexMaxPool(name=f"{layer.name}_maxpool")(gathered)  # (B, N_out, C)
+
+    return keras.layers.Reshape(
+        (H_out, W_out, C), name=f"{layer.name}_reshape_out"
+    )(pooled)
+
+
 def _conv3d_replacement(layer, x):
     """Conv3d -> per-depth-tap (Crop1D + EinsumDense) + Add + Reshape.
 
@@ -506,6 +537,102 @@ def _conv3d_slotwise(layer, x):
 
 
 # ---------------------------------------------------------------------------
+# Gather builders (strategy="gather")
+# ---------------------------------------------------------------------------
+
+
+def _get_ring_idx(layer, cells):
+    """Return (K,) int32 array mapping each cell slot to its hex ring index.
+
+    Only meaningful when share_neighbors=True.  Uses ring_maps_2d (the same
+    empirical ring map already used by get_cell_weights) so the ring assignment
+    is guaranteed consistent with the weight layout.
+    """
+    from keras_hexagdly.layers import ring_maps_2d
+    ring_maps, _ = ring_maps_2d(layer.kernel_size)
+    return np.array(
+        [int(ring_maps[i][r, c]) for i, r, c in cells], dtype=np.int32
+    )
+
+
+def _conv2d_gather(layer, x):
+    """Conv2d -> HexGather + HexRingMAC + Reshape.
+
+    One HexGather replaces all K EinsumDense selection matrices.
+    One HexRingMAC replaces all K MAC EinsumDense layers, exploiting
+    share_neighbors to store only (num_rings, Cin, Cout) instead of (K, Cin, Cout).
+
+    Graph:
+        Reshape(N_in, Cin)
+        → HexGather(N_out, K)              # (B, N_out, K, Cin)
+        → HexRingMAC(weights, ring_idx)    # (B, N_out, Cout)
+        → Reshape(H_out, W_out, Cout)
+    """
+    from keras_hexagdly.hex_gather import HexGather, HexRingMAC
+
+    H, W = int(x.shape[1]), int(x.shape[2])
+    Cin  = int(x.shape[3])
+    N_in = H * W
+    Cout = layer.out_channels
+
+    nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
+    N_out = H_out * W_out
+
+    x_flat = keras.layers.Reshape(
+        (N_in, Cin), name=f"{layer.name}_reshape_in"
+    )(x)
+
+    # HexGather: index table (N_out, K) — tiny integer ROM
+    gathered = HexGather(
+        neighbor_idx=nbr, name=f"{layer.name}_gather"
+    )(x_flat)                                           # (B, N_out, K, Cin)
+
+    # HexRingMAC: weights + optional ring_idx
+    if layer.share_neighbors:
+        W_rings = layer.ring_weights.numpy()            # (num_rings, Cin, Cout)
+        ring_idx = _get_ring_idx(layer, cells)          # (K,)
+        y_flat = HexRingMAC(
+            weights_array=W_rings,
+            ring_idx=ring_idx,
+            name=f"{layer.name}_mac",
+        )(gathered)
+    else:
+        from keras_hexagdly.indexed import get_cell_weights
+        W_k = get_cell_weights(layer, cells)            # (K, Cin, Cout)
+        y_flat = HexRingMAC(
+            weights_array=W_k,
+            ring_idx=None,
+            name=f"{layer.name}_mac",
+        )(gathered)
+
+    if layer.use_bias:
+        y_flat = keras.layers.Add(name=f"{layer.name}_bias")([
+            y_flat,
+            keras.layers.Lambda(
+                lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
+                name=f"{layer.name}_bias_const",
+            )(y_flat),
+        ])
+
+    return keras.layers.Reshape(
+        (H_out, W_out, Cout), name=f"{layer.name}_reshape_out"
+    )(y_flat)
+
+
+def _conv3d_gather(layer, x):
+    """Conv3d with strategy='gather' falls back to slotwise.
+
+    HexGather operates on (B, N_in, C) — adding a depth axis requires
+    reshaping the batch and depth dims together, which is awkward in a
+    functional Keras graph and adds no benefit over slotwise for the temporal
+    axis (depth taps are already dense, not sparse).  The gather savings apply
+    to the spatial axis only, and the slotwise path already handles the spatial
+    gather correctly.  A dedicated 3D gather is a future extension.
+    """
+    return _conv3d_slotwise(layer, x)
+
+
+# ---------------------------------------------------------------------------
 # Model surgery: walk the functional DAG and swap hex layers
 # ---------------------------------------------------------------------------
 
@@ -522,6 +649,13 @@ _REPLACEMENTS_SLOTWISE = {
     hgly.Conv2d:    _conv2d_slotwise,
     hgly.MaxPool2d: _maxpool2d_replacement,   # pool is strategy-agnostic
     hgly.Conv3d:    _conv3d_slotwise,
+    hgly.MaxPool3d: _maxpool3d_replacement,
+}
+
+_REPLACEMENTS_GATHER = {
+    hgly.Conv2d:    _conv2d_gather,
+    hgly.MaxPool2d: _maxpool2d_gather,        # HexGather + HexMaxPool (no large matrix)
+    hgly.Conv3d:    _conv3d_gather,           # falls back to slotwise (see docstring)
     hgly.MaxPool3d: _maxpool3d_replacement,
 }
 
@@ -542,8 +676,14 @@ def patch_model_for_hls(model, strategy="slotwise"):
                   - "folded": one EinsumDense with the full (N_in,Cin,N_out,Cout)
                     kernel. Simpler graph; fine for C-simulation but causes Vitis
                     HLS clang to segfault at synthesis on grids larger than ~9×9.
-                  - "gather": sparse gather layer + custom hls4ml handler. Scales
-                    to full camera size. Not yet implemented.
+                  - "gather": HexGather + HexRingMAC layers.  Conv2d uses a
+                    sparse (N_out, K) integer index table instead of dense
+                    selection matrices — the key improvement for synthesis at
+                    full camera scale.  Requires Phases 3-4 (custom hls4ml
+                    handler + HLS C++ kernel) to synthesize; C-simulation
+                    with stock hls4ml is not yet supported.  Conv3d falls back
+                    to slotwise (spatial gather savings don't apply to the
+                    temporal axis).
 
     Returns:
         A new keras.Model — plain Keras, no hls4ml dependency.  Pass this to
@@ -552,8 +692,7 @@ def patch_model_for_hls(model, strategy="slotwise"):
     Raises:
         TypeError:           if ``model`` is not a keras.Model.
         ValueError:          if ``strategy`` is not a recognised value.
-        NotImplementedError: for MaxPool3d layers, or strategy="gather",
-                             or Conv3d with depth_stride > 1.
+        NotImplementedError: for MaxPool3d layers, or Conv3d with depth_stride > 1.
     """
     if not isinstance(model, keras.Model):
         raise TypeError(f"Expected a keras.Model, got {type(model).__name__}.")
@@ -561,16 +700,13 @@ def patch_model_for_hls(model, strategy="slotwise"):
         raise ValueError(
             f"Unknown strategy {strategy!r}. Choose from: {_STRATEGIES}."
         )
-    if strategy == "gather":
-        raise NotImplementedError(
-            "strategy='gather' is not yet implemented. "
-            "It will use a sparse gather layer backed by a custom hls4ml "
-            "KerasV3LayerHandler + HLS C++ template, scaling to full camera size."
-        )
 
-    replacements = (
-        _REPLACEMENTS_SLOTWISE if strategy == "slotwise" else _REPLACEMENTS_FOLDED
-    )
+    if strategy == "gather":
+        replacements = _REPLACEMENTS_GATHER
+    elif strategy == "slotwise":
+        replacements = _REPLACEMENTS_SLOTWISE
+    else:
+        replacements = _REPLACEMENTS_FOLDED
 
     # Map from original tensor id -> replacement tensor.
     tensor_map = {id(t): t for t in model.inputs}
