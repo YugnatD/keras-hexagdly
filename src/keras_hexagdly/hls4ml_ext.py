@@ -288,6 +288,25 @@ def _maxpool3d_replacement(layer, x):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _binary_add(tensors, name_prefix):
+    """Reduce a list of tensors to one value using a binary tree of Add layers.
+
+    hls4ml's Add handler asserts exactly 2 inputs, so a flat multi-input Add
+    is not allowed.  A left-fold binary tree produces only 2-input Add nodes
+    and is equivalent for commutative addition.
+    """
+    assert len(tensors) > 0
+    acc = tensors[0]
+    for i, t in enumerate(tensors[1:], start=1):
+        acc = keras.layers.Add(name=f"{name_prefix}_add{i}")([acc, t])
+    return acc
+
+
+# ---------------------------------------------------------------------------
 # Slotwise builders (strategy="slotwise")
 # ---------------------------------------------------------------------------
 
@@ -363,10 +382,8 @@ def _conv2d_slotwise(layer, x):
             "amc,co->ao", output_shape=(Cout,), bias_axes=None,
             name=f"{layer.name}_zero_proj",
         )(x_flat))
-    elif len(slot_outputs) == 1:
-        y_flat = slot_outputs[0]
     else:
-        y_flat = keras.layers.Add(name=f"{layer.name}_add")(slot_outputs)
+        y_flat = _binary_add(slot_outputs, name_prefix=layer.name)
 
     if layer.use_bias:
         y_flat = keras.layers.Add(name=f"{layer.name}_bias")([
@@ -472,10 +489,7 @@ def _conv3d_slotwise(layer, x):
             mac.set_weights([W_k[d, k]])
             tap_slot_outputs.append(y_dk)
 
-    if len(tap_slot_outputs) == 1:
-        y_flat = tap_slot_outputs[0]
-    else:
-        y_flat = keras.layers.Add(name=f"{layer.name}_add")(tap_slot_outputs)
+    y_flat = _binary_add(tap_slot_outputs, name_prefix=layer.name)
 
     if layer.use_bias:
         y_flat = keras.layers.Add(name=f"{layer.name}_bias")([
