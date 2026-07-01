@@ -15,14 +15,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`indexed_conv2d_forward`, `indexed_maxpool2d_forward`, etc.) that match
   `call()` bit-for-bit and double as C-simulation oracles.
 
-- `src/keras_hexagdly/hls4ml_ext.py`: hls4ml export bridge. A single public
-  function `patch_model_for_hls(model)` returns a new Keras model where every
-  hex layer is replaced by stock hls4ml-native ops — no custom HLS layer
-  needed. Replacement mapping:
-  - `Conv2d`    → `Reshape` + `EinsumDense('amc,mcno->ano')` + `Reshape`
-  - `MaxPool2d` → `Reshape` + `EinsumDense` (gather) + `MaxPooling1D(K,K)` + `Reshape`
-  - `Conv3d`    → per-depth-tap `EinsumDense('abmc,mcno->abno')` + `Add` + `Reshape`
-  - `MaxPool3d` → `NotImplementedError` (pending; workaround documented)
+- `src/keras_hexagdly/hls4ml_ext.py`: hls4ml export bridge.
+  `patch_model_for_hls(model, strategy="slotwise")` returns a new Keras model
+  where every hex layer is replaced by stock hls4ml-native ops — no custom HLS
+  layer needed. Two strategies selectable via the `strategy` parameter:
+  - `"slotwise"` (default): K separate gather+MAC `EinsumDense` pairs per
+    layer, summed via `Add`. Largest static array is `(N_out, N_in)` per slot
+    — safe for Vitis HLS RTL synthesis at typical camera sizes.
+  - `"folded"`: one `EinsumDense` with the full `(N_in,Cin,N_out,Cout)` kernel.
+    Simpler graph; fine for C-simulation but causes Vitis HLS clang to segfault
+    during synthesis on grids larger than ~9×9.
+  - `"gather"`: `NotImplementedError` placeholder for a future sparse-gather
+    custom layer that scales to full camera size (e.g. DigiCam N=1296).
+  `MaxPool2d` → `EinsumDense` gather + `MaxPooling1D(K,K)` (strategy-agnostic).
+  `MaxPool3d` → `NotImplementedError` (pending).
   The original model and its weights are never modified; `hls4ml` is an
   optional dependency, never imported at training time.
 

@@ -196,6 +196,18 @@ class TestPatchModelMisc:
         with pytest.raises(TypeError):
             patch_model_for_hls("not_a_model")
 
+    def test_invalid_strategy_raises(self):
+        layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=False)
+        model = _build_2d_model(layer)
+        with pytest.raises(ValueError, match="Unknown strategy"):
+            patch_model_for_hls(model, strategy="invalid")
+
+    def test_gather_strategy_raises_not_implemented(self):
+        layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=False)
+        model = _build_2d_model(layer)
+        with pytest.raises(NotImplementedError, match="gather"):
+            patch_model_for_hls(model, strategy="gather")
+
     def test_non_hex_layers_passthrough(self):
         """Non-hex layers (Dense, ReLU) must be preserved unchanged."""
         inp = keras.Input((H, W, CIN))
@@ -226,14 +238,77 @@ class TestPatchModelMisc:
 
 
 # =============================================================================
+# Slotwise strategy tests
+# =============================================================================
+
+class TestConv2dSlotwise:
+    @pytest.mark.parametrize("share", [False, True])
+    @pytest.mark.parametrize("kernel_size", [1, 2])
+    @pytest.mark.parametrize("stride", [1, 2])
+    def test_output_matches_original(self, share, kernel_size, stride):
+        layer = hgly.Conv2d(
+            CIN, COUT, kernel_size=kernel_size, stride=stride,
+            bias=False, share_neighbors=share,
+        )
+        model = _build_2d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((2, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0)
+        patched = patch_model_for_hls(model, strategy="slotwise")
+        y_pat  = patched.predict(x, verbose=0)
+
+        assert y_ref.shape == y_pat.shape
+        assert np.max(np.abs(y_ref - y_pat)) < ATOL_KERAS, (
+            f"Conv2d slotwise(k={kernel_size},s={stride},share={share}): "
+            f"max err={np.max(np.abs(y_ref-y_pat)):.2e}"
+        )
+
+    def test_folded_and_slotwise_agree(self):
+        """Both strategies must produce identical float32 outputs."""
+        layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=False)
+        model = _build_2d_model(layer)
+        _rand_weights(layer)
+        x = RNG.standard_normal((2, H, W, CIN)).astype(np.float32)
+        y_folded   = patch_model_for_hls(model, strategy="folded").predict(x, verbose=0)
+        y_slotwise = patch_model_for_hls(model, strategy="slotwise").predict(x, verbose=0)
+        assert np.max(np.abs(y_folded - y_slotwise)) < ATOL_KERAS
+
+
+class TestConv3dSlotwise:
+    @pytest.mark.parametrize("share", [False, True])
+    @pytest.mark.parametrize("kernel_size", [(1, 1), (2, 2)])
+    @pytest.mark.parametrize("depth_padding", ["valid", "same"])
+    def test_output_matches_original(self, share, kernel_size, depth_padding):
+        layer = hgly.Conv3d(
+            CIN, COUT, kernel_size=kernel_size,
+            bias=False, share_neighbors=share, depth_padding=depth_padding,
+        )
+        model = _build_3d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((1, D, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0)
+        patched = patch_model_for_hls(model, strategy="slotwise")
+        y_pat  = patched.predict(x, verbose=0)
+
+        assert y_ref.shape == y_pat.shape
+        assert np.max(np.abs(y_ref - y_pat)) < ATOL_KERAS, (
+            f"Conv3d slotwise(k={kernel_size},share={share},dp={depth_padding}): "
+            f"max err={np.max(np.abs(y_ref-y_pat)):.2e}"
+        )
+
+
+# =============================================================================
 # Tier 2: hls4ml C-sim
 # =============================================================================
 
 @hls4ml_skip
 class TestHls4mlCsim:
-    def test_conv2d_converts_and_csim(self, tmp_path):
+    def test_conv2d_folded_converts_and_csim(self, tmp_path):
+        """strategy='folded' C-sim — small grid so the dense matrix fits."""
         global _HLS_DIR
-        _HLS_DIR = str(tmp_path / "hls_conv2d")
+        _HLS_DIR = str(tmp_path / "hls_conv2d_folded")
 
         layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=False)
         model = _build_2d_model(layer)
@@ -242,7 +317,7 @@ class TestHls4mlCsim:
         x = RNG.standard_normal((1, H, W, CIN)).astype(np.float32)
         y_ref = model.predict(x, verbose=0).reshape(-1)
 
-        patched = patch_model_for_hls(model)
+        patched = patch_model_for_hls(model, strategy="folded")
         y_hls = _csim(patched, x).reshape(-1)
 
         assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
@@ -259,7 +334,7 @@ class TestHls4mlCsim:
         x = RNG.standard_normal((1, H, W, CIN)).astype(np.float32)
         y_ref = model.predict(x, verbose=0).reshape(-1)
 
-        patched = patch_model_for_hls(model)
+        patched = patch_model_for_hls(model, strategy="folded")
         y_hls = _csim(patched, x).reshape(-1)
 
         assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM

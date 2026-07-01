@@ -5,7 +5,7 @@ Usage
     from keras_hexagdly.hls4ml_ext import patch_model_for_hls
     import hls4ml
 
-    hls_model_input = patch_model_for_hls(trained_model)
+    hls_model_input = patch_model_for_hls(trained_model, strategy="slotwise")
     cfg = hls4ml.utils.config_from_keras_model(hls_model_input, backend="Vivado")
     hls_model = hls4ml.converters.convert_from_keras_model(
         hls_model_input, hls_config=cfg, backend="Vivado", ...
@@ -19,28 +19,47 @@ decomposition.  This module builds an equivalent Keras model using only
 hls4ml-native layers (EinsumDense, MaxPooling1D, Reshape, Cropping1D,
 ZeroPadding1D) that produce **bit-identical float32 results** to the original.
 
-Replacement mapping
--------------------
-  Conv2d    ->  Reshape + EinsumDense('amc,mcno->ano') + Reshape
-  MaxPool2d ->  Reshape + EinsumDense('amc,pm->apc') + MaxPooling1D(K,K) + Reshape
-  Conv3d    ->  per-depth-tap (ZeroPad1D? + Crop1D + Reshape + EinsumDense('abmc,mcno->abno'))
-                + Add over taps + Reshape  [depth_stride=1 only]
-  MaxPool3d ->  NotImplementedError (temporal+spatial max requires Transpose not in hls4ml)
+Export strategies
+-----------------
+Two strategies are available via the ``strategy`` argument to
+``patch_model_for_hls``:
+
+"slotwise" (default, recommended for synthesis):
+    Conv2d/Conv3d: K separate (gather + MAC) pairs, one per neighbor slot.
+    Each gather is an EinsumDense with a (N_out, N_in) selection matrix;
+    each MAC is an EinsumDense with a (Cin, Cout) weight matrix.
+    Results are summed via Add.  The largest single static array is
+    (N_out, N_in) per slot — ~160k entries at 20×20, well within Vitis HLS
+    elaboration limits.
+
+"folded":
+    Conv2d/Conv3d: one EinsumDense with a (N_in, Cin, N_out, Cout) kernel
+    where the gather is folded into the weight.  Simpler graph but the matrix
+    is N_in*Cin*N_out*Cout entries — 1.28M at 20×20/8-filter, which causes
+    Vitis HLS clang to segfault during static elaboration.  Useful for
+    C-simulation at any size but not for RTL synthesis beyond small grids.
+
+"gather" (not yet implemented):
+    A proper sparse gather layer backed by a custom hls4ml KerasV3LayerHandler
+    + HLS C++ template.  Scales to full camera size (DigiCam N=1296) without
+    a large static array.  Raises NotImplementedError until implemented.
+
+MaxPool2d uses a gather EinsumDense + MaxPooling1D regardless of strategy
+(max is not linear so neither folded nor slotwise applies; the gather matrix
+is (N_out*K, N_in) which is smaller and has not caused elaboration issues at
+toy scale).
 
 The original model is NOT modified; a new Keras model is returned.
 hls4ml is NOT imported here; the patched model is plain Keras.
 
 Flat-index convention
 ---------------------
-Spatial flat index m = h * W + w (raster scan).  The (N_in, Cin, N_out, Cout)
-EinsumDense kernel encodes the neighbor gather: A[m,:,n,:] accumulates the
-weights of all kernel slots k where nbr[n,k] == m.
+Spatial flat index m = h * W + w (raster scan).
 
 Border behavior
 ---------------
 Invalid neighbor slots (-1 in the table) contribute 0.0, matching hexagdly's
-zero-padding at the grid border.  For max pooling, a 0-pad slot can dominate
-when all real neighbors are negative — this is identical to hexagdly's behavior.
+zero-padding at the grid border.
 """
 
 import numpy as np
@@ -269,20 +288,231 @@ def _maxpool3d_replacement(layer, x):
 
 
 # ---------------------------------------------------------------------------
+# Slotwise builders (strategy="slotwise")
+# ---------------------------------------------------------------------------
+
+
+def _conv2d_slotwise(layer, x):
+    """Conv2d -> K × (gather EinsumDense + MAC EinsumDense) + Add + Reshape.
+
+    For each neighbor slot k:
+      1. A (N_out, N_in) binary selection matrix S_k gathers input pixel
+         nbr[n,k] into output position n (0 for invalid slots).
+         EinsumDense equation: 'amc,nm->anc'  (batch a, N_in m, N_out n, Cin c)
+      2. A (Cin, Cout) weight matrix W_k applies the learned kernel.
+         EinsumDense equation: 'anc,co->ano'
+    Outputs are summed over all K slots via Add.
+
+    Largest single static array: (N_out, N_in) per slot — ~160k at 20×20,
+    well within Vitis HLS elaboration limits.
+    """
+    H, W = int(x.shape[1]), int(x.shape[2])
+    Cin  = int(x.shape[3])
+    N_in = H * W
+    Cout = layer.out_channels
+
+    nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
+    W_k = get_cell_weights(layer, cells)          # (K, Cin, Cout)
+    N_out = H_out * W_out
+    K = len(cells)
+
+    x_flat = keras.layers.Reshape(
+        (N_in, Cin), name=f"{layer.name}_reshape_in"
+    )(x)
+
+    slot_outputs = []
+    for k in range(K):
+        # Binary selection matrix: S_k[n, m] = 1 iff nbr[n, k] == m.
+        S_k = np.zeros((N_out, N_in), np.float32)
+        for n in range(N_out):
+            m = int(nbr[n, k])
+            if m >= 0:
+                S_k[n, m] = 1.0
+
+        # Skip zero-weight slots (e.g. all-zero kernel cell).
+        if not np.any(S_k) and not np.any(W_k[k]):
+            continue
+
+        # Gather: (B, N_in, Cin) -> (B, N_out, Cin)
+        gather = keras.layers.EinsumDense(
+            "amc,nm->anc",
+            output_shape=(N_out, Cin),
+            bias_axes=None,
+            name=f"{layer.name}_gather_k{k}",
+        )
+        gathered = gather(x_flat)
+        gather.set_weights([S_k])
+
+        # MAC: (B, N_out, Cin) -> (B, N_out, Cout)
+        mac = keras.layers.EinsumDense(
+            "anc,co->ano",
+            output_shape=(N_out, Cout),
+            bias_axes=None,
+            name=f"{layer.name}_mac_k{k}",
+        )
+        y_k = mac(gathered)
+        mac.set_weights([W_k[k]])
+
+        slot_outputs.append(y_k)
+
+    if len(slot_outputs) == 0:
+        # Degenerate: all-zero kernel — return zeros.
+        y_flat = keras.layers.Lambda(
+            lambda t: t * 0.0, name=f"{layer.name}_zero"
+        )(keras.layers.EinsumDense(
+            "amc,co->ao", output_shape=(Cout,), bias_axes=None,
+            name=f"{layer.name}_zero_proj",
+        )(x_flat))
+    elif len(slot_outputs) == 1:
+        y_flat = slot_outputs[0]
+    else:
+        y_flat = keras.layers.Add(name=f"{layer.name}_add")(slot_outputs)
+
+    if layer.use_bias:
+        y_flat = keras.layers.Add(name=f"{layer.name}_bias")([
+            y_flat,
+            keras.layers.Lambda(
+                lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
+                name=f"{layer.name}_bias_const",
+            )(y_flat),
+        ])
+
+    return keras.layers.Reshape(
+        (H_out, W_out, Cout), name=f"{layer.name}_reshape_out"
+    )(y_flat)
+
+
+def _conv3d_slotwise(layer, x):
+    """Conv3d -> per-depth-tap slotwise replacement + Add + Reshape.
+
+    Combines the per-depth-tap structure of _conv3d_replacement with the
+    per-slot decomposition of _conv2d_slotwise.  Only depth_stride=1 supported.
+    """
+    D_in = int(x.shape[1])
+    H, W = int(x.shape[2]), int(x.shape[3])
+    Cin  = int(x.shape[4])
+    N_in = H * W
+    D_kernel    = layer.depth_size
+    depth_stride = layer.depth_stride
+    Cout = layer.out_channels
+
+    if depth_stride != 1:
+        raise NotImplementedError(
+            f"Conv3d hls4ml export only supports depth_stride=1, got {depth_stride}."
+        )
+
+    if layer.depth_padding == "same":
+        pad_top = (D_kernel - 1) // 2
+        pad_bot = D_kernel - 1 - pad_top
+        D_eff = D_in
+    else:
+        pad_top = 0
+        pad_bot = 0
+        D_eff = D_in - D_kernel + 1
+
+    nbr, cells, _ = build_neighbor_table_3d(layer, D_in, H, W)
+    W_k = get_cell_weights_3d(layer, cells)          # (D_kernel, K, Cin, Cout)
+    K = len(cells)
+
+    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
+    _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
+    N_out = H_out * W_out
+
+    D_padded = D_in + pad_top + pad_bot
+    x_seq = keras.layers.Reshape(
+        (D_in, N_in * Cin), name=f"{layer.name}_reshape_seq"
+    )(x)
+    if pad_top > 0 or pad_bot > 0:
+        x_seq = keras.layers.ZeroPadding1D(
+            padding=(pad_top, pad_bot), name=f"{layer.name}_zpad"
+        )(x_seq)
+
+    tap_slot_outputs = []
+    for d in range(D_kernel):
+        crop_start = d
+        crop_end   = D_padded - D_eff - d
+        if crop_start == 0 and crop_end == 0:
+            x_d_seq = x_seq
+        else:
+            x_d_seq = keras.layers.Cropping1D(
+                cropping=(crop_start, crop_end),
+                name=f"{layer.name}_crop_d{d}",
+            )(x_seq)
+
+        x_d = keras.layers.Reshape(
+            (D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}"
+        )(x_d_seq)
+
+        for k in range(K):
+            S_k = np.zeros((N_out, N_in), np.float32)
+            for n in range(N_out):
+                m = int(nbr[n, k])
+                if m >= 0:
+                    S_k[n, m] = 1.0
+
+            if not np.any(S_k) and not np.any(W_k[d, k]):
+                continue
+
+            gather = keras.layers.EinsumDense(
+                "abmc,nm->abnc",
+                output_shape=(D_eff, N_out, Cin),
+                bias_axes=None,
+                name=f"{layer.name}_gather_d{d}_k{k}",
+            )
+            gathered = gather(x_d)
+            gather.set_weights([S_k])
+
+            mac = keras.layers.EinsumDense(
+                "abnc,co->abno",
+                output_shape=(D_eff, N_out, Cout),
+                bias_axes=None,
+                name=f"{layer.name}_mac_d{d}_k{k}",
+            )
+            y_dk = mac(gathered)
+            mac.set_weights([W_k[d, k]])
+            tap_slot_outputs.append(y_dk)
+
+    if len(tap_slot_outputs) == 1:
+        y_flat = tap_slot_outputs[0]
+    else:
+        y_flat = keras.layers.Add(name=f"{layer.name}_add")(tap_slot_outputs)
+
+    if layer.use_bias:
+        y_flat = keras.layers.Add(name=f"{layer.name}_bias")([
+            y_flat,
+            keras.layers.Lambda(
+                lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
+                name=f"{layer.name}_bias_const",
+            )(y_flat),
+        ])
+
+    return keras.layers.Reshape(
+        (D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out"
+    )(y_flat)
+
+
+# ---------------------------------------------------------------------------
 # Model surgery: walk the functional DAG and swap hex layers
 # ---------------------------------------------------------------------------
 
-_HEX_LAYER_TYPES = (hgly.Conv2d, hgly.MaxPool2d, hgly.Conv3d, hgly.MaxPool3d)
+_STRATEGIES = ("folded", "slotwise", "gather")
 
-_REPLACEMENTS = {
+_REPLACEMENTS_FOLDED = {
     hgly.Conv2d:    _conv2d_replacement,
     hgly.MaxPool2d: _maxpool2d_replacement,
     hgly.Conv3d:    _conv3d_replacement,
     hgly.MaxPool3d: _maxpool3d_replacement,
 }
 
+_REPLACEMENTS_SLOTWISE = {
+    hgly.Conv2d:    _conv2d_slotwise,
+    hgly.MaxPool2d: _maxpool2d_replacement,   # pool is strategy-agnostic
+    hgly.Conv3d:    _conv3d_slotwise,
+    hgly.MaxPool3d: _maxpool3d_replacement,
+}
 
-def patch_model_for_hls(model):
+
+def patch_model_for_hls(model, strategy="slotwise"):
     """Return a new Keras functional model with hex layers replaced by hls4ml-native ops.
 
     Walks the model's layer graph in topological order.  Every hex layer is
@@ -290,19 +520,43 @@ def patch_model_for_hls(model):
     are re-applied unchanged so weights, activations, and topology are preserved.
 
     Args:
-        model:  A built keras.Model whose hex layers have been trained.
+        model:    A built keras.Model whose hex layers have been trained.
+        strategy: Export strategy for conv layers. One of:
+                  - "slotwise" (default): K separate gather+MAC pairs per layer.
+                    Largest static array is (N_out, N_in) per slot — safe for
+                    Vitis HLS synthesis at typical camera sizes.
+                  - "folded": one EinsumDense with the full (N_in,Cin,N_out,Cout)
+                    kernel. Simpler graph; fine for C-simulation but causes Vitis
+                    HLS clang to segfault at synthesis on grids larger than ~9×9.
+                  - "gather": sparse gather layer + custom hls4ml handler. Scales
+                    to full camera size. Not yet implemented.
 
     Returns:
         A new keras.Model — plain Keras, no hls4ml dependency.  Pass this to
         ``hls4ml.converters.convert_from_keras_model()``.
 
     Raises:
-        TypeError:          if ``model`` is not a keras.Model.
-        NotImplementedError: if the model contains a MaxPool3d layer.
-        ValueError:          if depth_stride > 1 is used in a Conv3d layer.
+        TypeError:           if ``model`` is not a keras.Model.
+        ValueError:          if ``strategy`` is not a recognised value.
+        NotImplementedError: for MaxPool3d layers, or strategy="gather",
+                             or Conv3d with depth_stride > 1.
     """
     if not isinstance(model, keras.Model):
         raise TypeError(f"Expected a keras.Model, got {type(model).__name__}.")
+    if strategy not in _STRATEGIES:
+        raise ValueError(
+            f"Unknown strategy {strategy!r}. Choose from: {_STRATEGIES}."
+        )
+    if strategy == "gather":
+        raise NotImplementedError(
+            "strategy='gather' is not yet implemented. "
+            "It will use a sparse gather layer backed by a custom hls4ml "
+            "KerasV3LayerHandler + HLS C++ template, scaling to full camera size."
+        )
+
+    replacements = (
+        _REPLACEMENTS_SLOTWISE if strategy == "slotwise" else _REPLACEMENTS_FOLDED
+    )
 
     # Map from original tensor id -> replacement tensor.
     tensor_map = {id(t): t for t in model.inputs}
@@ -319,7 +573,7 @@ def patch_model_for_hls(model):
             x = tensor_map[id(raw_in)]
 
         # Apply replacement or pass-through.
-        fn = _REPLACEMENTS.get(type(layer))
+        fn = replacements.get(type(layer))
         if fn is not None:
             y = fn(layer, x)
         else:
