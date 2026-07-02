@@ -346,7 +346,19 @@ def _conv2d_slotwise(layer, x):
 
     x_flat = keras.layers.Reshape((N_in, Cin), name=f"{layer.name}_reshape_in")(x)
 
+    # Bias is folded into the last MAC EinsumDense (bias_axes="o"); EinsumDense
+    # supports bias natively and hls4ml converts it — no Lambda/Add (which hls4ml
+    # cannot convert). Only one slot carries the bias so it is added exactly once.
+    bias_vec = layer.bias_tensor.numpy() if layer.use_bias else None
+
     slot_outputs = []
+    # Determine which retained slot will carry the bias (the last non-skipped one).
+    last_active = None
+    for k in range(K):
+        S_probe = any(int(nbr[n, k]) >= 0 for n in range(N_out))
+        if S_probe or np.any(W_k[k]):
+            last_active = k
+
     for k in range(K):
         # Binary selection matrix: S_k[n, m] = 1 iff nbr[n, k] == m.
         S_k = np.zeros((N_out, N_in), np.float32)
@@ -369,41 +381,34 @@ def _conv2d_slotwise(layer, x):
         gathered = gather(x_flat)
         gather.set_weights([S_k])
 
-        # MAC: (B, N_out, Cin) -> (B, N_out, Cout)
+        # MAC: (B, N_out, Cin) -> (B, N_out, Cout). Fold bias into this slot's
+        # EinsumDense if it is the one chosen to carry it.
+        carry_bias = bias_vec is not None and k == last_active
         mac = keras.layers.EinsumDense(
             "anc,co->ano",
             output_shape=(N_out, Cout),
-            bias_axes=None,
+            bias_axes="o" if carry_bias else None,
             name=f"{layer.name}_mac_k{k}",
         )
         y_k = mac(gathered)
-        mac.set_weights([W_k[k]])
+        mac.set_weights([W_k[k], bias_vec] if carry_bias else [W_k[k]])
 
         slot_outputs.append(y_k)
 
     if len(slot_outputs) == 0:
-        # Degenerate: all-zero kernel — return zeros.
-        y_flat = keras.layers.Lambda(lambda t: t * 0.0, name=f"{layer.name}_zero")(
-            keras.layers.EinsumDense(
-                "amc,co->ao",
-                output_shape=(Cout,),
-                bias_axes=None,
-                name=f"{layer.name}_zero_proj",
-            )(x_flat)
+        # Degenerate: all-zero kernel. Emit one EinsumDense with a zero folded
+        # kernel (plus bias if present) so the graph stays hls4ml-convertible.
+        proj = keras.layers.EinsumDense(
+            "amc,mcno->ano",
+            output_shape=(N_out, Cout),
+            bias_axes="o" if bias_vec is not None else None,
+            name=f"{layer.name}_zero_proj",
         )
+        y_flat = proj(x_flat)
+        zero_A = np.zeros((N_in, Cin, N_out, Cout), np.float32)
+        proj.set_weights([zero_A, bias_vec] if bias_vec is not None else [zero_A])
     else:
         y_flat = _binary_add(slot_outputs, name_prefix=layer.name)
-
-    if layer.use_bias:
-        y_flat = keras.layers.Add(name=f"{layer.name}_bias")(
-            [
-                y_flat,
-                keras.layers.Lambda(
-                    lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
-                    name=f"{layer.name}_bias_const",
-                )(y_flat),
-            ]
-        )
 
     return keras.layers.Reshape((H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(y_flat)
 
@@ -451,6 +456,16 @@ def _conv3d_slotwise(layer, x):
             x_seq
         )
 
+    # Bias is folded into the last active MAC EinsumDense (bias_axes="o") rather
+    # than added via a Lambda, which hls4ml cannot convert. Find that (d,k) pair.
+    bias_vec = layer.bias_tensor.numpy() if layer.use_bias else None
+    last_active = None
+    for d in range(D_kernel):
+        for k in range(K):
+            S_probe = any(int(nbr[n, k]) >= 0 for n in range(N_out))
+            if S_probe or np.any(W_k[d, k]):
+                last_active = (d, k)
+
     tap_slot_outputs = []
     for d in range(D_kernel):
         crop_start = d
@@ -484,28 +499,18 @@ def _conv3d_slotwise(layer, x):
             gathered = gather(x_d)
             gather.set_weights([S_k])
 
+            carry_bias = bias_vec is not None and (d, k) == last_active
             mac = keras.layers.EinsumDense(
                 "abnc,co->abno",
                 output_shape=(D_eff, N_out, Cout),
-                bias_axes=None,
+                bias_axes="o" if carry_bias else None,
                 name=f"{layer.name}_mac_d{d}_k{k}",
             )
             y_dk = mac(gathered)
-            mac.set_weights([W_k[d, k]])
+            mac.set_weights([W_k[d, k], bias_vec] if carry_bias else [W_k[d, k]])
             tap_slot_outputs.append(y_dk)
 
     y_flat = _binary_add(tap_slot_outputs, name_prefix=layer.name)
-
-    if layer.use_bias:
-        y_flat = keras.layers.Add(name=f"{layer.name}_bias")(
-            [
-                y_flat,
-                keras.layers.Lambda(
-                    lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
-                    name=f"{layer.name}_bias_const",
-                )(y_flat),
-            ]
-        )
 
     return keras.layers.Reshape((D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(
         y_flat
@@ -563,13 +568,18 @@ def _conv2d_gather(layer, x):
         x_flat
     )  # (B, N_out, K, Cin)
 
-    # HexRingMAC: weights + optional ring_idx
+    # Bias is baked into HexRingMAC (seeded into the accumulator on the FPGA)
+    # so the export graph needs no extra Add/Lambda — hls4ml can't convert those.
+    bias = layer.bias_tensor.numpy() if layer.use_bias else None
+
+    # HexRingMAC: weights + optional ring_idx + bias
     if layer.share_neighbors:
         W_rings = layer.ring_weights.numpy()  # (num_rings, Cin, Cout)
         ring_idx = _get_ring_idx(layer, cells)  # (K,)
         y_flat = HexRingMAC(
             weights_array=W_rings,
             ring_idx=ring_idx,
+            bias=bias,
             name=f"{layer.name}_mac",
         )(gathered)
     else:
@@ -579,19 +589,9 @@ def _conv2d_gather(layer, x):
         y_flat = HexRingMAC(
             weights_array=W_k,
             ring_idx=None,
+            bias=bias,
             name=f"{layer.name}_mac",
         )(gathered)
-
-    if layer.use_bias:
-        y_flat = keras.layers.Add(name=f"{layer.name}_bias")(
-            [
-                y_flat,
-                keras.layers.Lambda(
-                    lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
-                    name=f"{layer.name}_bias_const",
-                )(y_flat),
-            ]
-        )
 
     return keras.layers.Reshape((H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(y_flat)
 

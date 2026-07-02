@@ -29,6 +29,12 @@ struct hex_ring_mac_3d_config {
     static const unsigned num_weight_rows = 7;     // K (full) or num_rings (shared)
     static const bool     share_neighbors = false;
 
+    // Resource reuse: pipeline II = reuse_factor and cap the parallel multiplier
+    // count at multiplier_limit. n_mult counts every multiply across all frames.
+    static const unsigned reuse_factor    = 1;
+    static const unsigned n_mult          = 1 * 81 * 7 * 1 * 4;
+    static const unsigned multiplier_limit = DIV_ROUNDUP(n_mult, reuse_factor);
+
     typedef float weight_t;
     typedef int   ring_idx_t;
     typedef float bias_t;
@@ -43,69 +49,70 @@ void hex_ring_mac_3d(
     b_T     bias      [CONFIG_T::n_out_chan],
     res_T   output    [CONFIG_T::n_depth * CONFIG_T::n_out * CONFIG_T::n_out_chan]
 ) {
-    #pragma HLS PIPELINE II=1
-    #pragma HLS ARRAY_PARTITION variable=input    complete
-    #pragma HLS ARRAY_PARTITION variable=weights  complete
+    // Resource-reuse structure modelled on hls4ml's dense_resource (see the 2D
+    // nnet_hex_ring_mac.h for the rationale). The flat product index here covers
+    // depth as the leading dimension: n_mult = n_depth*n_out*k*n_in_chan*n_out_chan.
+    // The same weight ROM is applied to every depth frame (w_idx ignores d).
+    // At reuse_factor=1 this is a single fully-parallel cycle, matching the
+    // previous behaviour bit-for-bit.
+    const unsigned reuse        = CONFIG_T::reuse_factor;
+    const unsigned block_factor = DIV_ROUNDUP(CONFIG_T::n_mult, reuse);
+
     #pragma HLS ARRAY_PARTITION variable=ring_idx complete
     #pragma HLS ARRAY_PARTITION variable=bias     complete
     #pragma HLS ARRAY_PARTITION variable=output   complete
+    #pragma HLS ARRAY_RESHAPE variable=weights block factor=block_factor
+    #pragma HLS FUNCTION_INSTANTIATE variable=weights,bias
 
-DepthLoop:
-    for (unsigned d = 0; d < CONFIG_T::n_depth; d++) {
+    const unsigned CO    = CONFIG_T::n_out_chan;
+    const unsigned CICO  = CONFIG_T::n_in_chan * CONFIG_T::n_out_chan;
+    const unsigned KCICO = CONFIG_T::k * CICO;
+    const unsigned NKCICO = CONFIG_T::n_out * KCICO;  // products per depth frame
+
+    typename CONFIG_T::accum_t acc[CONFIG_T::n_depth * CONFIG_T::n_out * CONFIG_T::n_out_chan];
+    #pragma HLS ARRAY_PARTITION variable=acc complete
+
+// Seed every (depth, pixel) accumulator with the bias.  The Conv3d export
+// passes a real bias only on the final depth tap (zeros elsewhere), so the
+// total contribution across taps is 1x.
+InitAccum:
+    for (unsigned i = 0; i < CONFIG_T::n_depth * CONFIG_T::n_out * CONFIG_T::n_out_chan; i++) {
         #pragma HLS UNROLL
-        const unsigned in_base  = d * CONFIG_T::n_out * CONFIG_T::k * CONFIG_T::n_in_chan;
-        const unsigned out_base = d * CONFIG_T::n_out * CONFIG_T::n_out_chan;
+        acc[i] = typename CONFIG_T::accum_t(bias[i % CO]);
+    }
 
-        typename CONFIG_T::accum_t acc[CONFIG_T::n_out * CONFIG_T::n_out_chan];
-        #pragma HLS ARRAY_PARTITION variable=acc complete
-
-    InitAccum:
-        for (unsigned n = 0; n < CONFIG_T::n_out; n++) {
+ReuseLoop:
+    for (unsigned ir = 0; ir < reuse; ir++) {
+        #pragma HLS PIPELINE II=1 rewind
+        #pragma HLS ALLOCATION operation instances=mul limit=block_factor
+    MultLoop:
+        for (unsigned im = 0; im < block_factor; im++) {
             #pragma HLS UNROLL
-            for (unsigned o = 0; o < CONFIG_T::n_out_chan; o++) {
-                #pragma HLS UNROLL
-                // Seed with bias so it is added once per output pixel per frame.
-                // The Conv3d export passes a real bias only on the final depth
-                // tap (zeros on the others), so the total bias contribution is 1x.
-                acc[n * CONFIG_T::n_out_chan + o] = typename CONFIG_T::accum_t(bias[o]);
-            }
+            const unsigned idx = ir + reuse * im;  // strided cover of [0, n_mult)
+            if (idx >= CONFIG_T::n_mult)
+                continue;
+            // Decode flat product index -> (d, n, ki, c, o).
+            const unsigned o  = idx % CO;
+            const unsigned c  = (idx / CO) % CONFIG_T::n_in_chan;
+            const unsigned ki = (idx / CICO) % CONFIG_T::k;
+            const unsigned n  = (idx / KCICO) % CONFIG_T::n_out;
+            const unsigned d  = idx / NKCICO;
+            const unsigned row = CONFIG_T::share_neighbors
+                                 ? (unsigned)(int)ring_idx[ki]
+                                 : ki;
+            const data_T in_val =
+                input[d * CONFIG_T::n_out * CONFIG_T::k * CONFIG_T::n_in_chan
+                      + (n * CONFIG_T::k + ki) * CONFIG_T::n_in_chan + c];
+            const unsigned w_idx = (row * CONFIG_T::n_in_chan + c) * CO + o;
+            acc[(d * CONFIG_T::n_out + n) * CO + o] +=
+                typename CONFIG_T::accum_t(in_val * weights[w_idx]);
         }
+    }
 
-    MacOut:
-        for (unsigned n = 0; n < CONFIG_T::n_out; n++) {
-            #pragma HLS UNROLL
-        MacSlot:
-            for (unsigned ki = 0; ki < CONFIG_T::k; ki++) {
-                #pragma HLS UNROLL
-                // Map slot ki to weight row: ring index when sharing, slot index otherwise.
-                // Cast to int: ring_idx may be stored as ap_fixed by hls4ml.
-                unsigned row = CONFIG_T::share_neighbors
-                               ? (unsigned)(int)ring_idx[ki]
-                               : ki;
-            MacCin:
-                for (unsigned c = 0; c < CONFIG_T::n_in_chan; c++) {
-                    #pragma HLS UNROLL
-                    data_T in_val = input[in_base + (n * CONFIG_T::k + ki) * CONFIG_T::n_in_chan + c];
-                MacCout:
-                    for (unsigned o = 0; o < CONFIG_T::n_out_chan; o++) {
-                        #pragma HLS UNROLL
-                        unsigned w_idx = (row * CONFIG_T::n_in_chan + c) * CONFIG_T::n_out_chan + o;
-                        acc[n * CONFIG_T::n_out_chan + o] +=
-                            typename CONFIG_T::accum_t(in_val * weights[w_idx]);
-                    }
-                }
-            }
-        }
-
-    WriteOut:
-        for (unsigned n = 0; n < CONFIG_T::n_out; n++) {
-            #pragma HLS UNROLL
-            for (unsigned o = 0; o < CONFIG_T::n_out_chan; o++) {
-                #pragma HLS UNROLL
-                output[out_base + n * CONFIG_T::n_out_chan + o] =
-                    res_T(acc[n * CONFIG_T::n_out_chan + o]);
-            }
-        }
+WriteOut:
+    for (unsigned i = 0; i < CONFIG_T::n_depth * CONFIG_T::n_out * CONFIG_T::n_out_chan; i++) {
+        #pragma HLS UNROLL
+        output[i] = res_T(acc[i]);
     }
 }
 

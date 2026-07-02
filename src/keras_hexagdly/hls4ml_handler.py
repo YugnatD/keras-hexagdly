@@ -29,6 +29,45 @@ from hls4ml.converters.keras_v3._base import KerasV3LayerHandler
 from hls4ml.model.attributes import Attribute, TypeAttribute, WeightAttribute
 from hls4ml.model.layers import Layer
 
+
+def _index_width(n_in):
+    """Signed bit-width needed to hold a neighbor index in [-1, n_in-1].
+
+    The gather stores flat pixel indices (and -1 for border slots). A fixed
+    16-bit width silently overflows for detectors with >32767 pixels; deriving
+    the width from n_in makes the gather correct at any camera size.
+    """
+    import math
+
+    # values range over [-1, n_in-1]; magnitude n_in-1 needs ceil(log2(n_in))
+    # value bits, plus one sign bit.
+    return int(math.ceil(math.log2(max(2, n_in)))) + 1
+
+
+def _accum_type_str(node, n_terms):
+    """Return an ap_fixed<> string for the ring-MAC accumulator.
+
+    The accumulator sums ``n_terms`` products; to hold that sum without overflow
+    it needs ceil(log2(n_terms)) extra integer bits over the weight type. We grow
+    both the total width and the integer part by the same amount, matching the
+    bit-growth idiom hls4ml uses for its dense/conv accumulators.
+
+    Falls back to the plain weight-type name if the precision can't be read
+    (e.g. a non-FixedPrecision type), which preserves the old behavior.
+    """
+    import math
+
+    prec = node.get_weights("mac_weights").type.precision
+    width = getattr(prec, "width", None)
+    integer = getattr(prec, "integer", None)
+    signed = getattr(prec, "signed", True)
+    if width is None or integer is None:
+        return node.get_weights("mac_weights").type.name
+    scale = int(math.ceil(math.log2(max(1, n_terms))))
+    u = "" if signed else "u"
+    return f"ap_{u}fixed<{width + scale}, {integer + scale}>"
+
+
 # ---------------------------------------------------------------------------
 # hls4ml IR layers
 # ---------------------------------------------------------------------------
@@ -54,6 +93,7 @@ class HHexGather(Layer):
     def initialize(self):
         from hls4ml.model.types import IntegerPrecisionType
 
+        n_in = self.attributes["n_in"]
         n_out = self.attributes["n_out"]
         k = self.attributes["k"]
         n_chan = self.attributes["n_chan"]
@@ -61,10 +101,12 @@ class HHexGather(Layer):
         # Force integer precision for the index table — it holds pixel indices,
         # not fixed-point values.  Without this hls4ml assigns the global
         # ap_fixed precision which breaks the (idx >= 0) border check.
+        # Width is derived from n_in so indices never overflow (a fixed 16-bit
+        # width would silently wrap for detectors with >32767 pixels).
         self.add_weights_variable(
             name="indices",
             var_name="idx{index}",
-            precision=IntegerPrecisionType(width=16, signed=True),
+            precision=IntegerPrecisionType(width=_index_width(n_in), signed=True),
         )
 
 
@@ -84,10 +126,19 @@ class HHexRingMAC(Layer):
         Attribute("n_out_chan"),
         Attribute("num_weight_rows"),  # num_rings (shared) or K (full)
         Attribute("share_neighbors", value_type=bool),
+        # NOTE: reuse_factor is intentionally NOT declared here. hls4ml's base
+        # Layer optimizer (init_base_layer) already sets it from the model/layer
+        # config (falling through to cfg['Model']['ReuseFactor']). Declaring it
+        # as a ConfigurableAttribute with a default would overwrite that value
+        # with the default after init_base_layer runs. The ring MAC honors it by
+        # pipelining at II=reuse_factor and capping the parallel multiplier count,
+        # exactly like hls4ml's dense_latency.
         WeightAttribute("mac_weights"),
         TypeAttribute("mac_weights"),
         WeightAttribute("ring_idx"),
         TypeAttribute("ring_idx"),
+        WeightAttribute("mac_bias"),
+        TypeAttribute("mac_bias"),
     ]
 
     def initialize(self):
@@ -103,6 +154,7 @@ class HHexRingMAC(Layer):
             var_name="ridx{index}",
             precision=IntegerPrecisionType(width=8, signed=False),
         )
+        self.add_weights_variable(name="mac_bias", var_name="b{index}")
 
 
 class HHexMaxPool(Layer):
@@ -179,6 +231,8 @@ class HexRingMACHandler(KerasV3LayerHandler):
             # no ring sharing — dummy ring_idx that maps slot k → k (identity)
             ring_idx = np.arange(k, dtype=np.int32)
 
+        bias = keras_ops_to_numpy(layer.mac_bias).astype(np.float32).reshape(-1)
+
         return {
             "class_name": "HHexRingMAC",
             "n_out": n_out,
@@ -189,6 +243,7 @@ class HexRingMACHandler(KerasV3LayerHandler):
             "share_neighbors": share,
             "mac_weights_data": w,
             "ring_idx_data": ring_idx,
+            "mac_bias_data": bias,
         }
 
 
@@ -227,14 +282,24 @@ struct config{index} : nnet::hex_ring_mac_config {{
     static const unsigned n_out_chan     = {n_out_chan};
     static const unsigned num_weight_rows = {num_weight_rows};
     static const bool     share_neighbors = {share_neighbors_str};
+    static const unsigned reuse_factor    = {reuse};
+    // total multiplications = n_out * k * n_in_chan * n_out_chan; spread over
+    // reuse_factor cycles -> this many parallel multipliers.
+    static const unsigned n_mult          = {n_mult};
+    static const unsigned multiplier_limit = DIV_ROUNDUP(n_mult, reuse_factor);
     typedef {mac_weights_t.name} weight_t;
     typedef {ring_idx_t.name}    ring_idx_t;
-    typedef {mac_weights_t.name} accum_t;
+    typedef {mac_bias_t.name}    bias_t;
+    // Accumulator widened by ceil(log2(#summed terms)) integer+total bits over
+    // the weight type so the neighbor sum cannot overflow (same bit-growth idiom
+    // hls4ml uses for dense/conv accumulators).
+    typedef {accum_t_str} accum_t;
 }};\n"""
 
 hex_ring_mac_function_template = (
-    "nnet::hex_ring_mac<{input_t}, {mac_weights_t}, {ring_idx_t}, {output_t}, {config}>"
-    "({input}, w{index}, ridx{index}, {output});"
+    "nnet::hex_ring_mac<{input_t}, {mac_weights_t}, {ring_idx_t}, {mac_bias_t}, "
+    "{output_t}, {config}>"
+    "({input}, w{index}, ridx{index}, b{index}, {output});"
 )
 
 hex_gather_include_list = ["nnet_utils/nnet_hex_gather.h"]
@@ -278,13 +343,22 @@ class HexRingMACConfigTemplate(LayerConfigTemplate):
         self.template = hex_ring_mac_config_template
 
     def format(self, node):
-        params = self._default_config_params(node)
+        params = self._default_config_params(node)  # provides params['reuse']
         params["n_out"] = node.attributes["n_out"]
         params["k"] = node.attributes["k"]
         params["n_in_chan"] = node.attributes["n_in_chan"]
         params["n_out_chan"] = node.attributes["n_out_chan"]
         params["num_weight_rows"] = node.attributes["num_weight_rows"]
         params["share_neighbors_str"] = "true" if node.attributes["share_neighbors"] else "false"
+        params["n_mult"] = (
+            node.attributes["n_out"]
+            * node.attributes["k"]
+            * node.attributes["n_in_chan"]
+            * node.attributes["n_out_chan"]
+        )
+        # Accumulator holds a sum of K*Cin products per output channel.
+        n_terms = node.attributes["k"] * node.attributes["n_in_chan"]
+        params["accum_t_str"] = _accum_type_str(node, n_terms)
         return self.template.format(**params)
 
 
@@ -300,6 +374,7 @@ class HexRingMACFunctionTemplate(FunctionCallTemplate):
         params["input_t"] = node.get_input_variable(node.inputs[0]).type.name
         params["mac_weights_t"] = node.get_weights("mac_weights").type.name
         params["ring_idx_t"] = node.get_weights("ring_idx").type.name
+        params["mac_bias_t"] = node.get_weights("mac_bias").type.name
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
@@ -395,15 +470,17 @@ class HHexGather3D(Layer):
     def initialize(self):
         from hls4ml.model.types import IntegerPrecisionType
 
+        n_in = self.attributes["n_in"]
         n_depth = self.attributes["n_depth"]
         n_out = self.attributes["n_out"]
         k = self.attributes["k"]
         n_chan = self.attributes["n_chan"]
         self.add_output_variable(shape=[n_depth * n_out * k * n_chan])
+        # Index width derived from n_in (see HHexGather) so it never overflows.
         self.add_weights_variable(
             name="indices",
             var_name="idx{index}",
-            precision=IntegerPrecisionType(width=16, signed=True),
+            precision=IntegerPrecisionType(width=_index_width(n_in), signed=True),
         )
 
 
@@ -538,10 +615,16 @@ struct config{index} : nnet::hex_ring_mac_3d_config {{
     static const unsigned n_out_chan      = {n_out_chan};
     static const unsigned num_weight_rows = {num_weight_rows};
     static const bool     share_neighbors = {share_neighbors_str};
+    static const unsigned reuse_factor    = {reuse};
+    static const unsigned n_mult          = {n_mult};
+    static const unsigned multiplier_limit = DIV_ROUNDUP(n_mult, reuse_factor);
     typedef {mac_weights_t.name} weight_t;
     typedef {ring_idx_t.name}    ring_idx_t;
     typedef {mac_bias_t.name}    bias_t;
-    typedef {mac_weights_t.name} accum_t;
+    // Accumulator widened by ceil(log2(#summed terms)) integer+total bits over
+    // the weight type so the neighbor sum cannot overflow (same bit-growth idiom
+    // hls4ml uses for dense/conv accumulators).
+    typedef {accum_t_str} accum_t;
 }};\n"""
 
 hex_ring_mac_3d_function_template = (
@@ -592,7 +675,7 @@ class HexRingMAC3DConfigTemplate(LayerConfigTemplate):
         self.template = hex_ring_mac_3d_config_template
 
     def format(self, node):
-        params = self._default_config_params(node)
+        params = self._default_config_params(node)  # provides params['reuse']
         params["n_depth"] = node.attributes["n_depth"]
         params["n_out"] = node.attributes["n_out"]
         params["k"] = node.attributes["k"]
@@ -600,6 +683,17 @@ class HexRingMAC3DConfigTemplate(LayerConfigTemplate):
         params["n_out_chan"] = node.attributes["n_out_chan"]
         params["num_weight_rows"] = node.attributes["num_weight_rows"]
         params["share_neighbors_str"] = "true" if node.attributes["share_neighbors"] else "false"
+        params["n_mult"] = (
+            node.attributes["n_depth"]
+            * node.attributes["n_out"]
+            * node.attributes["k"]
+            * node.attributes["n_in_chan"]
+            * node.attributes["n_out_chan"]
+        )
+        # Per-frame accumulator sums K*Cin products; depth taps are summed later
+        # by a native Add layer with its own accumulator inference.
+        n_terms = node.attributes["k"] * node.attributes["n_in_chan"]
+        params["accum_t_str"] = _accum_type_str(node, n_terms)
         return self.template.format(**params)
 
 

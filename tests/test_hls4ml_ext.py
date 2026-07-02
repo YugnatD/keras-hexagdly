@@ -299,6 +299,58 @@ class TestPatchModelMisc:
 
 
 # =============================================================================
+# Serialization: patched (gather) models must save/load round-trip
+# =============================================================================
+
+
+class TestPatchedModelSerialization:
+    """The patched model is what users hand to hls4ml; it must survive
+    model.save() / load_model().  Exercises get_config/from_config of
+    HexGather, HexRingMAC, HexMaxPool and their 3D variants."""
+
+    def _roundtrip(self, model, x, tmp_path, name):
+        y_before = model.predict(x, verbose=0)
+        f = str(tmp_path / f"{name}.keras")
+        model.save(f)
+        reloaded = keras.models.load_model(f)
+        y_after = reloaded.predict(x, verbose=0)
+        assert np.max(np.abs(y_before - y_after)) < 1e-6, (
+            f"{name}: save/load changed the output "
+            f"(max err={np.max(np.abs(y_before - y_after)):.2e})"
+        )
+
+    @pytest.mark.parametrize("share", [False, True])
+    @pytest.mark.parametrize("bias", [False, True])
+    def test_conv2d_maxpool_gather_roundtrip(self, tmp_path, share, bias):
+        inp = keras.Input((H, W, CIN))
+        x = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=bias, share_neighbors=share, name="c1")(inp)
+        x = keras.layers.ReLU()(x)
+        x = hgly.MaxPool2d(kernel_size=1, stride=2, name="p1")(x)
+        model = keras.Model(inp, x)
+        for w in model.trainable_variables:
+            w.assign(RNG.standard_normal(w.shape).astype(np.float32))
+        patched = patch_model_for_hls(model, strategy="gather")
+        x_in = RNG.standard_normal((2, H, W, CIN)).astype(np.float32)
+        self._roundtrip(patched, x_in, tmp_path, f"g2d_s{share}_b{bias}")
+
+    @pytest.mark.parametrize("depth_padding", ["valid", "same"])
+    def test_conv3d_maxpool_gather_roundtrip(self, tmp_path, depth_padding):
+        inp = keras.Input((D, H, W, CIN))
+        x = hgly.Conv3d(
+            CIN, COUT, kernel_size=(2, 1), bias=True,
+            share_neighbors=True, depth_padding=depth_padding, name="c3",
+        )(inp)
+        x = keras.layers.ReLU()(x)
+        x = hgly.MaxPool3d(kernel_size=(2, 1), name="p3")(x)
+        model = keras.Model(inp, x)
+        for w in model.trainable_variables:
+            w.assign(RNG.standard_normal(w.shape).astype(np.float32))
+        patched = patch_model_for_hls(model, strategy="gather")
+        x_in = RNG.standard_normal((1, D, H, W, CIN)).astype(np.float32)
+        self._roundtrip(patched, x_in, tmp_path, f"g3d_{depth_padding}")
+
+
+# =============================================================================
 # Slotwise strategy tests
 # =============================================================================
 
@@ -752,6 +804,79 @@ class TestHls4mlCsim:
 
         assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
             f"gather C-sim share={share}: max err={np.max(np.abs(y_hls - y_ref)):.4f}"
+        )
+
+    @pytest.mark.parametrize("share", [False, True])
+    def test_conv2d_gather_with_bias_csim(self, tmp_path, share):
+        """Conv2d with bias=True must convert + C-sim under strategy='gather'.
+
+        Regression: the bias used to be injected via a Lambda layer, which
+        hls4ml has no handler for (conversion crashed).  The bias is now baked
+        into HexRingMAC (seeded into the accumulator).
+        """
+        from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+        register_hex_gather_layers()
+
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / f"hls_gather_bias_share{share}")
+
+        layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=True, share_neighbors=share)
+        model = _build_2d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((1, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0).reshape(-1)
+
+        patched = patch_model_for_hls(model, strategy="gather")
+        y_hls = _csim(patched, x).reshape(-1)
+
+        assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
+            f"gather+bias C-sim share={share}: max err={np.max(np.abs(y_hls - y_ref)):.4f}"
+        )
+
+    @pytest.mark.parametrize("share", [False, True])
+    def test_conv2d_slotwise_with_bias_csim(self, tmp_path, share):
+        """Conv2d bias=True under strategy='slotwise' must convert + C-sim.
+
+        Regression: slotwise also injected bias via a Lambda (hls4ml can't
+        convert it); the bias is now folded into the last MAC EinsumDense.
+        """
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / f"hls_slotwise_bias_share{share}")
+
+        layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=True, share_neighbors=share)
+        model = _build_2d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((1, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0).reshape(-1)
+
+        patched = patch_model_for_hls(model, strategy="slotwise")
+        y_hls = _csim(patched, x).reshape(-1)
+
+        assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
+            f"slotwise+bias C-sim share={share}: max err={np.max(np.abs(y_hls - y_ref)):.4f}"
+        )
+
+    def test_conv3d_slotwise_with_bias_csim(self, tmp_path):
+        """Conv3d bias=True under strategy='slotwise' must convert + C-sim
+        (bias folded into the last active MAC EinsumDense, no Lambda)."""
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / "hls_slotwise3d_bias")
+
+        layer = hgly.Conv3d(CIN, COUT, kernel_size=(1, 1), bias=True, depth_padding="valid")
+        model = _build_3d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((1, D, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0).reshape(-1)
+
+        patched = patch_model_for_hls(model, strategy="slotwise")
+        y_hls = _csim(patched, x).reshape(-1)
+
+        assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
+            f"slotwise3d+bias C-sim: max err={np.max(np.abs(y_hls - y_ref)):.4f}"
         )
 
     def test_conv2d_gather_border_pixels_csim(self, tmp_path):
@@ -1239,4 +1364,183 @@ class TestHls4mlCsim:
 
         assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
             f"MaxPool3d gather border C-sim: max err={np.max(np.abs(y_hls - y_ref)):.4f}"
+        )
+
+    @pytest.mark.parametrize("reuse", [1, 3])
+    def test_ring_mac_reuse_factor(self, tmp_path, reuse):
+        """ReuseFactor must reach the HexRingMAC config and must not change the
+        C-sim result (reuse only affects scheduling / multiplier count).
+
+        This guards against the earlier bug where the ring MAC hardcoded
+        II=1 and ignored ReuseFactor entirely.
+        """
+        from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+        register_hex_gather_layers()
+
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / f"hls_rf{reuse}")
+
+        layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=False, share_neighbors=True)
+        model = _build_2d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((1, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0).reshape(-1)
+
+        patched = patch_model_for_hls(model, strategy="gather")
+        cfg = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vivado")
+        cfg["Model"]["Precision"] = "ap_fixed<32,12>"
+        cfg["Model"]["ReuseFactor"] = reuse
+        hm = hls4ml.converters.convert_from_keras_model(
+            patched, hls_config=cfg, backend="Vivado",
+            output_dir=_HLS_DIR, part=_HLS_PART,
+        )
+        hm.compile()  # writes the firmware (parameters.h, config headers, ...)
+
+        # The generated ring-MAC config header must carry the requested reuse.
+        import glob
+        params_files = glob.glob(f"{_HLS_DIR}/**/parameters.h", recursive=True)
+        assert params_files, "parameters.h not generated"
+        params_txt = "".join(open(p).read() for p in params_files)
+        assert f"reuse_factor    = {reuse}" in params_txt, (
+            f"ReuseFactor={reuse} did not reach the HexRingMAC config"
+        )
+
+        y_hls = hm.predict(np.ascontiguousarray(x)).reshape(-1)
+        assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
+            f"reuse={reuse}: C-sim differs from reference "
+            f"(max err={np.max(np.abs(y_hls - y_ref)):.4f})"
+        )
+
+    @pytest.mark.parametrize("reuse", [1, 3])
+    def test_ring_mac_3d_reuse_factor(self, tmp_path, reuse):
+        """ReuseFactor must reach the Conv3d HexRingMAC3D config and must not
+        change the C-sim result — same guard as the 2D ring MAC."""
+        from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+        register_hex_gather_layers()
+
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / f"hls_rf3d{reuse}")
+
+        layer = hgly.Conv3d(CIN, COUT, kernel_size=(1, 1), bias=False, share_neighbors=True)
+        model = _build_3d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((1, D, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0).reshape(-1)
+
+        patched = patch_model_for_hls(model, strategy="gather")
+        cfg = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vivado")
+        cfg["Model"]["Precision"] = "ap_fixed<32,12>"
+        cfg["Model"]["ReuseFactor"] = reuse
+        hm = hls4ml.converters.convert_from_keras_model(
+            patched, hls_config=cfg, backend="Vivado",
+            output_dir=_HLS_DIR, part=_HLS_PART,
+        )
+        hm.compile()
+
+        import glob
+        params_files = glob.glob(f"{_HLS_DIR}/**/parameters.h", recursive=True)
+        assert params_files, "parameters.h not generated"
+        params_txt = "".join(open(p).read() for p in params_files)
+        assert f"reuse_factor    = {reuse}" in params_txt, (
+            f"ReuseFactor={reuse} did not reach the HexRingMAC3D config"
+        )
+
+        y_hls = hm.predict(np.ascontiguousarray(x)).reshape(-1)
+        assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
+            f"3D reuse={reuse}: C-sim differs from reference "
+            f"(max err={np.max(np.abs(y_hls - y_ref)):.4f})"
+        )
+
+    @pytest.mark.parametrize("kernel_size,cin", [(1, 1), (2, 2), (3, 1)])
+    def test_ring_mac_accum_wider_than_weight(self, tmp_path, kernel_size, cin):
+        """The MAC accumulator type must be wider than the weight type by
+        ceil(log2(K*Cin)) bits, so summing the neighbor products cannot overflow.
+
+        This is a structural check on the generated config header (reliable —
+        it directly asserts the fix), rather than a runtime overflow which is
+        entangled with output-type saturation and hard to isolate.
+        """
+        from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+        register_hex_gather_layers()
+
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / f"hls_accum_k{kernel_size}_c{cin}")
+
+        layer = hgly.Conv2d(cin, 2, kernel_size=kernel_size, bias=False, share_neighbors=True)
+        inp = keras.Input((H, W, cin), name="x")
+        model = keras.Model(inp, layer(inp))
+        for w in layer.trainable_variables:
+            w.assign(RNG.standard_normal(w.shape).astype(np.float32))
+
+        patched = patch_model_for_hls(model, strategy="gather")
+        cfg = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vivado")
+        cfg["Model"]["Precision"] = "ap_fixed<16,6>"
+        hm = hls4ml.converters.convert_from_keras_model(
+            patched, hls_config=cfg, backend="Vivado",
+            output_dir=_HLS_DIR, part=_HLS_PART,
+        )
+        hm.compile()
+
+        import glob
+        import math
+
+        params_files = glob.glob(f"{_HLS_DIR}/**/parameters.h", recursive=True)
+        params_txt = "".join(open(p).read() for p in params_files)
+
+        # Find the ring-MAC accum_t typedef and parse its integer bits.
+        # K includes the center + rings for this kernel size.
+        from keras_hexagdly.indexed import _cell_list
+
+        k = len(_cell_list(kernel_size))
+        scale = math.ceil(math.log2(k * cin))
+        # weight type is ap_fixed<16,6>; accum must be ap_fixed<16+scale, 6+scale>
+        expected = f"ap_fixed<{16 + scale}, {6 + scale}>"
+        assert f"typedef {expected} accum_t;" in params_txt, (
+            f"expected accum_t {expected} (scale={scale} for K*Cin={k * cin}), "
+            f"not found in generated config"
+        )
+
+    def test_gather_index_width_derived_from_n_in(self, tmp_path):
+        """The gather index type width must be derived from N_in (not a fixed
+        16 bits), so it neither overflows for large detectors nor wastes bits
+        for small ones. For N_in=H*W here, width = ceil(log2(N_in)) + 1 (sign)."""
+        import math
+
+        from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+        register_hex_gather_layers()
+
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / "hls_index_width")
+
+        layer = hgly.Conv2d(1, 2, kernel_size=1, bias=False, share_neighbors=True)
+        inp = keras.Input((H, W, 1), name="x")
+        model = keras.Model(inp, layer(inp))
+        for w in layer.trainable_variables:
+            w.assign(RNG.standard_normal(w.shape).astype(np.float32))
+
+        patched = patch_model_for_hls(model, strategy="gather")
+        cfg = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vivado")
+        cfg["Model"]["Precision"] = "ap_fixed<16,6>"
+        hm = hls4ml.converters.convert_from_keras_model(
+            patched, hls_config=cfg, backend="Vivado",
+            output_dir=_HLS_DIR, part=_HLS_PART,
+        )
+        hm.compile()
+
+        import glob
+
+        params_txt = "".join(
+            open(p).read() for p in glob.glob(f"{_HLS_DIR}/**/defines.h", recursive=True)
+        )
+        n_in = H * W
+        expected_w = math.ceil(math.log2(n_in)) + 1
+        assert f"ap_int<{expected_w}>" in params_txt, (
+            f"expected index type ap_int<{expected_w}> for N_in={n_in}, "
+            f"not found — index width not derived from N_in"
         )

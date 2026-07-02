@@ -91,13 +91,22 @@ class HexRingMAC(keras.layers.Layer):
     share_neighbors=True:  weights (num_rings, Cin, Cout), ring_idx (K,) int.
       On the FPGA this stores only num_rings unique weight vectors instead of K,
       mapping each slot to its ring via a tiny ROM (ring_idx).
+
+    ``bias`` (Cout,) is added to the output; it lives inside this layer (seeded
+    into the accumulator on the FPGA) so the export graph needs no extra Add /
+    Lambda layer — hls4ml has no handler for those. Pass None for no bias.
     """
 
-    def __init__(self, weights_array, ring_idx=None, **kwargs):
+    def __init__(self, weights_array, ring_idx=None, bias=None, **kwargs):
         super().__init__(**kwargs)
         self._weights_init = np.asarray(weights_array, dtype=np.float32)
         self._ring_idx_init = np.asarray(ring_idx, dtype=np.int32) if ring_idx is not None else None
         self.share_neighbors = ring_idx is not None
+        Cout = self._weights_init.shape[-1]
+        if bias is None:
+            self._bias_init = np.zeros((Cout,), dtype=np.float32)
+        else:
+            self._bias_init = np.asarray(bias, dtype=np.float32).reshape(Cout)
 
     def build(self, input_shape):
         self.mac_weights = self.add_weight(
@@ -115,6 +124,13 @@ class HexRingMAC(keras.layers.Layer):
                 initializer=keras.initializers.Constant(self._ring_idx_init),
                 trainable=False,
             )
+        self.mac_bias = self.add_weight(
+            name="mac_bias",
+            shape=self._bias_init.shape,
+            dtype="float32",
+            initializer=keras.initializers.Constant(self._bias_init),
+            trainable=False,
+        )
         super().build(input_shape)
 
     def call(self, x):
@@ -127,7 +143,8 @@ class HexRingMAC(keras.layers.Layer):
 
         # sum over K slots and Cin channels
         # x: (B, N_out, K, Cin), W: (K, Cin, Cout) → (B, N_out, Cout)
-        return keras.ops.einsum("bnkc,kco->bno", x, W)
+        y = keras.ops.einsum("bnkc,kco->bno", x, W)
+        return y + keras.ops.reshape(self.mac_bias, (1, 1, -1))
 
     def get_config(self):
         config = super().get_config()
@@ -135,6 +152,7 @@ class HexRingMAC(keras.layers.Layer):
         config["ring_idx"] = (
             self._ring_idx_init.tolist() if self._ring_idx_init is not None else None
         )
+        config["bias"] = self._bias_init.tolist()
         return config
 
     @classmethod
@@ -143,6 +161,8 @@ class HexRingMAC(keras.layers.Layer):
         config["weights_array"] = np.asarray(config["weights_array"], dtype=np.float32)
         if config["ring_idx"] is not None:
             config["ring_idx"] = np.asarray(config["ring_idx"], dtype=np.int32)
+        if config.get("bias") is not None:
+            config["bias"] = np.asarray(config["bias"], dtype=np.float32)
         return cls(**config)
 
 
