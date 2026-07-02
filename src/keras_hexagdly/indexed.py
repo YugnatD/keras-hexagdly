@@ -32,11 +32,10 @@ export the caller is responsible for mapping CameraGeometry pixel IDs to (h, w)
 positions (via GridTransform) and re-indexing if needed.
 """
 
-import numpy as np
 import keras
+import numpy as np
 
 from keras_hexagdly.layers import Conv2d_CustomKernel, ring_maps_2d
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -157,10 +156,8 @@ def get_cell_weights(layer, cells):
 
     if layer.share_neighbors:
         ring_maps, _ = ring_maps_2d(n)
-        W_rings = layer.ring_weights.numpy()          # (num_rings, Cin, Cout)
-        W = np.stack(
-            [W_rings[int(ring_maps[i][r, c])] for i, r, c in cells]
-        )
+        W_rings = layer.ring_weights.numpy()  # (num_rings, Cin, Cout)
+        W = np.stack([W_rings[int(ring_maps[i][r, c])] for i, r, c in cells])
     else:
         base = [k.numpy() for k in layer._base_kernels]  # [(kh,kw,Cin,Cout)]
         W = np.stack([base[i][r, c] for i, r, c in cells])
@@ -182,9 +179,9 @@ def indexed_conv2d_forward(x_flat, neighbor_idx, W):
     Returns:
         float32 ndarray (N_out, Cout).
     """
-    valid = neighbor_idx >= 0                                # (N_out, K)
-    safe_idx = np.where(valid, neighbor_idx, 0)              # clamp for indexing
-    gathered = x_flat[safe_idx]                             # (N_out, K, Cin)
+    valid = neighbor_idx >= 0  # (N_out, K)
+    safe_idx = np.where(valid, neighbor_idx, 0)  # clamp for indexing
+    gathered = x_flat[safe_idx]  # (N_out, K, Cin)
     gathered = np.where(valid[:, :, np.newaxis], gathered, 0.0)
     return np.einsum("nkc,kco->no", gathered, W)
 
@@ -203,11 +200,11 @@ def indexed_maxpool2d_forward(x_flat, neighbor_idx):
     Returns:
         float32 ndarray (N_out, C).
     """
-    valid = neighbor_idx >= 0                                # (N_out, K)
+    valid = neighbor_idx >= 0  # (N_out, K)
     safe_idx = np.where(valid, neighbor_idx, 0)
-    gathered = x_flat[safe_idx]                             # (N_out, K, C)
+    gathered = x_flat[safe_idx]  # (N_out, K, C)
     gathered = np.where(valid[:, :, np.newaxis], gathered, 0.0)
-    return gathered.max(axis=1)                             # (N_out, C)
+    return gathered.max(axis=1)  # (N_out, C)
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +234,9 @@ def build_neighbor_table_3d(layer, D, H, W):
     """
     import keras_hexagdly as hgly
 
-    hex_size   = layer.hexbase_size
+    hex_size = layer.hexbase_size
     hex_stride = layer.hexbase_stride
-    depth_size   = layer.depth_size
+    depth_size = layer.depth_size
     depth_stride = layer.depth_stride
 
     # Build a 2D proxy to derive the spatial table.
@@ -271,15 +268,15 @@ def get_cell_weights_3d(layer, cells):
 
     if layer.share_neighbors:
         ring_maps, _ = ring_maps_2d(n)
-        W_rings = layer.ring_weights.numpy()     # (D, num_rings, Cin, Cout)
+        W_rings = layer.ring_weights.numpy()  # (D, num_rings, Cin, Cout)
         D = W_rings.shape[0]
         ring_indices = [int(ring_maps[i][r, c]) for i, r, c in cells]
-        W = W_rings[:, ring_indices, :, :]       # (D, K, Cin, Cout)
+        W = W_rings[:, ring_indices, :, :]  # (D, K, Cin, Cout)
     else:
         base = [k.numpy() for k in layer._base_kernels]  # [(D,kh,kw,Cin,Cout)]
         D = base[0].shape[0]
         K = len(cells)
-        Cin  = base[0].shape[-2]
+        Cin = base[0].shape[-2]
         Cout = base[0].shape[-1]
         W = np.zeros((D, K, Cin, Cout), np.float32)
         for k_idx, (i, r, c) in enumerate(cells):
@@ -305,15 +302,15 @@ def indexed_conv3d_forward(x_flat, neighbor_idx, W, depth_stride=1):
     D_out = (D_in - D_kernel) // depth_stride + 1
     N_out = neighbor_idx.shape[0]
 
-    valid   = neighbor_idx >= 0                    # (N_out, K)
-    safe_idx = np.where(valid, neighbor_idx, 0)    # (N_out, K)
+    valid = neighbor_idx >= 0  # (N_out, K)
+    safe_idx = np.where(valid, neighbor_idx, 0)  # (N_out, K)
 
     out = np.zeros((D_out, N_out, Cout), np.float32)
     for t_out in range(D_out):
         for d in range(D_kernel):
             t_in = t_out * depth_stride + d
-            x_t = x_flat[t_in]                                # (N_in, Cin)
-            gathered = x_t[safe_idx]                          # (N_out, K, Cin)
+            x_t = x_flat[t_in]  # (N_in, Cin)
+            gathered = x_t[safe_idx]  # (N_out, K, Cin)
             gathered = np.where(valid[:, :, np.newaxis], gathered, 0.0)
             out[t_out] += np.einsum("nkc,kco->no", gathered, W[d])
 
@@ -338,15 +335,15 @@ def indexed_maxpool3d_forward(x_flat, neighbor_idx, depth_size, depth_stride=1):
     N_out = neighbor_idx.shape[0]
     D_out = (D_in - depth_size) // depth_stride + 1
 
-    valid    = neighbor_idx >= 0
+    valid = neighbor_idx >= 0
     safe_idx = np.where(valid, neighbor_idx, 0)
 
     out = np.full((D_out, N_out, C), -np.inf, np.float32)
     for t_out in range(D_out):
         for d in range(depth_size):
             t_in = t_out * depth_stride + d
-            x_t = x_flat[t_in]                               # (N_in, C)
-            gathered = x_t[safe_idx]                         # (N_out, K, C)
+            x_t = x_flat[t_in]  # (N_in, C)
+            gathered = x_t[safe_idx]  # (N_out, K, C)
             gathered = np.where(valid[:, :, np.newaxis], gathered, 0.0)
             out[t_out] = np.maximum(out[t_out], gathered.max(axis=1))
 

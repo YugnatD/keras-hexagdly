@@ -62,17 +62,16 @@ Invalid neighbor slots (-1 in the table) contribute 0.0, matching hexagdly's
 zero-padding at the grid border.
 """
 
-import numpy as np
 import keras
+import numpy as np
 
 import keras_hexagdly as hgly
 from keras_hexagdly.indexed import (
     build_neighbor_table,
-    get_cell_weights,
     build_neighbor_table_3d,
+    get_cell_weights,
     get_cell_weights_3d,
 )
-
 
 # ---------------------------------------------------------------------------
 # Per-layer replacement builders
@@ -87,12 +86,12 @@ def _conv2d_replacement(layer, x):
     nbr[n, k] == m.  Invalid slots (-1) are skipped so they contribute 0.
     """
     H, W = int(x.shape[1]), int(x.shape[2])
-    Cin  = int(x.shape[3])
+    Cin = int(x.shape[3])
     N_in = H * W
     Cout = layer.out_channels
 
     nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
-    W_k = get_cell_weights(layer, cells)          # (K, Cin, Cout)
+    W_k = get_cell_weights(layer, cells)  # (K, Cin, Cout)
     N_out = H_out * W_out
     K = len(cells)
 
@@ -103,9 +102,7 @@ def _conv2d_replacement(layer, x):
             if m >= 0:
                 A[m, :, n, :] += W_k[k]
 
-    x_flat = keras.layers.Reshape(
-        (N_in, Cin), name=f"{layer.name}_reshape_in"
-    )(x)
+    x_flat = keras.layers.Reshape((N_in, Cin), name=f"{layer.name}_reshape_in")(x)
 
     use_bias = layer.use_bias
     einsum = keras.layers.EinsumDense(
@@ -120,9 +117,7 @@ def _conv2d_replacement(layer, x):
     else:
         einsum.set_weights([A])
 
-    return keras.layers.Reshape(
-        (H_out, W_out, Cout), name=f"{layer.name}_reshape_out"
-    )(y_flat)
+    return keras.layers.Reshape((H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(y_flat)
 
 
 def _maxpool2d_replacement(layer, x):
@@ -133,7 +128,7 @@ def _maxpool2d_replacement(layer, x):
     pool_size=K and strides=K then reduces each K-block to a single max value.
     """
     H, W = int(x.shape[1]), int(x.shape[2])
-    C    = int(x.shape[3])
+    C = int(x.shape[3])
     N_in = H * W
 
     nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
@@ -147,9 +142,7 @@ def _maxpool2d_replacement(layer, x):
             if m >= 0:
                 S[n * K + k, m] = 1.0
 
-    x_flat = keras.layers.Reshape(
-        (N_in, C), name=f"{layer.name}_reshape_in"
-    )(x)
+    x_flat = keras.layers.Reshape((N_in, C), name=f"{layer.name}_reshape_in")(x)
 
     gather = keras.layers.EinsumDense(
         "amc,pm->apc",
@@ -160,13 +153,11 @@ def _maxpool2d_replacement(layer, x):
     gathered = gather(x_flat)
     gather.set_weights([S])
 
-    pooled = keras.layers.MaxPooling1D(
-        pool_size=K, strides=K, name=f"{layer.name}_pool1d"
-    )(gathered)
+    pooled = keras.layers.MaxPooling1D(pool_size=K, strides=K, name=f"{layer.name}_pool1d")(
+        gathered
+    )
 
-    return keras.layers.Reshape(
-        (H_out, W_out, C), name=f"{layer.name}_reshape_out"
-    )(pooled)
+    return keras.layers.Reshape((H_out, W_out, C), name=f"{layer.name}_reshape_out")(pooled)
 
 
 def _maxpool2d_gather(layer, x):
@@ -179,25 +170,18 @@ def _maxpool2d_gather(layer, x):
     from keras_hexagdly.hex_gather import HexGather, HexMaxPool
 
     H, W = int(x.shape[1]), int(x.shape[2])
-    C    = int(x.shape[3])
+    C = int(x.shape[3])
     N_in = H * W
 
     nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
-    N_out = H_out * W_out
 
-    x_flat = keras.layers.Reshape(
-        (N_in, C), name=f"{layer.name}_reshape_in"
-    )(x)
+    x_flat = keras.layers.Reshape((N_in, C), name=f"{layer.name}_reshape_in")(x)
 
-    gathered = HexGather(
-        neighbor_idx=nbr, name=f"{layer.name}_gather"
-    )(x_flat)                                           # (B, N_out, K, C)
+    gathered = HexGather(neighbor_idx=nbr, name=f"{layer.name}_gather")(x_flat)  # (B, N_out, K, C)
 
     pooled = HexMaxPool(name=f"{layer.name}_maxpool")(gathered)  # (B, N_out, C)
 
-    return keras.layers.Reshape(
-        (H_out, W_out, C), name=f"{layer.name}_reshape_out"
-    )(pooled)
+    return keras.layers.Reshape((H_out, W_out, C), name=f"{layer.name}_reshape_out")(pooled)
 
 
 def _conv3d_replacement(layer, x):
@@ -214,9 +198,9 @@ def _conv3d_replacement(layer, x):
     """
     D_in = int(x.shape[1])
     H, W = int(x.shape[2]), int(x.shape[3])
-    Cin  = int(x.shape[4])
+    Cin = int(x.shape[4])
     N_in = H * W
-    D_kernel    = layer.depth_size
+    D_kernel = layer.depth_size
     depth_stride = layer.depth_stride
     Cout = layer.out_channels
 
@@ -237,8 +221,7 @@ def _conv3d_replacement(layer, x):
         D_eff = D_in - D_kernel + 1  # valid conv output depth
 
     nbr, cells, _ = build_neighbor_table_3d(layer, D_in, H, W)
-    W_k = get_cell_weights_3d(layer, cells)          # (D_kernel, K, Cin, Cout)
-    N_out_spatial = int(nbr.shape[0])                # H_out * W_out (spatial)
+    W_k = get_cell_weights_3d(layer, cells)  # (D_kernel, K, Cin, Cout)
     K = len(cells)
 
     # Get H_out, W_out from a proxy
@@ -248,30 +231,26 @@ def _conv3d_replacement(layer, x):
 
     # Reshape to (B, D_padded, N_in*Cin) for Cropping1D / ZeroPadding1D.
     D_padded = D_in + pad_top + pad_bot
-    x_seq = keras.layers.Reshape(
-        (D_in, N_in * Cin), name=f"{layer.name}_reshape_seq"
-    )(x)
+    x_seq = keras.layers.Reshape((D_in, N_in * Cin), name=f"{layer.name}_reshape_seq")(x)
     if pad_top > 0 or pad_bot > 0:
-        x_seq = keras.layers.ZeroPadding1D(
-            padding=(pad_top, pad_bot), name=f"{layer.name}_zpad"
-        )(x_seq)
+        x_seq = keras.layers.ZeroPadding1D(padding=(pad_top, pad_bot), name=f"{layer.name}_zpad")(
+            x_seq
+        )
 
     tap_outputs = []
     for d in range(D_kernel):
         # Crop to extract the D_eff frames for this tap.
         crop_start = d
-        crop_end = D_padded - D_eff - d   # = D_kernel - 1 - d
+        crop_end = D_padded - D_eff - d  # = D_kernel - 1 - d
         if crop_start == 0 and crop_end == 0:
             x_d_seq = x_seq
         else:
             x_d_seq = keras.layers.Cropping1D(
                 cropping=(crop_start, crop_end),
                 name=f"{layer.name}_crop_d{d}",
-            )(x_seq)                                   # (B, D_eff, N_in*Cin)
+            )(x_seq)  # (B, D_eff, N_in*Cin)
 
-        x_d = keras.layers.Reshape(
-            (D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}"
-        )(x_d_seq)
+        x_d = keras.layers.Reshape((D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}")(x_d_seq)
 
         # Build folded spatial kernel for this depth tap: (N_in, Cin, N_out, Cout)
         A_d = np.zeros((N_in, Cin, N_out, Cout), np.float32)
@@ -303,18 +282,17 @@ def _conv3d_replacement(layer, x):
     else:
         y_flat = keras.layers.Add(name=f"{layer.name}_add")(tap_outputs)
 
-    return keras.layers.Reshape(
-        (D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out"
-    )(y_flat)
+    return keras.layers.Reshape((D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(
+        y_flat
+    )
 
 
 def _maxpool3d_replacement(layer, x):
     raise NotImplementedError(
-        "MaxPool3d hls4ml export is not yet implemented. "
-        "The temporal+spatial max requires an (N_out, D_kernel, K) -> (N_out, D_kernel*K) "
-        "reordering that needs a Transpose not available in stock hls4ml ops. "
-        "Workaround: replace MaxPool3d with MaxPool2d on each depth slice manually, "
-        "or use a custom KerasV3LayerHandler + HLS template."
+        "MaxPool3d export is only implemented for strategy='gather'. "
+        "Max is not linear, so the folded/slotwise EinsumDense decompositions do "
+        "not apply. Use patch_model_for_hls(model, strategy='gather'), which maps "
+        "MaxPool3d to HexGather3D + HexMaxPool3D."
     )
 
 
@@ -357,18 +335,16 @@ def _conv2d_slotwise(layer, x):
     well within Vitis HLS elaboration limits.
     """
     H, W = int(x.shape[1]), int(x.shape[2])
-    Cin  = int(x.shape[3])
+    Cin = int(x.shape[3])
     N_in = H * W
     Cout = layer.out_channels
 
     nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
-    W_k = get_cell_weights(layer, cells)          # (K, Cin, Cout)
+    W_k = get_cell_weights(layer, cells)  # (K, Cin, Cout)
     N_out = H_out * W_out
     K = len(cells)
 
-    x_flat = keras.layers.Reshape(
-        (N_in, Cin), name=f"{layer.name}_reshape_in"
-    )(x)
+    x_flat = keras.layers.Reshape((N_in, Cin), name=f"{layer.name}_reshape_in")(x)
 
     slot_outputs = []
     for k in range(K):
@@ -407,27 +383,29 @@ def _conv2d_slotwise(layer, x):
 
     if len(slot_outputs) == 0:
         # Degenerate: all-zero kernel — return zeros.
-        y_flat = keras.layers.Lambda(
-            lambda t: t * 0.0, name=f"{layer.name}_zero"
-        )(keras.layers.EinsumDense(
-            "amc,co->ao", output_shape=(Cout,), bias_axes=None,
-            name=f"{layer.name}_zero_proj",
-        )(x_flat))
+        y_flat = keras.layers.Lambda(lambda t: t * 0.0, name=f"{layer.name}_zero")(
+            keras.layers.EinsumDense(
+                "amc,co->ao",
+                output_shape=(Cout,),
+                bias_axes=None,
+                name=f"{layer.name}_zero_proj",
+            )(x_flat)
+        )
     else:
         y_flat = _binary_add(slot_outputs, name_prefix=layer.name)
 
     if layer.use_bias:
-        y_flat = keras.layers.Add(name=f"{layer.name}_bias")([
-            y_flat,
-            keras.layers.Lambda(
-                lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
-                name=f"{layer.name}_bias_const",
-            )(y_flat),
-        ])
+        y_flat = keras.layers.Add(name=f"{layer.name}_bias")(
+            [
+                y_flat,
+                keras.layers.Lambda(
+                    lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
+                    name=f"{layer.name}_bias_const",
+                )(y_flat),
+            ]
+        )
 
-    return keras.layers.Reshape(
-        (H_out, W_out, Cout), name=f"{layer.name}_reshape_out"
-    )(y_flat)
+    return keras.layers.Reshape((H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(y_flat)
 
 
 def _conv3d_slotwise(layer, x):
@@ -438,9 +416,9 @@ def _conv3d_slotwise(layer, x):
     """
     D_in = int(x.shape[1])
     H, W = int(x.shape[2]), int(x.shape[3])
-    Cin  = int(x.shape[4])
+    Cin = int(x.shape[4])
     N_in = H * W
-    D_kernel    = layer.depth_size
+    D_kernel = layer.depth_size
     depth_stride = layer.depth_stride
     Cout = layer.out_channels
 
@@ -459,7 +437,7 @@ def _conv3d_slotwise(layer, x):
         D_eff = D_in - D_kernel + 1
 
     nbr, cells, _ = build_neighbor_table_3d(layer, D_in, H, W)
-    W_k = get_cell_weights_3d(layer, cells)          # (D_kernel, K, Cin, Cout)
+    W_k = get_cell_weights_3d(layer, cells)  # (D_kernel, K, Cin, Cout)
     K = len(cells)
 
     proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
@@ -467,18 +445,16 @@ def _conv3d_slotwise(layer, x):
     N_out = H_out * W_out
 
     D_padded = D_in + pad_top + pad_bot
-    x_seq = keras.layers.Reshape(
-        (D_in, N_in * Cin), name=f"{layer.name}_reshape_seq"
-    )(x)
+    x_seq = keras.layers.Reshape((D_in, N_in * Cin), name=f"{layer.name}_reshape_seq")(x)
     if pad_top > 0 or pad_bot > 0:
-        x_seq = keras.layers.ZeroPadding1D(
-            padding=(pad_top, pad_bot), name=f"{layer.name}_zpad"
-        )(x_seq)
+        x_seq = keras.layers.ZeroPadding1D(padding=(pad_top, pad_bot), name=f"{layer.name}_zpad")(
+            x_seq
+        )
 
     tap_slot_outputs = []
     for d in range(D_kernel):
         crop_start = d
-        crop_end   = D_padded - D_eff - d
+        crop_end = D_padded - D_eff - d
         if crop_start == 0 and crop_end == 0:
             x_d_seq = x_seq
         else:
@@ -487,9 +463,7 @@ def _conv3d_slotwise(layer, x):
                 name=f"{layer.name}_crop_d{d}",
             )(x_seq)
 
-        x_d = keras.layers.Reshape(
-            (D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}"
-        )(x_d_seq)
+        x_d = keras.layers.Reshape((D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}")(x_d_seq)
 
         for k in range(K):
             S_k = np.zeros((N_out, N_in), np.float32)
@@ -523,17 +497,19 @@ def _conv3d_slotwise(layer, x):
     y_flat = _binary_add(tap_slot_outputs, name_prefix=layer.name)
 
     if layer.use_bias:
-        y_flat = keras.layers.Add(name=f"{layer.name}_bias")([
-            y_flat,
-            keras.layers.Lambda(
-                lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
-                name=f"{layer.name}_bias_const",
-            )(y_flat),
-        ])
+        y_flat = keras.layers.Add(name=f"{layer.name}_bias")(
+            [
+                y_flat,
+                keras.layers.Lambda(
+                    lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
+                    name=f"{layer.name}_bias_const",
+                )(y_flat),
+            ]
+        )
 
-    return keras.layers.Reshape(
-        (D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out"
-    )(y_flat)
+    return keras.layers.Reshape((D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(
+        y_flat
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -547,12 +523,15 @@ def _get_ring_idx(layer, cells):
     Only meaningful when share_neighbors=True.  Uses ring_maps_2d (the same
     empirical ring map already used by get_cell_weights) so the ring assignment
     is guaranteed consistent with the weight layout.
+
+    Keyed off hexbase_size (the spatial kernel size), not kernel_size: for
+    Conv2d the two are identical, but Conv3d's kernel_size may be a (depth,
+    spatial) tuple, so hexbase_size is the correct spatial ring geometry.
     """
     from keras_hexagdly.layers import ring_maps_2d
-    ring_maps, _ = ring_maps_2d(layer.kernel_size)
-    return np.array(
-        [int(ring_maps[i][r, c]) for i, r, c in cells], dtype=np.int32
-    )
+
+    ring_maps, _ = ring_maps_2d(layer.hexbase_size)
+    return np.array([int(ring_maps[i][r, c]) for i, r, c in cells], dtype=np.int32)
 
 
 def _conv2d_gather(layer, x):
@@ -571,26 +550,23 @@ def _conv2d_gather(layer, x):
     from keras_hexagdly.hex_gather import HexGather, HexRingMAC
 
     H, W = int(x.shape[1]), int(x.shape[2])
-    Cin  = int(x.shape[3])
+    Cin = int(x.shape[3])
     N_in = H * W
     Cout = layer.out_channels
 
     nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
-    N_out = H_out * W_out
 
-    x_flat = keras.layers.Reshape(
-        (N_in, Cin), name=f"{layer.name}_reshape_in"
-    )(x)
+    x_flat = keras.layers.Reshape((N_in, Cin), name=f"{layer.name}_reshape_in")(x)
 
     # HexGather: index table (N_out, K) — tiny integer ROM
-    gathered = HexGather(
-        neighbor_idx=nbr, name=f"{layer.name}_gather"
-    )(x_flat)                                           # (B, N_out, K, Cin)
+    gathered = HexGather(neighbor_idx=nbr, name=f"{layer.name}_gather")(
+        x_flat
+    )  # (B, N_out, K, Cin)
 
     # HexRingMAC: weights + optional ring_idx
     if layer.share_neighbors:
-        W_rings = layer.ring_weights.numpy()            # (num_rings, Cin, Cout)
-        ring_idx = _get_ring_idx(layer, cells)          # (K,)
+        W_rings = layer.ring_weights.numpy()  # (num_rings, Cin, Cout)
+        ring_idx = _get_ring_idx(layer, cells)  # (K,)
         y_flat = HexRingMAC(
             weights_array=W_rings,
             ring_idx=ring_idx,
@@ -598,7 +574,8 @@ def _conv2d_gather(layer, x):
         )(gathered)
     else:
         from keras_hexagdly.indexed import get_cell_weights
-        W_k = get_cell_weights(layer, cells)            # (K, Cin, Cout)
+
+        W_k = get_cell_weights(layer, cells)  # (K, Cin, Cout)
         y_flat = HexRingMAC(
             weights_array=W_k,
             ring_idx=None,
@@ -606,30 +583,159 @@ def _conv2d_gather(layer, x):
         )(gathered)
 
     if layer.use_bias:
-        y_flat = keras.layers.Add(name=f"{layer.name}_bias")([
-            y_flat,
-            keras.layers.Lambda(
-                lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
-                name=f"{layer.name}_bias_const",
-            )(y_flat),
-        ])
+        y_flat = keras.layers.Add(name=f"{layer.name}_bias")(
+            [
+                y_flat,
+                keras.layers.Lambda(
+                    lambda t, b=layer.bias_tensor.numpy(): t * 0.0 + b,
+                    name=f"{layer.name}_bias_const",
+                )(y_flat),
+            ]
+        )
 
-    return keras.layers.Reshape(
-        (H_out, W_out, Cout), name=f"{layer.name}_reshape_out"
-    )(y_flat)
+    return keras.layers.Reshape((H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(y_flat)
 
 
 def _conv3d_gather(layer, x):
-    """Conv3d with strategy='gather' falls back to slotwise.
+    """Conv3d -> per-depth-tap (Crop1D + HexGather3D + HexRingMAC3D) + Add + Reshape.
 
-    HexGather operates on (B, N_in, C) — adding a depth axis requires
-    reshaping the batch and depth dims together, which is awkward in a
-    functional Keras graph and adds no benefit over slotwise for the temporal
-    axis (depth taps are already dense, not sparse).  The gather savings apply
-    to the spatial axis only, and the slotwise path already handles the spatial
-    gather correctly.  A dedicated 3D gather is a future extension.
+    The spatial neighbor gather is sparse (a small (N_out, K) index ROM) exactly
+    as in Conv2d; the depth axis is dense and rides through HexGather3D /
+    HexRingMAC3D as a passthrough leading dimension.  Only depth_stride=1 is
+    supported (matches the slotwise path).  Both depth_padding='valid'/'same'
+    are handled via the same ZeroPadding1D + Cropping1D scaffolding as
+    _conv3d_slotwise.
+
+    For each depth tap d:
+        Crop the D_eff frames for this tap -> (B, D_eff, N_in, Cin)
+        HexGather3D(nbr)   -> (B, D_eff, N_out, K, Cin)
+        HexRingMAC3D(W[d]) -> (B, D_eff, N_out, Cout)
+    The D_kernel taps are summed via a binary Add tree, then bias is added.
     """
-    return _conv3d_slotwise(layer, x)
+    from keras_hexagdly.hex_gather import HexGather3D, HexRingMAC3D
+
+    D_in = int(x.shape[1])
+    H, W = int(x.shape[2]), int(x.shape[3])
+    Cin = int(x.shape[4])
+    N_in = H * W
+    D_kernel = layer.depth_size
+    depth_stride = layer.depth_stride
+    Cout = layer.out_channels
+
+    if depth_stride != 1:
+        raise NotImplementedError(
+            f"Conv3d hls4ml export only supports depth_stride=1, got {depth_stride}."
+        )
+
+    if layer.depth_padding == "same":
+        pad_top = (D_kernel - 1) // 2
+        pad_bot = D_kernel - 1 - pad_top
+        D_eff = D_in
+    else:
+        pad_top = 0
+        pad_bot = 0
+        D_eff = D_in - D_kernel + 1
+
+    nbr, cells, _ = build_neighbor_table_3d(layer, D_in, H, W)
+
+    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
+    _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
+
+    # Per-tap weight sets: share -> (D_kernel, num_rings, Cin, Cout) + ring_idx;
+    # full -> (D_kernel, K, Cin, Cout).
+    if layer.share_neighbors:
+        W_all = layer.ring_weights.numpy()  # (D_kernel, num_rings, Cin, Cout)
+        ring_idx = _get_ring_idx(layer, cells)  # (K,)
+    else:
+        W_all = get_cell_weights_3d(layer, cells)  # (D_kernel, K, Cin, Cout)
+        ring_idx = None
+
+    D_padded = D_in + pad_top + pad_bot
+    x_seq = keras.layers.Reshape((D_in, N_in * Cin), name=f"{layer.name}_reshape_seq")(x)
+    if pad_top > 0 or pad_bot > 0:
+        x_seq = keras.layers.ZeroPadding1D(padding=(pad_top, pad_bot), name=f"{layer.name}_zpad")(
+            x_seq
+        )
+
+    tap_outputs = []
+    for d in range(D_kernel):
+        crop_start = d
+        crop_end = D_padded - D_eff - d
+        if crop_start == 0 and crop_end == 0:
+            x_d_seq = x_seq
+        else:
+            x_d_seq = keras.layers.Cropping1D(
+                cropping=(crop_start, crop_end),
+                name=f"{layer.name}_crop_d{d}",
+            )(x_seq)
+
+        x_d = keras.layers.Reshape((D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}")(x_d_seq)
+
+        gathered = HexGather3D(neighbor_idx=nbr, name=f"{layer.name}_gather_d{d}")(
+            x_d
+        )  # (B, D_eff, N_out, K, Cin)
+
+        # Bias is baked into the MAC (no Lambda — stock hls4ml can't convert it).
+        # Add it on the final tap only so it contributes exactly once.
+        bias_d = layer.bias_tensor.numpy() if (layer.use_bias and d == D_kernel - 1) else None
+        y_d = HexRingMAC3D(
+            weights_array=W_all[d],
+            ring_idx=ring_idx,
+            bias=bias_d,
+            name=f"{layer.name}_mac_d{d}",
+        )(gathered)  # (B, D_eff, N_out, Cout)
+
+        tap_outputs.append(y_d)
+
+    if D_kernel == 1:
+        y_flat = tap_outputs[0]
+    else:
+        y_flat = _binary_add(tap_outputs, name_prefix=layer.name)
+
+    return keras.layers.Reshape((D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(
+        y_flat
+    )
+
+
+def _maxpool3d_gather(layer, x):
+    """MaxPool3d -> Reshape + HexGather3D + HexMaxPool3D + Reshape.
+
+    One HexGather3D gathers each input frame's K spatial neighbors; HexMaxPool3D
+    then reduces the max over both the depth pool window (depth_size taps at
+    stride depth_stride) and the K slots, in a single custom HLS kernel.  This
+    avoids any per-tap slicing / concatenation, so strided depth pooling
+    (depth_stride > 1) needs no strided-slice op in the graph — the HLS kernel
+    walks the window directly.  Border slots are zeroed by HexGather3D, matching
+    hexagdly's zero-padding at the grid border.
+
+    Graph:
+        Reshape(D_in, N_in, C)
+        → HexGather3D(nbr)                       # (B, D_in, N_out, K, C)
+        → HexMaxPool3D(depth_size, depth_stride)  # (B, D_out, N_out, C)
+        → Reshape(D_out, H_out, W_out, C)
+    """
+    from keras_hexagdly.hex_gather import HexGather3D, HexMaxPool3D
+
+    D_in = int(x.shape[1])
+    H, W = int(x.shape[2]), int(x.shape[3])
+    C = int(x.shape[4])
+    N_in = H * W
+
+    nbr, cells, (D_out, H_out, W_out) = build_neighbor_table_3d(layer, D_in, H, W)
+
+    x_flat = keras.layers.Reshape((D_in, N_in, C), name=f"{layer.name}_reshape_in")(x)
+
+    gathered = HexGather3D(neighbor_idx=nbr, name=f"{layer.name}_gather")(
+        x_flat
+    )  # (B, D_in, N_out, K, C)
+
+    pooled = HexMaxPool3D(
+        depth_size=layer.depth_size,
+        depth_stride=layer.depth_stride,
+        name=f"{layer.name}_maxpool",
+    )(gathered)  # (B, D_out, N_out, C)
+
+    return keras.layers.Reshape((D_out, H_out, W_out, C), name=f"{layer.name}_reshape_out")(pooled)
 
 
 # ---------------------------------------------------------------------------
@@ -639,24 +745,24 @@ def _conv3d_gather(layer, x):
 _STRATEGIES = ("folded", "slotwise", "gather")
 
 _REPLACEMENTS_FOLDED = {
-    hgly.Conv2d:    _conv2d_replacement,
+    hgly.Conv2d: _conv2d_replacement,
     hgly.MaxPool2d: _maxpool2d_replacement,
-    hgly.Conv3d:    _conv3d_replacement,
+    hgly.Conv3d: _conv3d_replacement,
     hgly.MaxPool3d: _maxpool3d_replacement,
 }
 
 _REPLACEMENTS_SLOTWISE = {
-    hgly.Conv2d:    _conv2d_slotwise,
-    hgly.MaxPool2d: _maxpool2d_replacement,   # pool is strategy-agnostic
-    hgly.Conv3d:    _conv3d_slotwise,
+    hgly.Conv2d: _conv2d_slotwise,
+    hgly.MaxPool2d: _maxpool2d_replacement,  # pool is strategy-agnostic
+    hgly.Conv3d: _conv3d_slotwise,
     hgly.MaxPool3d: _maxpool3d_replacement,
 }
 
 _REPLACEMENTS_GATHER = {
-    hgly.Conv2d:    _conv2d_gather,
-    hgly.MaxPool2d: _maxpool2d_gather,        # HexGather + HexMaxPool (no large matrix)
-    hgly.Conv3d:    _conv3d_gather,           # falls back to slotwise (see docstring)
-    hgly.MaxPool3d: _maxpool3d_replacement,
+    hgly.Conv2d: _conv2d_gather,
+    hgly.MaxPool2d: _maxpool2d_gather,  # HexGather + HexMaxPool (no large matrix)
+    hgly.Conv3d: _conv3d_gather,  # HexGather3D + HexRingMAC3D (depth-aware)
+    hgly.MaxPool3d: _maxpool3d_gather,  # HexGather3D + HexMaxPool3D (depth-aware)
 }
 
 
@@ -681,9 +787,10 @@ def patch_model_for_hls(model, strategy="slotwise"):
                     selection matrices — the key improvement for synthesis at
                     full camera scale.  Requires Phases 3-4 (custom hls4ml
                     handler + HLS C++ kernel) to synthesize; C-simulation
-                    with stock hls4ml is not yet supported.  Conv3d falls back
-                    to slotwise (spatial gather savings don't apply to the
-                    temporal axis).
+                    with stock hls4ml is not yet supported.  Conv3d uses the
+                    depth-aware HexGather3D + HexRingMAC3D variants (spatial
+                    gather is sparse; the depth axis rides through as a
+                    passthrough dimension).  Only depth_stride=1 is supported.
 
     Returns:
         A new keras.Model — plain Keras, no hls4ml dependency.  Pass this to
@@ -697,9 +804,7 @@ def patch_model_for_hls(model, strategy="slotwise"):
     if not isinstance(model, keras.Model):
         raise TypeError(f"Expected a keras.Model, got {type(model).__name__}.")
     if strategy not in _STRATEGIES:
-        raise ValueError(
-            f"Unknown strategy {strategy!r}. Choose from: {_STRATEGIES}."
-        )
+        raise ValueError(f"Unknown strategy {strategy!r}. Choose from: {_STRATEGIES}.")
 
     if strategy == "gather":
         replacements = _REPLACEMENTS_GATHER

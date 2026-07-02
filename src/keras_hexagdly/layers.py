@@ -300,8 +300,30 @@ class HexBase:
         # Reorder along the W axis (= self.dimensions in channels-last).
         return keras.ops.take(input, order, axis=self.dimensions)
 
+    def _stabilize_3d_shape(self, input):
+        """Launder a 3D input through a slice+concat identity so graph-mode shape
+        inference stays consistent through the column-split convolution.
+
+        keras.ops.conv can *trace* an odd/even column width one larger than it
+        actually produces at run time when its input tensor was created by a pad
+        op -- either the internal depth_padding='same' pad, or an upstream
+        ZeroPadding3D in user code.  The stale trace-time width then makes the
+        column-reorder gather (get_ordered_output) index out of bounds under
+        tf.function / model.predict, e.g. ``indices[9] = 10 is not in [0, 10)``.
+        Eager execution is unaffected, which is why it only surfaces in graph
+        mode.  Rebuilding the tensor with a genuine concatenate resets that
+        inference so trace-time and run-time widths agree.
+
+        Identity operation.  Only the 3D path needs it (2D is unaffected); the
+        depth axis (axis 1) always has length >= 1 so the split is safe.
+        """
+        if self.dimensions == 3:
+            input = keras.ops.concatenate([input[:, :1], input[:, 1:]], axis=1)
+        return input
+
     # --- general operation with arbitrary stride (verbatim orchestration) ------
     def operation_with_arbitrary_stride(self, input):
+        input = self._stabilize_3d_shape(input)
         assert self._hw_ordered_size(input)[-2] - (self.hexbase_stride // 2) >= 0, (
             "Too few rows to apply hex conv with the stide that is set"
         )
@@ -385,6 +407,7 @@ class HexBase:
 
     # --- faster single-stride special case (verbatim orchestration) -----------
     def operation_with_single_hexbase_stride(self, input):
+        input = self._stabilize_3d_shape(input)
         columns_mod2 = self._hw_ordered_size(input)[-1] % 2
         odd_kernels_odd_columns = []
         odd_kernels_even_columns = []
@@ -959,6 +982,9 @@ class Conv3d(HexBase, keras.layers.Layer):
         if self.depth_padding == "same":
             # Symmetric zero-pad the depth axis (NDHWC -> axis 1) so the temporal
             # kernel is centred and output depth == input depth, like TDSCAN.
+            # The resulting pad-op tensor is laundered by _stabilize_3d_shape at
+            # the entry of operation_with_*_hexbase_stride so it stays correct in
+            # graph mode (see that method for why).
             pad = (self.depth_size - 1) // 2
             top = pad
             bot = self.depth_size - 1 - pad  # handles even kernels too
