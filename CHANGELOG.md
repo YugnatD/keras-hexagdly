@@ -3,6 +3,50 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **Restructured the gather-strategy HLS kernels around hls4ml's proven conv2d
+  pattern** (`nnet_hex_ring_mac.h`, `nnet_hex_gather.h` and `_3d` variants,
+  `hls4ml_handler.py`). The previous ring MAC flattened all
+  `n_out*k*Cin*Cout` products into one fully-unrolled loop with runtime
+  div/mod index decoding and runtime-addressed accumulators, which made Vitis
+  HLS build thousands of multipliers, emit II violations (HLS 200-882/885),
+  spend hours in scheduling/binding, and run out of memory (>48 GB) at
+  20×20-grid scale. The new structure mirrors `conv_2d_latency_cl`:
+  a sequential partition loop pipelined at `II=ReuseFactor` over
+  `n_partitions = n_out / n_pixels` iterations, an unrolled pixel loop over
+  `n_pixels` concurrent output pixels, and per-pixel Product/Accum stages in
+  which every mult/accum/weight index is a compile-time constant (no
+  crossbars, no div/mod). `multiplier_limit` is now per-partition
+  (`ceil(n_pixels*k*Cin*Cout / ReuseFactor)`), satisfiable by construction.
+
+- **Neighbor index tables and ring maps are now compile-time constants.**
+  `HexGather`'s `(N_out, K)` table and `HexRingMAC`'s ring map are emitted as
+  `static const` arrays in the generated `parameters.h` (the same trick
+  hls4ml's im2col codegen uses) instead of runtime weight ROMs. The
+  fully-unrolled gather constant-folds to pure wiring with literal zeros at
+  border slots; ring weight sharing costs no runtime indirection
+  (`row_map[k]`, identity when `share_neighbors=False`). The `idx*`/`ridx*`
+  weight arrays and their derived integer types no longer exist.
+
+### Added
+
+- **`ParallelizationFactor` support for `HexRingMAC` / `HexRingMAC3D`**
+  (per-layer or model-wide hls4ml config), mirroring hls4ml's conv handling:
+  `n_pixels = PF` output pixels are computed concurrently and hardware cost
+  scales with `PF * k * Cin * Cout / ReuseFactor` instead of the whole image.
+  Defaults to 1 (one output pixel per II); invalid values clamp to the
+  closest divisor of `n_out` with a warning. Latency scales as
+  `n_partitions * ReuseFactor` cycles per layer.
+  A rolled partition loop requires dataflow pipeline style (set
+  `cfg['Model']['PipelineStyle'] = 'dataflow'`, or `Strategy = 'Resource'`):
+  under 'pipeline' style the top-level `#pragma HLS PIPELINE` force-unrolls
+  every layer loop (same physics as hls4ml conv, cf. their
+  `SetPipelineStyle` pass), so the emitted config falls back to
+  `n_pixels = n_out` with a whole-layer multiplier cap and a warning.
+
 ## [0.2.0] - 2026-06-30
 
 ### Added

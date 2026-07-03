@@ -1403,7 +1403,7 @@ class TestHls4mlCsim:
         params_files = glob.glob(f"{_HLS_DIR}/**/parameters.h", recursive=True)
         assert params_files, "parameters.h not generated"
         params_txt = "".join(open(p).read() for p in params_files)
-        assert f"reuse_factor    = {reuse}" in params_txt, (
+        assert f"reuse_factor = {reuse}" in params_txt, (
             f"ReuseFactor={reuse} did not reach the HexRingMAC config"
         )
 
@@ -1412,6 +1412,129 @@ class TestHls4mlCsim:
             f"reuse={reuse}: C-sim differs from reference "
             f"(max err={np.max(np.abs(y_hls - y_ref)):.4f})"
         )
+
+    @pytest.mark.parametrize("pf", [11, 143, 7])
+    def test_ring_mac_parallelization_factor(self, tmp_path, pf):
+        """ParallelizationFactor must reach the HexRingMAC config as
+        n_pixels (with n_partitions = n_out / n_pixels), and must not change
+        the C-sim result — PF only trades hardware parallelism for latency.
+        For the 13x11 toy grid n_out=143 (divisors 1/11/13/143): 11 is a mid
+        PF, 143 is full unroll (one partition — the old fully-parallel
+        behavior), and 7 is invalid so it must clamp to the closest divisor
+        (11), mirroring hls4ml's conv PF handling.  PF=1 (the default) is
+        exercised by every other C-sim test in this file.
+
+        PipelineStyle=dataflow is required: under 'pipeline' style the
+        top-level PIPELINE pragma unrolls the partition loop, so PF is
+        deliberately ignored there (see test_ring_mac_pf_ignored_under_
+        pipeline_style)."""
+        import glob
+        import re
+
+        from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+        register_hex_gather_layers()
+
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / f"hls_pf{pf}")
+
+        layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=False, share_neighbors=True)
+        model = _build_2d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((1, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0).reshape(-1)
+
+        patched = patch_model_for_hls(model, strategy="gather")
+        cfg = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vivado")
+        cfg["Model"]["Precision"] = "ap_fixed<32,12>"
+        cfg["Model"]["PipelineStyle"] = "dataflow"
+        mac_names = [n for n in cfg["LayerName"] if n.endswith("_mac")]
+        assert mac_names, "no HexRingMAC layer found in config"
+        for name in mac_names:
+            cfg["LayerName"][name]["ParallelizationFactor"] = pf
+        hm = hls4ml.converters.convert_from_keras_model(
+            patched, hls_config=cfg, backend="Vivado",
+            output_dir=_HLS_DIR, part=_HLS_PART,
+        )
+        hm.compile()
+
+        params_files = glob.glob(f"{_HLS_DIR}/**/parameters.h", recursive=True)
+        assert params_files, "parameters.h not generated"
+        params_txt = "".join(open(p).read() for p in params_files)
+
+        n_out = H * W  # kernel_size=1, stride=1 -> N_out == N_in
+        if n_out % pf == 0:
+            expected_pf = pf
+        else:
+            divisors = [d for d in range(1, n_out + 1) if n_out % d == 0]
+            expected_pf = min(divisors, key=lambda d: (abs(d - pf), d))
+        m = re.search(r"n_pixels\s+= (\d+);\s+static const unsigned n_partitions = (\d+);",
+                      params_txt)
+        assert m, "n_pixels / n_partitions not found in generated MAC config"
+        assert int(m.group(1)) == expected_pf, (
+            f"ParallelizationFactor={pf}: expected n_pixels={expected_pf}, got {m.group(1)}"
+        )
+        assert int(m.group(1)) * int(m.group(2)) == n_out
+
+        y_hls = hm.predict(np.ascontiguousarray(x)).reshape(-1)
+        assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM, (
+            f"pf={pf}: C-sim differs from reference "
+            f"(max err={np.max(np.abs(y_hls - y_ref)):.4f})"
+        )
+
+    def test_ring_mac_pf_ignored_under_pipeline_style(self, tmp_path):
+        """Under 'pipeline' style (io_parallel + Latency default) the top-level
+        PIPELINE pragma force-unrolls the MAC partition loop, so a rolled
+        partition cannot exist: the emitted config must fall back to
+        n_pixels = n_out / n_partitions = 1 regardless of the requested PF
+        (with a warning), keeping multiplier_limit spanning the whole layer.
+        This mirrors hls4ml's SetPipelineStyle coupling for conv layers."""
+        import glob
+        import re
+
+        from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+        register_hex_gather_layers()
+
+        global _HLS_DIR
+        _HLS_DIR = str(tmp_path / "hls_pf_pipeline")
+
+        layer = hgly.Conv2d(CIN, COUT, kernel_size=1, bias=False, share_neighbors=True)
+        model = _build_2d_model(layer)
+        _rand_weights(layer)
+
+        x = RNG.standard_normal((1, H, W, CIN)).astype(np.float32)
+        y_ref = model.predict(x, verbose=0).reshape(-1)
+
+        patched = patch_model_for_hls(model, strategy="gather")
+        cfg = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vivado")
+        cfg["Model"]["Precision"] = "ap_fixed<32,12>"
+        # No PipelineStyle override: io_parallel + Latency resolves to 'pipeline'.
+        mac_names = [n for n in cfg["LayerName"] if n.endswith("_mac")]
+        for name in mac_names:
+            cfg["LayerName"][name]["ParallelizationFactor"] = 11
+        hm = hls4ml.converters.convert_from_keras_model(
+            patched, hls_config=cfg, backend="Vivado",
+            output_dir=_HLS_DIR, part=_HLS_PART,
+        )
+        hm.compile()
+
+        params_txt = "".join(
+            open(p).read()
+            for p in glob.glob(f"{_HLS_DIR}/**/parameters.h", recursive=True)
+        )
+        n_out = H * W
+        m = re.search(r"n_pixels\s+= (\d+);\s+static const unsigned n_partitions = (\d+);",
+                      params_txt)
+        assert m, "n_pixels / n_partitions not found in generated MAC config"
+        assert int(m.group(1)) == n_out and int(m.group(2)) == 1, (
+            f"pipeline style must force n_pixels=n_out={n_out}, n_partitions=1; "
+            f"got n_pixels={m.group(1)}, n_partitions={m.group(2)}"
+        )
+
+        y_hls = hm.predict(np.ascontiguousarray(x)).reshape(-1)
+        assert np.max(np.abs(y_hls - y_ref)) < ATOL_CSIM
 
     @pytest.mark.parametrize("reuse", [1, 3])
     def test_ring_mac_3d_reuse_factor(self, tmp_path, reuse):
@@ -1445,7 +1568,7 @@ class TestHls4mlCsim:
         params_files = glob.glob(f"{_HLS_DIR}/**/parameters.h", recursive=True)
         assert params_files, "parameters.h not generated"
         params_txt = "".join(open(p).read() for p in params_files)
-        assert f"reuse_factor    = {reuse}" in params_txt, (
+        assert f"reuse_factor = {reuse}" in params_txt, (
             f"ReuseFactor={reuse} did not reach the HexRingMAC3D config"
         )
 
@@ -1505,18 +1628,23 @@ class TestHls4mlCsim:
             f"not found in generated config"
         )
 
-    def test_gather_index_width_derived_from_n_in(self, tmp_path):
-        """The gather index type width must be derived from N_in (not a fixed
-        16 bits), so it neither overflows for large detectors nor wastes bits
-        for small ones. For N_in=H*W here, width = ceil(log2(N_in)) + 1 (sign)."""
-        import math
+    def test_gather_indices_are_compile_time_constants(self, tmp_path):
+        """The gather index table must be emitted as a compile-time constant
+        array in the generated config (parameters.h) — not as a runtime weight
+        ROM.  With the table constant, the fully-unrolled gather folds to pure
+        wiring (the hls4ml im2col-codegen trick), and the plain-int indices can
+        never overflow for any camera size.  Likewise the ring map must be
+        baked as the constant row_map — no idx/ridx weight files."""
+        import glob
+        import re
+        from pathlib import Path
 
         from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
 
         register_hex_gather_layers()
 
         global _HLS_DIR
-        _HLS_DIR = str(tmp_path / "hls_index_width")
+        _HLS_DIR = str(tmp_path / "hls_const_indices")
 
         layer = hgly.Conv2d(1, 2, kernel_size=1, bias=False, share_neighbors=True)
         inp = keras.Input((H, W, 1), name="x")
@@ -1533,14 +1661,20 @@ class TestHls4mlCsim:
         )
         hm.compile()
 
-        import glob
-
         params_txt = "".join(
-            open(p).read() for p in glob.glob(f"{_HLS_DIR}/**/defines.h", recursive=True)
+            open(p).read() for p in glob.glob(f"{_HLS_DIR}/**/parameters.h", recursive=True)
         )
-        n_in = H * W
-        expected_w = math.ceil(math.log2(n_in)) + 1
-        assert f"ap_int<{expected_w}>" in params_txt, (
-            f"expected index type ap_int<{expected_w}> for N_in={n_in}, "
-            f"not found — index width not derived from N_in"
+        # Constant index table and ring row map are defined out-of-line in
+        # parameters.h (same pattern hls4ml uses for conv `pixels[]`).
+        assert re.search(r"const int config\d+::indices\[\] = \{", params_txt), (
+            "gather indices not emitted as a compile-time constant table"
         )
+        assert re.search(r"const unsigned config\d+::row_map\[\] = \{", params_txt), (
+            "ring row_map not emitted as a compile-time constant table"
+        )
+        # No runtime index/ring weight ROMs may be generated.
+        weight_files = [
+            Path(p).name for p in glob.glob(f"{_HLS_DIR}/**/weights/*.h", recursive=True)
+        ]
+        offenders = [f for f in weight_files if f.startswith(("idx", "ridx"))]
+        assert not offenders, f"runtime index weight ROMs still generated: {offenders}"

@@ -30,18 +30,58 @@ from hls4ml.model.attributes import Attribute, TypeAttribute, WeightAttribute
 from hls4ml.model.layers import Layer
 
 
-def _index_width(n_in):
-    """Signed bit-width needed to hold a neighbor index in [-1, n_in-1].
+def _choose_parallelization(node, n_out):
+    """Resolve ParallelizationFactor (n_pixels) for a hex MAC node.
 
-    The gather stores flat pixel indices (and -1 for border slots). A fixed
-    16-bit width silently overflows for detectors with >32767 pixels; deriving
-    the width from n_in makes the gather correct at any camera size.
+    Mirrors hls4ml's Conv1D/2D handling: reads the per-layer (or model)
+    'ParallelizationFactor' config value (default 1 = one output pixel per
+    partition-loop iteration) and clamps it to the closest divisor of n_out
+    so that n_partitions = n_out / n_pixels is exact.
+
+    Pipeline-style interaction (same physics as hls4ml conv): when the model
+    resolves to 'pipeline' style, myproject() carries a top-level
+    `#pragma HLS PIPELINE`, which force-unrolls every loop in every layer —
+    including the MAC partition loop.  A rolled partition (PF < n_out) cannot
+    exist in that regime, and a per-partition multiplier cap would strangle
+    the scheduler (II explosion).  So under 'pipeline' style we emit
+    n_pixels = n_out (one partition, fully unrolled — the multiplier cap
+    then spans the whole layer, matching hls4ml's Latency-strategy conv).
+    A rolled partition loop requires dataflow style: set
+    cfg['Model']['Strategy'] = 'Resource' or cfg['Model']['PipelineStyle'] =
+    'dataflow' — exactly as with stock hls4ml conv layers.
     """
-    import math
+    style = getattr(node.model.config, "pipeline_style", None)
+    pf = node.model.config.get_layer_config_value(node, "ParallelizationFactor", 1)
+    try:
+        pf = int(pf)
+    except (TypeError, ValueError):
+        pf = 1
 
-    # values range over [-1, n_in-1]; magnitude n_in-1 needs ceil(log2(n_in))
-    # value bits, plus one sign bit.
-    return int(math.ceil(math.log2(max(2, n_in)))) + 1
+    if style == "pipeline":
+        if pf not in (1, int(n_out)):
+            print(
+                f'WARNING: ParallelizationFactor={pf} in layer "{node.name}" is ignored: '
+                "the model resolved to pipeline style (top-level PIPELINE unrolls the "
+                "partition loop). Set Strategy=Resource or PipelineStyle=dataflow to "
+                "use a rolled partition loop."
+            )
+        return int(n_out)
+
+    pf = max(1, min(pf, int(n_out)))
+    if n_out % pf != 0:
+        valid = [d for d in range(1, n_out + 1) if n_out % d == 0]
+        closest = min(valid, key=lambda d: (abs(d - pf), d))
+        print(
+            f'WARNING: Invalid ParallelizationFactor={pf} in layer "{node.name}". '
+            f"Using ParallelizationFactor={closest} instead (must divide n_out={n_out})."
+        )
+        pf = closest
+    return pf
+
+
+def _int_csv(values):
+    """Render an int array as a C initializer list body."""
+    return ", ".join(str(int(v)) for v in np.asarray(values).reshape(-1))
 
 
 def _accum_type_str(node, n_terms):
@@ -77,8 +117,12 @@ class HHexGather(Layer):
     """hls4ml IR node for HexGather.
 
     Inputs:  flat pixel tensor (B, N_in*C_flat) — hls4ml flattens everything
-    Weights: indices (N_out, K) int ROM  — synthesized as a constant BRAM/ROM
     Output:  gathered tensor (B, N_out*K*C)
+
+    The (N_out, K) index table is NOT a runtime weight: it is emitted as a
+    compile-time constant array in the generated config struct (parameters.h),
+    so the fully-unrolled gather constant-folds to pure wiring — the same
+    trick hls4ml's conv im2col codegen uses.
     """
 
     _expected_attributes = [
@@ -86,28 +130,13 @@ class HHexGather(Layer):
         Attribute("n_out"),  # total output pixels N_out
         Attribute("k"),  # number of neighbor slots K
         Attribute("n_chan"),  # channels C
-        WeightAttribute("indices"),
-        TypeAttribute("indices"),
     ]
 
     def initialize(self):
-        from hls4ml.model.types import IntegerPrecisionType
-
-        n_in = self.attributes["n_in"]
         n_out = self.attributes["n_out"]
         k = self.attributes["k"]
         n_chan = self.attributes["n_chan"]
         self.add_output_variable(shape=[n_out * k * n_chan])
-        # Force integer precision for the index table — it holds pixel indices,
-        # not fixed-point values.  Without this hls4ml assigns the global
-        # ap_fixed precision which breaks the (idx >= 0) border check.
-        # Width is derived from n_in so indices never overflow (a fixed 16-bit
-        # width would silently wrap for detectors with >32767 pixels).
-        self.add_weights_variable(
-            name="indices",
-            var_name="idx{index}",
-            precision=IntegerPrecisionType(width=_index_width(n_in), signed=True),
-        )
 
 
 class HHexRingMAC(Layer):
@@ -115,8 +144,12 @@ class HHexRingMAC(Layer):
 
     Inputs:  gathered tensor (B, N_out*K*C_in)
     Weights: mac_weights  (num_rings or K, Cin, Cout)
-             ring_idx     (K,) int — only present when share_neighbors=True
     Output:  (B, N_out*Cout)
+
+    Ring sharing (ring_idx) is NOT a runtime weight: the slot -> weight-row
+    map is emitted as the compile-time constant row_map[k] in the generated
+    config struct (identity map when share_neighbors=False), so no runtime
+    indirection into the weight ROM exists in hardware.
     """
 
     _expected_attributes = [
@@ -131,12 +164,10 @@ class HHexRingMAC(Layer):
         # config (falling through to cfg['Model']['ReuseFactor']). Declaring it
         # as a ConfigurableAttribute with a default would overwrite that value
         # with the default after init_base_layer runs. The ring MAC honors it by
-        # pipelining at II=reuse_factor and capping the parallel multiplier count,
-        # exactly like hls4ml's dense_latency.
+        # pipelining the partition loop at II=reuse_factor and capping the
+        # parallel multiplier count, exactly like hls4ml's conv/dense kernels.
         WeightAttribute("mac_weights"),
         TypeAttribute("mac_weights"),
-        WeightAttribute("ring_idx"),
-        TypeAttribute("ring_idx"),
         WeightAttribute("mac_bias"),
         TypeAttribute("mac_bias"),
     ]
@@ -144,16 +175,9 @@ class HHexRingMAC(Layer):
     def initialize(self):
         n_out = self.attributes["n_out"]
         n_out_chan = self.attributes["n_out_chan"]
-        from hls4ml.model.types import IntegerPrecisionType
 
         self.add_output_variable(shape=[n_out * n_out_chan])
         self.add_weights_variable(name="mac_weights", var_name="w{index}")
-        # ring_idx holds ring indices (small integers) — force integer precision.
-        self.add_weights_variable(
-            name="ring_idx",
-            var_name="ridx{index}",
-            precision=IntegerPrecisionType(width=8, signed=False),
-        )
         self.add_weights_variable(name="mac_bias", var_name="b{index}")
 
 
@@ -267,11 +291,14 @@ struct config{index} : nnet::hex_gather_config {{
     static const unsigned n_out  = {n_out};
     static const unsigned k      = {k};
     static const unsigned n_chan  = {n_chan};
-    typedef {indices_t.name} indices_t;
-}};\n"""
+    // Compile-time neighbor table (-1 = border -> zero): constant-folds to
+    // wires under full unroll, like hls4ml's generated im2col fill_buffer.
+    static const int indices[n_out * k];
+}};
+const int config{index}::indices[] = {{{indices_vals}}};\n"""
 
 hex_gather_function_template = (
-    "nnet::hex_gather<{input_t}, {indices_t}, {output_t}, {config}>({input}, idx{index}, {output});"
+    "nnet::hex_gather<{input_t}, {output_t}, {config}>({input}, {output});"
 )
 
 hex_ring_mac_config_template = """\
@@ -281,25 +308,31 @@ struct config{index} : nnet::hex_ring_mac_config {{
     static const unsigned n_in_chan      = {n_in_chan};
     static const unsigned n_out_chan     = {n_out_chan};
     static const unsigned num_weight_rows = {num_weight_rows};
-    static const bool     share_neighbors = {share_neighbors_str};
-    static const unsigned reuse_factor    = {reuse};
-    // total multiplications = n_out * k * n_in_chan * n_out_chan; spread over
-    // reuse_factor cycles -> this many parallel multipliers.
-    static const unsigned n_mult          = {n_mult};
-    static const unsigned multiplier_limit = DIV_ROUNDUP(n_mult, reuse_factor);
+    // ParallelizationFactor: n_pixels output pixels computed concurrently;
+    // the partition loop pipelines n_partitions iterations at II=reuse_factor.
+    static const unsigned n_pixels     = {n_pixels};
+    static const unsigned n_partitions = {n_partitions};
+    static const unsigned reuse_factor = {reuse};
+    // Parallel multiplier cap: per-partition work spread over reuse_factor
+    // cycles — satisfiable by construction (mirrors hls4ml conv/dense).
+    static const unsigned multiplier_limit =
+        DIV_ROUNDUP(n_pixels * k * n_in_chan * n_out_chan, reuse_factor);
+    // Slot -> weight row, baked at export (ring index when share_neighbors,
+    // identity otherwise). No runtime indirection.
+    static const unsigned row_map[k];
     typedef {mac_weights_t.name} weight_t;
-    typedef {ring_idx_t.name}    ring_idx_t;
     typedef {mac_bias_t.name}    bias_t;
     // Accumulator widened by ceil(log2(#summed terms)) integer+total bits over
     // the weight type so the neighbor sum cannot overflow (same bit-growth idiom
     // hls4ml uses for dense/conv accumulators).
     typedef {accum_t_str} accum_t;
-}};\n"""
+}};
+const unsigned config{index}::row_map[] = {{{row_map_vals}}};\n"""
 
 hex_ring_mac_function_template = (
-    "nnet::hex_ring_mac<{input_t}, {mac_weights_t}, {ring_idx_t}, {mac_bias_t}, "
+    "nnet::hex_ring_mac<{input_t}, {mac_weights_t}, {mac_bias_t}, "
     "{output_t}, {config}>"
-    "({input}, w{index}, ridx{index}, b{index}, {output});"
+    "({input}, w{index}, b{index}, {output});"
 )
 
 hex_gather_include_list = ["nnet_utils/nnet_hex_gather.h"]
@@ -317,6 +350,7 @@ class HexGatherConfigTemplate(LayerConfigTemplate):
         params["n_out"] = node.attributes["n_out"]
         params["k"] = node.attributes["k"]
         params["n_chan"] = node.attributes["n_chan"]
+        params["indices_vals"] = _int_csv(node.get_attr("indices_data"))
         return self.template.format(**params)
 
 
@@ -328,9 +362,7 @@ class HexGatherFunctionTemplate(FunctionCallTemplate):
     def format(self, node):
         params = {}
         params["config"] = f"config{node.index}"
-        params["index"] = node.index
         params["input_t"] = node.get_input_variable(node.inputs[0]).type.name
-        params["indices_t"] = node.get_weights("indices").type.name
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
@@ -344,18 +376,16 @@ class HexRingMACConfigTemplate(LayerConfigTemplate):
 
     def format(self, node):
         params = self._default_config_params(node)  # provides params['reuse']
-        params["n_out"] = node.attributes["n_out"]
+        n_out = node.attributes["n_out"]
+        params["n_out"] = n_out
         params["k"] = node.attributes["k"]
         params["n_in_chan"] = node.attributes["n_in_chan"]
         params["n_out_chan"] = node.attributes["n_out_chan"]
         params["num_weight_rows"] = node.attributes["num_weight_rows"]
-        params["share_neighbors_str"] = "true" if node.attributes["share_neighbors"] else "false"
-        params["n_mult"] = (
-            node.attributes["n_out"]
-            * node.attributes["k"]
-            * node.attributes["n_in_chan"]
-            * node.attributes["n_out_chan"]
-        )
+        pf = _choose_parallelization(node, n_out)
+        params["n_pixels"] = pf
+        params["n_partitions"] = n_out // pf
+        params["row_map_vals"] = _int_csv(node.get_attr("ring_idx_data"))
         # Accumulator holds a sum of K*Cin products per output channel.
         n_terms = node.attributes["k"] * node.attributes["n_in_chan"]
         params["accum_t_str"] = _accum_type_str(node, n_terms)
@@ -373,7 +403,6 @@ class HexRingMACFunctionTemplate(FunctionCallTemplate):
         params["index"] = node.index
         params["input_t"] = node.get_input_variable(node.inputs[0]).type.name
         params["mac_weights_t"] = node.get_weights("mac_weights").type.name
-        params["ring_idx_t"] = node.get_weights("ring_idx").type.name
         params["mac_bias_t"] = node.get_weights("mac_bias").type.name
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
@@ -453,8 +482,10 @@ class HHexGather3D(Layer):
     """hls4ml IR node for HexGather3D.
 
     Inputs:  flat tensor (B, n_depth*n_in*n_chan)
-    Weights: indices (n_out, k) int ROM (shared across all depth frames)
     Output:  gathered tensor (B, n_depth*n_out*k*n_chan)
+
+    The (n_out, k) index table is a compile-time constant in the generated
+    config struct (shared across all depth frames) — see HHexGather.
     """
 
     _expected_attributes = [
@@ -463,33 +494,25 @@ class HHexGather3D(Layer):
         Attribute("n_out"),
         Attribute("k"),
         Attribute("n_chan"),
-        WeightAttribute("indices"),
-        TypeAttribute("indices"),
     ]
 
     def initialize(self):
-        from hls4ml.model.types import IntegerPrecisionType
-
-        n_in = self.attributes["n_in"]
         n_depth = self.attributes["n_depth"]
         n_out = self.attributes["n_out"]
         k = self.attributes["k"]
         n_chan = self.attributes["n_chan"]
         self.add_output_variable(shape=[n_depth * n_out * k * n_chan])
-        # Index width derived from n_in (see HHexGather) so it never overflows.
-        self.add_weights_variable(
-            name="indices",
-            var_name="idx{index}",
-            precision=IntegerPrecisionType(width=_index_width(n_in), signed=True),
-        )
 
 
 class HHexRingMAC3D(Layer):
     """hls4ml IR node for HexRingMAC3D.
 
     Inputs:  gathered tensor (B, n_depth*n_out*k*n_in_chan)
-    Weights: mac_weights (num_rings or K, Cin, Cout); ring_idx (K,) int
+    Weights: mac_weights (num_rings or K, Cin, Cout)
     Output:  (B, n_depth*n_out*n_out_chan)
+
+    Ring sharing is baked into the compile-time row_map[k] constant in the
+    generated config struct — see HHexRingMAC.
     """
 
     _expected_attributes = [
@@ -502,25 +525,16 @@ class HHexRingMAC3D(Layer):
         Attribute("share_neighbors", value_type=bool),
         WeightAttribute("mac_weights"),
         TypeAttribute("mac_weights"),
-        WeightAttribute("ring_idx"),
-        TypeAttribute("ring_idx"),
         WeightAttribute("mac_bias"),
         TypeAttribute("mac_bias"),
     ]
 
     def initialize(self):
-        from hls4ml.model.types import IntegerPrecisionType
-
         n_depth = self.attributes["n_depth"]
         n_out = self.attributes["n_out"]
         n_out_chan = self.attributes["n_out_chan"]
         self.add_output_variable(shape=[n_depth * n_out * n_out_chan])
         self.add_weights_variable(name="mac_weights", var_name="w{index}")
-        self.add_weights_variable(
-            name="ring_idx",
-            var_name="ridx{index}",
-            precision=IntegerPrecisionType(width=8, signed=False),
-        )
         self.add_weights_variable(name="mac_bias", var_name="b{index}")
 
 
@@ -598,12 +612,13 @@ struct config{index} : nnet::hex_gather_3d_config {{
     static const unsigned n_out   = {n_out};
     static const unsigned k       = {k};
     static const unsigned n_chan  = {n_chan};
-    typedef {indices_t.name} indices_t;
-}};\n"""
+    // Compile-time neighbor table (-1 = border -> zero), shared across frames.
+    static const int indices[n_out * k];
+}};
+const int config{index}::indices[] = {{{indices_vals}}};\n"""
 
 hex_gather_3d_function_template = (
-    "nnet::hex_gather_3d<{input_t}, {indices_t}, {output_t}, {config}>"
-    "({input}, idx{index}, {output});"
+    "nnet::hex_gather_3d<{input_t}, {output_t}, {config}>({input}, {output});"
 )
 
 hex_ring_mac_3d_config_template = """\
@@ -614,23 +629,32 @@ struct config{index} : nnet::hex_ring_mac_3d_config {{
     static const unsigned n_in_chan       = {n_in_chan};
     static const unsigned n_out_chan      = {n_out_chan};
     static const unsigned num_weight_rows = {num_weight_rows};
-    static const bool     share_neighbors = {share_neighbors_str};
-    static const unsigned reuse_factor    = {reuse};
-    static const unsigned n_mult          = {n_mult};
-    static const unsigned multiplier_limit = DIV_ROUNDUP(n_mult, reuse_factor);
+    // ParallelizationFactor: n_pixels output pixels computed concurrently per
+    // frame; the partition loop pipelines n_partitions iterations at
+    // II=reuse_factor.
+    static const unsigned n_pixels     = {n_pixels};
+    static const unsigned n_partitions = {n_partitions};
+    static const unsigned reuse_factor = {reuse};
+    // Parallel multiplier cap: per-partition work spread over reuse_factor
+    // cycles — satisfiable by construction (mirrors hls4ml conv/dense).
+    static const unsigned multiplier_limit =
+        DIV_ROUNDUP(n_pixels * k * n_in_chan * n_out_chan, reuse_factor);
+    // Slot -> weight row, baked at export (ring index when share_neighbors,
+    // identity otherwise). No runtime indirection.
+    static const unsigned row_map[k];
     typedef {mac_weights_t.name} weight_t;
-    typedef {ring_idx_t.name}    ring_idx_t;
     typedef {mac_bias_t.name}    bias_t;
     // Accumulator widened by ceil(log2(#summed terms)) integer+total bits over
     // the weight type so the neighbor sum cannot overflow (same bit-growth idiom
     // hls4ml uses for dense/conv accumulators).
     typedef {accum_t_str} accum_t;
-}};\n"""
+}};
+const unsigned config{index}::row_map[] = {{{row_map_vals}}};\n"""
 
 hex_ring_mac_3d_function_template = (
-    "nnet::hex_ring_mac_3d<{input_t}, {mac_weights_t}, {ring_idx_t}, "
+    "nnet::hex_ring_mac_3d<{input_t}, {mac_weights_t}, "
     "{mac_bias_t}, {output_t}, {config}>"
-    "({input}, w{index}, ridx{index}, b{index}, {output});"
+    "({input}, w{index}, b{index}, {output});"
 )
 
 hex_gather_3d_include_list = ["nnet_utils/nnet_hex_gather_3d.h"]
@@ -649,6 +673,7 @@ class HexGather3DConfigTemplate(LayerConfigTemplate):
         params["n_out"] = node.attributes["n_out"]
         params["k"] = node.attributes["k"]
         params["n_chan"] = node.attributes["n_chan"]
+        params["indices_vals"] = _int_csv(node.get_attr("indices_data"))
         return self.template.format(**params)
 
 
@@ -660,9 +685,7 @@ class HexGather3DFunctionTemplate(FunctionCallTemplate):
     def format(self, node):
         params = {}
         params["config"] = f"config{node.index}"
-        params["index"] = node.index
         params["input_t"] = node.get_input_variable(node.inputs[0]).type.name
-        params["indices_t"] = node.get_weights("indices").type.name
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
@@ -676,20 +699,17 @@ class HexRingMAC3DConfigTemplate(LayerConfigTemplate):
 
     def format(self, node):
         params = self._default_config_params(node)  # provides params['reuse']
+        n_out = node.attributes["n_out"]
         params["n_depth"] = node.attributes["n_depth"]
-        params["n_out"] = node.attributes["n_out"]
+        params["n_out"] = n_out
         params["k"] = node.attributes["k"]
         params["n_in_chan"] = node.attributes["n_in_chan"]
         params["n_out_chan"] = node.attributes["n_out_chan"]
         params["num_weight_rows"] = node.attributes["num_weight_rows"]
-        params["share_neighbors_str"] = "true" if node.attributes["share_neighbors"] else "false"
-        params["n_mult"] = (
-            node.attributes["n_depth"]
-            * node.attributes["n_out"]
-            * node.attributes["k"]
-            * node.attributes["n_in_chan"]
-            * node.attributes["n_out_chan"]
-        )
+        pf = _choose_parallelization(node, n_out)
+        params["n_pixels"] = pf
+        params["n_partitions"] = n_out // pf
+        params["row_map_vals"] = _int_csv(node.get_attr("ring_idx_data"))
         # Per-frame accumulator sums K*Cin products; depth taps are summed later
         # by a native Add layer with its own accumulator inference.
         n_terms = node.attributes["k"] * node.attributes["n_in_chan"]
@@ -708,7 +728,6 @@ class HexRingMAC3DFunctionTemplate(FunctionCallTemplate):
         params["index"] = node.index
         params["input_t"] = node.get_input_variable(node.inputs[0]).type.name
         params["mac_weights_t"] = node.get_weights("mac_weights").type.name
-        params["ring_idx_t"] = node.get_weights("ring_idx").type.name
         params["mac_bias_t"] = node.get_weights("mac_bias").type.name
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
