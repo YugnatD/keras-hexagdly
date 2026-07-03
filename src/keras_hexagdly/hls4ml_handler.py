@@ -136,7 +136,9 @@ class HHexGather(Layer):
         n_out = self.attributes["n_out"]
         k = self.attributes["k"]
         n_chan = self.attributes["n_chan"]
-        self.add_output_variable(shape=[n_out * k * n_chan])
+        # 2D shape: [n_out*k, n_chan] so io_stream packs n_chan values per token
+        # (depth = n_out*k), keeping token width under the 4096-bit HLS limit.
+        self.add_output_variable(shape=[n_out * k, n_chan])
 
 
 class HHexRingMAC(Layer):
@@ -175,8 +177,8 @@ class HHexRingMAC(Layer):
     def initialize(self):
         n_out = self.attributes["n_out"]
         n_out_chan = self.attributes["n_out_chan"]
-
-        self.add_output_variable(shape=[n_out * n_out_chan])
+        # 2D shape: [n_out, n_out_chan] so io_stream packs n_out_chan per token.
+        self.add_output_variable(shape=[n_out, n_out_chan])
         self.add_weights_variable(name="mac_weights", var_name="w{index}")
         self.add_weights_variable(name="mac_bias", var_name="b{index}")
 
@@ -199,7 +201,8 @@ class HHexMaxPool(Layer):
     def initialize(self):
         n_out = self.attributes["n_out"]
         n_chan = self.attributes["n_chan"]
-        self.add_output_variable(shape=[n_out * n_chan])
+        # 2D shape: [n_out, n_chan] so io_stream packs n_chan per token.
+        self.add_output_variable(shape=[n_out, n_chan])
 
 
 # ---------------------------------------------------------------------------
@@ -338,11 +341,88 @@ hex_ring_mac_function_template = (
 hex_gather_include_list = ["nnet_utils/nnet_hex_gather.h"]
 hex_ring_mac_include_list = ["nnet_utils/nnet_hex_ring_mac.h"]
 
+# ---------------------------------------------------------------------------
+# io_stream config + function templates
+#
+# The config structs are identical to the parallel variants (same geometry).
+# Only the function call changes: stream kernels take hls::stream<> refs,
+# which hls4ml's TransformTypes pass already wired into the variable names
+# when IOType == 'io_stream'.  We select the right template in the
+# FunctionCallTemplate.format() method by checking IOType.
+# ---------------------------------------------------------------------------
+
+# Stream config templates reuse the same base structs as the parallel variants
+# (hex_gather_config / hex_ring_mac_config / hex_max_pool_config) because the
+# stream kernels unpack→parallel_kernel→repack and need identical geometry.
+# Only the function call template changes.
+
+hex_gather_stream_config_template = """\
+struct config{index} : nnet::hex_gather_config {{
+    static const unsigned n_in   = {n_in};
+    static const unsigned n_out  = {n_out};
+    static const unsigned k      = {k};
+    static const unsigned n_chan  = {n_chan};
+    static const int indices[n_out * k];
+}};
+const int config{index}::indices[] = {{{indices_vals}}};\n"""
+
+hex_gather_stream_function_template = (
+    "nnet::hex_gather_stream<{input_t}, {output_t}, {config}>({input}, {output});"
+)
+
+hex_ring_mac_stream_config_template = """\
+struct config{index} : nnet::hex_ring_mac_config {{
+    static const unsigned n_out          = {n_out};
+    static const unsigned k              = {k};
+    static const unsigned n_in_chan      = {n_in_chan};
+    static const unsigned n_out_chan     = {n_out_chan};
+    static const unsigned num_weight_rows = {num_weight_rows};
+    static const unsigned n_pixels     = {n_pixels};
+    static const unsigned n_partitions = {n_partitions};
+    static const unsigned reuse_factor = {reuse};
+    static const unsigned multiplier_limit =
+        DIV_ROUNDUP(n_pixels * k * n_in_chan * n_out_chan, reuse_factor);
+    static const unsigned row_map[k];
+    typedef {mac_weights_t.name} weight_t;
+    typedef {mac_bias_t.name}    bias_t;
+    typedef {accum_t_str} accum_t;
+}};
+const unsigned config{index}::row_map[] = {{{row_map_vals}}};\n"""
+
+hex_ring_mac_stream_function_template = (
+    "nnet::hex_ring_mac_stream<{input_t}, {mac_weights_t}, {mac_bias_t}, "
+    "{output_t}, {config}>"
+    "({input}, w{index}, b{index}, {output});"
+)
+
+hex_max_pool_stream_config_template = """\
+struct config{index} : nnet::hex_max_pool_config {{
+    static const unsigned n_out  = {n_out};
+    static const unsigned k      = {k};
+    static const unsigned n_chan  = {n_chan};
+}};\n"""
+
+hex_max_pool_stream_function_template = (
+    "nnet::hex_max_pool_stream<{input_t}, {output_t}, {config}>({input}, {output});"
+)
+
+# Stream function templates need the stream header (for the wrapper) plus
+# the parallel header (included transitively, but listed explicitly for clarity).
+hex_gather_stream_include_list = ["nnet_utils/nnet_hex_gather_stream.h"]
+hex_ring_mac_stream_include_list = ["nnet_utils/nnet_hex_ring_mac_stream.h"]
+hex_max_pool_stream_include_list = ["nnet_utils/nnet_hex_max_pool_stream.h"]
+
+
+def _is_stream(node):
+    """Return True when the model is configured for io_stream."""
+    return node.model.config.get_config_value("IOType") == "io_stream"
+
 
 class HexGatherConfigTemplate(LayerConfigTemplate):
     def __init__(self):
         super().__init__(HHexGather)
         self.template = hex_gather_config_template
+        self.template_stream = hex_gather_stream_config_template
 
     def format(self, node):
         params = self._default_config_params(node)
@@ -351,13 +431,19 @@ class HexGatherConfigTemplate(LayerConfigTemplate):
         params["k"] = node.attributes["k"]
         params["n_chan"] = node.attributes["n_chan"]
         params["indices_vals"] = _int_csv(node.get_attr("indices_data"))
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexGatherFunctionTemplate(FunctionCallTemplate):
     def __init__(self):
-        super().__init__(HHexGather, include_header=hex_gather_include_list)
+        # Register headers for both variants; unused ones are harmless.
+        super().__init__(
+            HHexGather,
+            include_header=hex_gather_include_list + hex_gather_stream_include_list,
+        )
         self.template = hex_gather_function_template
+        self.template_stream = hex_gather_stream_function_template
 
     def format(self, node):
         params = {}
@@ -366,13 +452,15 @@ class HexGatherFunctionTemplate(FunctionCallTemplate):
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexRingMACConfigTemplate(LayerConfigTemplate):
     def __init__(self):
         super().__init__(HHexRingMAC)
         self.template = hex_ring_mac_config_template
+        self.template_stream = hex_ring_mac_stream_config_template
 
     def format(self, node):
         params = self._default_config_params(node)  # provides params['reuse']
@@ -382,20 +470,25 @@ class HexRingMACConfigTemplate(LayerConfigTemplate):
         params["n_in_chan"] = node.attributes["n_in_chan"]
         params["n_out_chan"] = node.attributes["n_out_chan"]
         params["num_weight_rows"] = node.attributes["num_weight_rows"]
+        params["row_map_vals"] = _int_csv(node.get_attr("ring_idx_data"))
+        n_terms = node.attributes["k"] * node.attributes["n_in_chan"]
+        params["accum_t_str"] = _accum_type_str(node, n_terms)
+        # Both parallel and stream configs need n_pixels / n_partitions.
         pf = _choose_parallelization(node, n_out)
         params["n_pixels"] = pf
         params["n_partitions"] = n_out // pf
-        params["row_map_vals"] = _int_csv(node.get_attr("ring_idx_data"))
-        # Accumulator holds a sum of K*Cin products per output channel.
-        n_terms = node.attributes["k"] * node.attributes["n_in_chan"]
-        params["accum_t_str"] = _accum_type_str(node, n_terms)
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexRingMACFunctionTemplate(FunctionCallTemplate):
     def __init__(self):
-        super().__init__(HHexRingMAC, include_header=hex_ring_mac_include_list)
+        super().__init__(
+            HHexRingMAC,
+            include_header=hex_ring_mac_include_list + hex_ring_mac_stream_include_list,
+        )
         self.template = hex_ring_mac_function_template
+        self.template_stream = hex_ring_mac_stream_function_template
 
     def format(self, node):
         params = {}
@@ -407,7 +500,8 @@ class HexRingMACFunctionTemplate(FunctionCallTemplate):
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexMaxPoolHandler(KerasV3LayerHandler):
@@ -444,19 +538,25 @@ class HexMaxPoolConfigTemplate(LayerConfigTemplate):
     def __init__(self):
         super().__init__(HHexMaxPool)
         self.template = hex_max_pool_config_template
+        self.template_stream = hex_max_pool_stream_config_template
 
     def format(self, node):
         params = self._default_config_params(node)
         params["n_out"] = node.attributes["n_out"]
         params["k"] = node.attributes["k"]
         params["n_chan"] = node.attributes["n_chan"]
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexMaxPoolFunctionTemplate(FunctionCallTemplate):
     def __init__(self):
-        super().__init__(HHexMaxPool, include_header=hex_max_pool_include_list)
+        super().__init__(
+            HHexMaxPool,
+            include_header=hex_max_pool_include_list + hex_max_pool_stream_include_list,
+        )
         self.template = hex_max_pool_function_template
+        self.template_stream = hex_max_pool_stream_function_template
 
     def format(self, node):
         params = {}
@@ -465,7 +565,8 @@ class HexMaxPoolFunctionTemplate(FunctionCallTemplate):
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +602,7 @@ class HHexGather3D(Layer):
         n_out = self.attributes["n_out"]
         k = self.attributes["k"]
         n_chan = self.attributes["n_chan"]
-        self.add_output_variable(shape=[n_depth * n_out * k * n_chan])
+        self.add_output_variable(shape=[n_depth * n_out * k, n_chan])
 
 
 class HHexRingMAC3D(Layer):
@@ -533,7 +634,7 @@ class HHexRingMAC3D(Layer):
         n_depth = self.attributes["n_depth"]
         n_out = self.attributes["n_out"]
         n_out_chan = self.attributes["n_out_chan"]
-        self.add_output_variable(shape=[n_depth * n_out * n_out_chan])
+        self.add_output_variable(shape=[n_depth * n_out, n_out_chan])
         self.add_weights_variable(name="mac_weights", var_name="w{index}")
         self.add_weights_variable(name="mac_bias", var_name="b{index}")
 
@@ -660,11 +761,72 @@ hex_ring_mac_3d_function_template = (
 hex_gather_3d_include_list = ["nnet_utils/nnet_hex_gather_3d.h"]
 hex_ring_mac_3d_include_list = ["nnet_utils/nnet_hex_ring_mac_3d.h"]
 
+hex_gather_3d_stream_config_template = """\
+struct config{index} : nnet::hex_gather_3d_config {{
+    static const unsigned n_depth = {n_depth};
+    static const unsigned n_in    = {n_in};
+    static const unsigned n_out   = {n_out};
+    static const unsigned k       = {k};
+    static const unsigned n_chan  = {n_chan};
+    static const int indices[n_out * k];
+}};
+const int config{index}::indices[] = {{{indices_vals}}};\n"""
+
+hex_gather_3d_stream_function_template = (
+    "nnet::hex_gather_3d_stream<{input_t}, {output_t}, {config}>({input}, {output});"
+)
+
+hex_ring_mac_3d_stream_config_template = """\
+struct config{index} : nnet::hex_ring_mac_3d_config {{
+    static const unsigned n_depth         = {n_depth};
+    static const unsigned n_out           = {n_out};
+    static const unsigned k               = {k};
+    static const unsigned n_in_chan       = {n_in_chan};
+    static const unsigned n_out_chan      = {n_out_chan};
+    static const unsigned num_weight_rows = {num_weight_rows};
+    static const unsigned n_pixels     = {n_pixels};
+    static const unsigned n_partitions = {n_partitions};
+    static const unsigned reuse_factor = {reuse};
+    static const unsigned multiplier_limit =
+        DIV_ROUNDUP(n_pixels * k * n_in_chan * n_out_chan, reuse_factor);
+    static const unsigned row_map[k];
+    typedef {mac_weights_t.name} weight_t;
+    typedef {mac_bias_t.name}    bias_t;
+    typedef {accum_t_str} accum_t;
+}};
+const unsigned config{index}::row_map[] = {{{row_map_vals}}};\n"""
+
+hex_ring_mac_3d_stream_function_template = (
+    "nnet::hex_ring_mac_3d_stream<{input_t}, {mac_weights_t}, "
+    "{mac_bias_t}, {output_t}, {config}>"
+    "({input}, w{index}, b{index}, {output});"
+)
+
+hex_max_pool_3d_stream_config_template = """\
+struct config{index} : nnet::hex_max_pool_3d_config {{
+    static const unsigned n_depth_in   = {n_depth_in};
+    static const unsigned n_depth_out  = {n_depth_out};
+    static const unsigned depth_size   = {depth_size};
+    static const unsigned depth_stride = {depth_stride};
+    static const unsigned n_out        = {n_out};
+    static const unsigned k            = {k};
+    static const unsigned n_chan       = {n_chan};
+}};\n"""
+
+hex_max_pool_3d_stream_function_template = (
+    "nnet::hex_max_pool_3d_stream<{input_t}, {output_t}, {config}>({input}, {output});"
+)
+
+hex_gather_3d_stream_include_list = ["nnet_utils/nnet_hex_gather_3d_stream.h"]
+hex_ring_mac_3d_stream_include_list = ["nnet_utils/nnet_hex_ring_mac_3d_stream.h"]
+hex_max_pool_3d_stream_include_list = ["nnet_utils/nnet_hex_max_pool_3d_stream.h"]
+
 
 class HexGather3DConfigTemplate(LayerConfigTemplate):
     def __init__(self):
         super().__init__(HHexGather3D)
         self.template = hex_gather_3d_config_template
+        self.template_stream = hex_gather_3d_stream_config_template
 
     def format(self, node):
         params = self._default_config_params(node)
@@ -674,13 +836,18 @@ class HexGather3DConfigTemplate(LayerConfigTemplate):
         params["k"] = node.attributes["k"]
         params["n_chan"] = node.attributes["n_chan"]
         params["indices_vals"] = _int_csv(node.get_attr("indices_data"))
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexGather3DFunctionTemplate(FunctionCallTemplate):
     def __init__(self):
-        super().__init__(HHexGather3D, include_header=hex_gather_3d_include_list)
+        super().__init__(
+            HHexGather3D,
+            include_header=hex_gather_3d_include_list + hex_gather_3d_stream_include_list,
+        )
         self.template = hex_gather_3d_function_template
+        self.template_stream = hex_gather_3d_stream_function_template
 
     def format(self, node):
         params = {}
@@ -689,13 +856,15 @@ class HexGather3DFunctionTemplate(FunctionCallTemplate):
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexRingMAC3DConfigTemplate(LayerConfigTemplate):
     def __init__(self):
         super().__init__(HHexRingMAC3D)
         self.template = hex_ring_mac_3d_config_template
+        self.template_stream = hex_ring_mac_3d_stream_config_template
 
     def format(self, node):
         params = self._default_config_params(node)  # provides params['reuse']
@@ -710,17 +879,20 @@ class HexRingMAC3DConfigTemplate(LayerConfigTemplate):
         params["n_pixels"] = pf
         params["n_partitions"] = n_out // pf
         params["row_map_vals"] = _int_csv(node.get_attr("ring_idx_data"))
-        # Per-frame accumulator sums K*Cin products; depth taps are summed later
-        # by a native Add layer with its own accumulator inference.
         n_terms = node.attributes["k"] * node.attributes["n_in_chan"]
         params["accum_t_str"] = _accum_type_str(node, n_terms)
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexRingMAC3DFunctionTemplate(FunctionCallTemplate):
     def __init__(self):
-        super().__init__(HHexRingMAC3D, include_header=hex_ring_mac_3d_include_list)
+        super().__init__(
+            HHexRingMAC3D,
+            include_header=hex_ring_mac_3d_include_list + hex_ring_mac_3d_stream_include_list,
+        )
         self.template = hex_ring_mac_3d_function_template
+        self.template_stream = hex_ring_mac_3d_stream_function_template
 
     def format(self, node):
         params = {}
@@ -732,7 +904,8 @@ class HexRingMAC3DFunctionTemplate(FunctionCallTemplate):
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HHexMaxPool3D(Layer):
@@ -758,7 +931,7 @@ class HHexMaxPool3D(Layer):
         n_depth_out = self.attributes["n_depth_out"]
         n_out = self.attributes["n_out"]
         n_chan = self.attributes["n_chan"]
-        self.add_output_variable(shape=[n_depth_out * n_out * n_chan])
+        self.add_output_variable(shape=[n_depth_out * n_out, n_chan])
 
 
 class HexMaxPool3DHandler(KerasV3LayerHandler):
@@ -802,6 +975,7 @@ class HexMaxPool3DConfigTemplate(LayerConfigTemplate):
     def __init__(self):
         super().__init__(HHexMaxPool3D)
         self.template = hex_max_pool_3d_config_template
+        self.template_stream = hex_max_pool_3d_stream_config_template
 
     def format(self, node):
         params = self._default_config_params(node)
@@ -812,13 +986,18 @@ class HexMaxPool3DConfigTemplate(LayerConfigTemplate):
         params["n_out"] = node.attributes["n_out"]
         params["k"] = node.attributes["k"]
         params["n_chan"] = node.attributes["n_chan"]
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 class HexMaxPool3DFunctionTemplate(FunctionCallTemplate):
     def __init__(self):
-        super().__init__(HHexMaxPool3D, include_header=hex_max_pool_3d_include_list)
+        super().__init__(
+            HHexMaxPool3D,
+            include_header=hex_max_pool_3d_include_list + hex_max_pool_3d_stream_include_list,
+        )
         self.template = hex_max_pool_3d_function_template
+        self.template_stream = hex_max_pool_3d_stream_function_template
 
     def format(self, node):
         params = {}
@@ -827,7 +1006,8 @@ class HexMaxPool3DFunctionTemplate(FunctionCallTemplate):
         params["output_t"] = node.get_output_variable().type.name
         params["input"] = node.get_input_variable(node.inputs[0]).name
         params["output"] = node.get_output_variable().name
-        return self.template.format(**params)
+        tmpl = self.template_stream if _is_stream(node) else self.template
+        return tmpl.format(**params)
 
 
 # ---------------------------------------------------------------------------
@@ -877,9 +1057,15 @@ def register_hex_gather_layers(backend_name="Vivado"):
         "nnet_hex_gather.h",
         "nnet_hex_ring_mac.h",
         "nnet_hex_max_pool.h",
+        "nnet_hex_gather_stream.h",
+        "nnet_hex_ring_mac_stream.h",
+        "nnet_hex_max_pool_stream.h",
         "nnet_hex_gather_3d.h",
         "nnet_hex_ring_mac_3d.h",
         "nnet_hex_max_pool_3d.h",
+        "nnet_hex_gather_3d_stream.h",
+        "nnet_hex_ring_mac_3d_stream.h",
+        "nnet_hex_max_pool_3d_stream.h",
     ):
         p = here / fname
         if p.exists():
