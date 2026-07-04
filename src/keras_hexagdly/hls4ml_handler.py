@@ -319,7 +319,7 @@ struct config{index} : nnet::hex_ring_mac_config {{
     // Parallel multiplier cap: per-partition work spread over reuse_factor
     // cycles — satisfiable by construction (mirrors hls4ml conv/dense).
     static const unsigned multiplier_limit =
-        DIV_ROUNDUP(n_pixels * k * n_in_chan * n_out_chan, reuse_factor);
+        DIV_ROUNDUP(n_pixels * num_weight_rows * n_in_chan * n_out_chan, reuse_factor);
     // Slot -> weight row, baked at export (ring index when share_neighbors,
     // identity otherwise). No runtime indirection.
     static const unsigned row_map[k];
@@ -381,7 +381,7 @@ struct config{index} : nnet::hex_ring_mac_config {{
     static const unsigned n_partitions = {n_partitions};
     static const unsigned reuse_factor = {reuse};
     static const unsigned multiplier_limit =
-        DIV_ROUNDUP(n_pixels * k * n_in_chan * n_out_chan, reuse_factor);
+        DIV_ROUNDUP(n_pixels * num_weight_rows * n_in_chan * n_out_chan, reuse_factor);
     static const unsigned row_map[k];
     typedef {mac_weights_t.name} weight_t;
     typedef {mac_bias_t.name}    bias_t;
@@ -739,7 +739,7 @@ struct config{index} : nnet::hex_ring_mac_3d_config {{
     // Parallel multiplier cap: per-partition work spread over reuse_factor
     // cycles — satisfiable by construction (mirrors hls4ml conv/dense).
     static const unsigned multiplier_limit =
-        DIV_ROUNDUP(n_pixels * k * n_in_chan * n_out_chan, reuse_factor);
+        DIV_ROUNDUP(n_pixels * num_weight_rows * n_in_chan * n_out_chan, reuse_factor);
     // Slot -> weight row, baked at export (ring index when share_neighbors,
     // identity otherwise). No runtime indirection.
     static const unsigned row_map[k];
@@ -788,7 +788,7 @@ struct config{index} : nnet::hex_ring_mac_3d_config {{
     static const unsigned n_partitions = {n_partitions};
     static const unsigned reuse_factor = {reuse};
     static const unsigned multiplier_limit =
-        DIV_ROUNDUP(n_pixels * k * n_in_chan * n_out_chan, reuse_factor);
+        DIV_ROUNDUP(n_pixels * num_weight_rows * n_in_chan * n_out_chan, reuse_factor);
     static const unsigned row_map[k];
     typedef {mac_weights_t.name} weight_t;
     typedef {mac_bias_t.name}    bias_t;
