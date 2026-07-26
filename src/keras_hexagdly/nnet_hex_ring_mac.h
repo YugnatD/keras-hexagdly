@@ -3,6 +3,7 @@
 
 #include "nnet_common.h"
 #include "nnet_helpers.h"
+#include "nnet_mult.h"
 
 // Hexagonal ring-sharing MAC for keras-hexagdly hls4ml export.
 //
@@ -70,6 +71,15 @@ struct hex_ring_mac_config {
     typedef float weight_t;
     typedef float bias_t;
     typedef float accum_t;
+
+    // Product kernel, selected by the handler from the data/weight precisions
+    // exactly as hls4ml does for its own layers (nnet::product::mult for plain
+    // fixed-point, but weight_binary / weight_ternary / weight_exponential when
+    // the weights are quantized -- for exponential weights a plain `a * w` would
+    // be numerically WRONG, since that product is a shift, not a multiply).
+    // Ring sharing stays valid for all of them: every supported product is
+    // distributive, so w*(x_a + x_b) == w*x_a + w*x_b still holds.
+    template <class x_T, class y_T> using product = nnet::product::mult<x_T, y_T>;
 };
 
 template<class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
@@ -86,9 +96,20 @@ void hex_ring_mac(
     constexpr unsigned n_rows     = CONFIG_T::num_weight_rows;  // rings (== k when not sharing)
     constexpr unsigned mult_n_out = CONFIG_T::n_out_chan;
 
-    #pragma HLS ARRAY_PARTITION variable=weights complete
-    #pragma HLS ARRAY_PARTITION variable=bias    complete
+    // Weights: BRAM when reuse_factor > 1 (same rule as nnet_dense_resource).
+    // At RF=1 (fully parallel): ARRAY_PARTITION complete -> distributed LUT-ROM,
+    //   every weight readable in one cycle without ports bottleneck.
+    // At RF>1 (time-multiplexed): ARRAY_RESHAPE block + ROM_nP_BRAM -> weight
+    //   array mapped to BRAM, freeing LUT as RF grows, matching classical conv.
+    // This is the fix for hex LUT not dropping with RF (unlike classical conv).
     #pragma HLS FUNCTION_INSTANTIATE variable=weights,bias
+    #pragma HLS ARRAY_PARTITION variable=bias complete
+    if (CONFIG_T::reuse_factor == 1) {
+        #pragma HLS ARRAY_PARTITION variable=weights complete
+    } else {
+        #pragma HLS ARRAY_RESHAPE   variable=weights block factor=CONFIG_T::reuse_factor
+        #pragma HLS RESOURCE        variable=weights core=ROM_nP_BRAM
+    }
 
     // Per-concurrent-pixel ring-sum and accumulator banks. Indexed only by
     // compile-time constants after unrolling -> registers, no crossbars.
@@ -153,8 +174,9 @@ PartitionLoop:
                 Product3:
                     for (unsigned o = 0; o < mult_n_out; o++) {
                         #pragma HLS UNROLL
-                        acc[i_pxl][o] +=
-                            s * weights[(row * CONFIG_T::n_in_chan + c) * mult_n_out + o];
+                        acc[i_pxl][o] += (typename CONFIG_T::accum_t)
+                            CONFIG_T::template product<typename CONFIG_T::accum_t, w_T>::product(
+                                s, weights[(row * CONFIG_T::n_in_chan + c) * mult_n_out + o]);
                     }
                 }
             }

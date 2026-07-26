@@ -11,6 +11,11 @@
 // Token counts derived from element type sizes:
 //   in_tokens  = (n_out * k * n_chan) / data_T::size
 //   out_tokens = (n_out * n_chan)     / res_T::size
+//
+// KNOWN LIMITATION (RTL correctness, io_stream + Strategy='Latency'+RF=1 +
+// a downstream repack_stream layer such as Flatten): see the detailed note
+// in nnet_hex_conv_linebuffer_stream.h. Workaround: Strategy='Resource' with
+// ReuseFactor>=2.
 
 namespace nnet {
 
@@ -20,6 +25,14 @@ void hex_max_pool_stream(hls::stream<data_T> &input, hls::stream<res_T> &output)
     constexpr unsigned N_OUT = CONFIG_T::n_out * CONFIG_T::n_chan;
     constexpr unsigned IN_TOKENS  = N_IN  / data_T::size;
     constexpr unsigned OUT_TOKENS = N_OUT / res_T::size;
+
+    // These token counts are integer divisions: if the stream element width did
+    // not divide the tensor evenly the kernel would silently process a
+    // truncated tensor. Fail at compile time instead.
+    static_assert(N_IN  % data_T::size == 0,
+                  "input stream element size must divide the input tensor evenly");
+    static_assert(N_OUT % res_T::size == 0,
+                  "output stream element size must divide the output tensor evenly");
 
     typename data_T::value_type in_arr[N_IN];
     #pragma HLS ARRAY_PARTITION variable=in_arr complete

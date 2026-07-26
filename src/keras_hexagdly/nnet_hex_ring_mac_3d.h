@@ -3,6 +3,7 @@
 
 #include "nnet_common.h"
 #include "nnet_helpers.h"
+#include "nnet_mult.h"
 
 // Depth-aware hexagonal ring-sharing MAC for keras-hexagdly Conv3d hls4ml export.
 //
@@ -60,6 +61,15 @@ struct hex_ring_mac_3d_config {
     typedef float weight_t;
     typedef float bias_t;
     typedef float accum_t;
+
+    // Product kernel, selected by the handler from the data/weight precisions
+    // exactly as hls4ml does for its own layers (nnet::product::mult for plain
+    // fixed-point, but weight_binary / weight_ternary / weight_exponential when
+    // the weights are quantized -- for exponential weights a plain `a * w` would
+    // be numerically WRONG, since that product is a shift, not a multiply).
+    // Ring sharing stays valid for all of them: every supported product is
+    // distributive, so w*(x_a + x_b) == w*x_a + w*x_b still holds.
+    template <class x_T, class y_T> using product = nnet::product::mult<x_T, y_T>;
 };
 
 template<class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
@@ -76,9 +86,14 @@ void hex_ring_mac_3d(
     constexpr unsigned n_rows     = CONFIG_T::num_weight_rows;  // rings (== k when not sharing)
     constexpr unsigned mult_n_out = CONFIG_T::n_out_chan;
 
-    #pragma HLS ARRAY_PARTITION variable=weights complete
-    #pragma HLS ARRAY_PARTITION variable=bias    complete
     #pragma HLS FUNCTION_INSTANTIATE variable=weights,bias
+    #pragma HLS ARRAY_PARTITION variable=bias complete
+    if (CONFIG_T::reuse_factor == 1) {
+        #pragma HLS ARRAY_PARTITION variable=weights complete
+    } else {
+        #pragma HLS ARRAY_RESHAPE   variable=weights block factor=CONFIG_T::reuse_factor
+        #pragma HLS RESOURCE        variable=weights core=ROM_nP_BRAM
+    }
 
     // Per-concurrent-pixel ring-sum and accumulator banks, reused across frames.
     // ring_sum folds the K slots into num_weight_rows ring totals before the
@@ -145,8 +160,9 @@ DepthLoop:
                     Product3:
                         for (unsigned o = 0; o < mult_n_out; o++) {
                             #pragma HLS UNROLL
-                            acc[i_pxl][o] +=
-                                s * weights[(row * CONFIG_T::n_in_chan + c) * mult_n_out + o];
+                            acc[i_pxl][o] += (typename CONFIG_T::accum_t)
+                                CONFIG_T::template product<typename CONFIG_T::accum_t, w_T>::product(
+                                    s, weights[(row * CONFIG_T::n_in_chan + c) * mult_n_out + o]);
                         }
                     }
                 }

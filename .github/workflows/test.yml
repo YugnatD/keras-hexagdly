@@ -18,6 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The real test suite for this repo lives in hexagdly-oracle (see its
+      # README): tests/ here only keeps what's genuinely local. Checked out
+      # as a sibling dir and put on PYTHONPATH rather than pip-installed,
+      # since its wheel doesn't ship tests/ (only src/hexagdly_oracle).
+      - name: Checkout hexagdly-oracle
+        uses: actions/checkout@v4
+        with:
+          repository: YugnatD/hexagdly-oracle
+          path: hexagdly-oracle
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -34,14 +44,21 @@ jobs:
       - name: Install keras-hexagdly + dev/test deps
         run: |
           pip install -e .
-          pip install pytest hexagdly
+          pip install pytest hexagdly hls4ml numpy
           # torch is also the cross-check oracle dependency, regardless of backend
           if [ "${{ matrix.backend }}" != "torch" ]; then
             pip install torch --index-url https://download.pytorch.org/whl/cpu
           fi
 
-      - name: Run tests
+      - name: Run local tests
         run: pytest tests/ -v
+
+      - name: Run hexagdly-oracle's keras-side tests
+        # pytorch_hexagdly isn't installed here, so pytorch-only parametrizations
+        # and test_cross_framework.py are collected but skipped, not run.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hexagdly-oracle/src
+        run: pytest hexagdly-oracle/tests/ -v
 
   lint:
     runs-on: ubuntu-latest

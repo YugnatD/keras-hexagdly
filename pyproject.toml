@@ -43,8 +43,6 @@ dependencies = [
 dev = [
     "pytest",
     "tensorflow",
-    "torch",
-    "hexagdly",
 ]
 
 [project.urls]

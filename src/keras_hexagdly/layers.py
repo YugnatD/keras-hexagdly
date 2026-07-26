@@ -602,29 +602,56 @@ def _reduce_max_aligned(taps, axes):
 
 
 # ----------------------------------------------------------------------------
-# Ring sharing (share_neighbors): tie weights by hexagonal ring, like TDSCAN
-# ----------------------------------------------------------------------------
+# Weight sharing (share_neighbors): tie kernel cells together by physical
+# offset, three ways -- ported from pytorch-hexagdly, which is the reference
+# implementation for this feature (this port previously had only "ring", and
+# had a real bug in it; see the note on _PROBE_ANCHOR_PARITY below).
+#
+#   "ring" -- one weight per hex ring (n+1 weights total): TDSCAN-style, all
+#             cells equidistant from the center share a weight.
+#   "diag" -- antipodal pairs: cells at offset (dr,dc) and (-dr,-dc) share.
+#             1 + 3*n*(n+1)/2 weights.
+#   "sym"  -- adjacent pairs along the outer boundary of each ring, grouped by
+#             60-degree rotational symmetry. Same weight count as "diag".
 #
 # The hexagdly offset layout does not map cleanly to a textbook hex-coordinate
 # distance formula (the per-column vertical shift is asymmetric). Rather than
-# risk a silently-wrong closed form, we derive the ring index of every kernel
-# cell EMPIRICALLY: a single-tap impulse through the (validated) custom-kernel
-# conv reveals each cell's physical (row, col) offset from the center, and the
-# ring is the smallest kernel size whose support contains that offset. This is
-# exact by construction and reuses the already-tested forward pass; it runs once
-# per (size) and is cached.
+# risk a silently-wrong closed form, "ring" is derived EMPIRICALLY: a
+# single-tap impulse through the (validated) custom-kernel conv reveals each
+# cell's physical (row, col) offset from the center, and the ring is the
+# smallest kernel size whose support contains that offset. "diag"/"sym" reuse
+# pytorch-hexagdly's own hand-verified tables (n=1,2 only -- neither this port
+# nor upstream defines them for n>2).
+# ----------------------------------------------------------------------------
 
-_RING_MAP_CACHE = {}
+_WEIGHT_MAP_CACHE = {}
+
+# _tap_offset probes kernel size nn using a synthetic grid of size g = 6*nn+11,
+# centered at cen = g//2. Since g grows with nn, cen's COLUMN PARITY flips
+# between probes of different nn (g=17 -> cen=8, even; g=23 -> cen=11, odd) --
+# and hexagdly's addressing is parity-dependent (the zig-zag itself), so two
+# probes run at different nn were being read against inconsistent parity
+# references. Concretely: ring_maps_2d(2) classified 4 of 19 taps in the wrong
+# ring (the (+-1,+-1) diagonal cells), because support[1] (probed at nn=1,
+# even column) and support[2] (probed at nn=2, odd column) don't describe the
+# same physical geometry. Anchoring every probe to the SAME column parity,
+# verified to reproduce pytorch-hexagdly's hand-checked ring map for n=2
+# exactly (element-for-element), fixes it.
+_PROBE_ANCHOR_PARITY = 0  # even column; arbitrary but must be probe-invariant
 
 
 def _tap_offset(n, i, r, c):
     """Physical (dr, dc) offset of sub-kernel cell (i, r, c) for kernel size n.
 
     Fires a single tap through Conv2d_CustomKernel on a centered impulse and
-    reads back where the 1.0 lands. Pure measurement, no coordinate assumptions.
+    reads back where the 1.0 lands. Pure measurement, no coordinate
+    assumptions -- except the probe's center column parity is pinned to
+    _PROBE_ANCHOR_PARITY (see that constant for why).
     """
     g = 6 * n + 11
     cen = g // 2
+    if cen % 2 != _PROBE_ANCHOR_PARITY:
+        cen += 1
     imp = np.zeros((1, g, g, 1), np.float32)
     imp[0, cen, cen, 0] = 1.0
     subk = []
@@ -642,18 +669,8 @@ def _tap_offset(n, i, r, c):
     return int(pos[0][0] - cen), int(pos[0][1] - cen)
 
 
-def ring_maps_2d(n):
-    """For kernel size ``n`` return ``(ring_maps, num_rings)``.
-
-    ``ring_maps[i]`` is an int array of shape ``(rows_i, cols_i)`` giving the hex
-    ring index (0..n) of every cell of sub-kernel ``i``. A b-ring kernel has
-    ``num_rings = n + 1`` distinct weights; ring r holds ``1 if r==0 else 6*r``
-    cells (verified for n=1,2,3: rings of size 1,6,12,18).
-    """
-    if n in _RING_MAP_CACHE:
-        return _RING_MAP_CACHE[n]
-
-    # physical-offset support of each kernel size 1..n (ring = smallest size in).
+def _ring_maps_2d_uncached(n):
+    """Empirical ring derivation (see the module-level note above)."""
     support = {}
     for nn in range(1, n + 1):
         offs = set()
@@ -682,10 +699,95 @@ def ring_maps_2d(n):
             for c in range(cols):
                 m[r, c] = ring_of(_tap_offset(n, i, r, c))
         ring_maps.append(m)
+    return ring_maps, n + 1
 
-    result = (ring_maps, n + 1)
-    _RING_MAP_CACHE[n] = result
+
+# Hand-verified weight-group tables for "diag" and "sym", ported verbatim from
+# pytorch-hexagdly's `_HARDCODED_MAPS` (the reference implementation for these
+# two modes). Both modes are parity-independent at n=1,2 (upstream carries a
+# per-parity variant purely for a "diag"/"sym" future beyond n=2 that neither
+# port actually implements; the even- and odd-column tables it stores are
+# identical, so only one copy is kept here). Sub-kernel shapes/ordering are
+# identical between the two ports (both mirror hexagdly's own decomposition),
+# so these arrays apply to keras-hexagdly's Conv2d_CustomKernel sub-kernels
+# unchanged -- confirmed by cross-checking "ring" n=2 element-for-element
+# against pytorch-hexagdly's own hardcoded ring table after the parity fix
+# above.
+_DIAG_SYM_MAPS = {
+    ("diag", 1): ([np.array([[3], [0], [3]]), np.array([[1, 2], [2, 1]])], 4),
+    ("diag", 2): (
+        [
+            np.array([[1], [5], [0], [5], [1]]),
+            np.array([[3, 2], [8, 7], [7, 8], [2, 3]]),
+            np.array([[6, 4], [9, 9], [4, 6]]),
+        ],
+        10,
+    ),
+    ("sym", 1): ([np.array([[2], [0], [3]]), np.array([[2, 1], [3, 1]])], 4),
+    ("sym", 2): (
+        [
+            np.array([[4], [3], [0], [1], [7]]),
+            np.array([[9, 4], [3, 2], [1, 2], [7, 6]]),
+            np.array([[9, 5], [8, 5], [8, 6]]),
+        ],
+        10,
+    ),
+}
+
+SHARE_NEIGHBORS_MODES = ("ring", "diag", "sym")
+
+
+def weight_maps_2d(n, mode="ring"):
+    """For kernel size ``n`` and sharing ``mode``, return ``(weight_maps, num_weights)``.
+
+    ``weight_maps[i]`` is an int array of shape ``(rows_i, cols_i)`` giving the
+    weight-group index of every cell of sub-kernel ``i``; ``num_weights`` is the
+    number of distinct shared weights that mode produces for this kernel size.
+
+    mode="ring": any kernel size (derived empirically, cached).
+    mode="diag"/"sym": kernel_size 1 or 2 only (hand-verified tables, ported
+    from pytorch-hexagdly, which does not define them beyond n=2 either).
+    """
+    if mode not in SHARE_NEIGHBORS_MODES:
+        raise ValueError(
+            f"share_neighbors mode must be one of {SHARE_NEIGHBORS_MODES}, got {mode!r}."
+        )
+    key = (mode, n)
+    if key in _WEIGHT_MAP_CACHE:
+        return _WEIGHT_MAP_CACHE[key]
+
+    if mode == "ring":
+        result = _ring_maps_2d_uncached(n)
+    else:
+        if (mode, n) not in _DIAG_SYM_MAPS:
+            raise NotImplementedError(
+                f"share_neighbors={mode!r} is only implemented for kernel_size 1 and 2, "
+                f"got kernel_size={n}."
+            )
+        maps, num = _DIAG_SYM_MAPS[(mode, n)]
+        result = ([m.copy() for m in maps], num)
+
+    _WEIGHT_MAP_CACHE[key] = result
     return result
+
+
+def ring_maps_2d(n):
+    """Back-compat alias: ``weight_maps_2d(n, "ring")``."""
+    return weight_maps_2d(n, "ring")
+
+
+def _normalize_share_neighbors(value):
+    """False/None -> False (off); True -> "ring" (back-compat default mode);
+    a mode string -> itself, validated."""
+    if value is False or value is None:
+        return False
+    if value is True:
+        return "ring"
+    if value in SHARE_NEIGHBORS_MODES:
+        return value
+    raise ValueError(
+        f"share_neighbors must be False, True, or one of {SHARE_NEIGHBORS_MODES}, got {value!r}."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -738,13 +840,16 @@ class Conv2d(HexBase, keras.layers.Layer):
         self.hexbase_stride = stride
         self.debug = debug
         self.use_bias = bias
-        self.share_neighbors = share_neighbors
+        self.share_neighbors = _normalize_share_neighbors(share_neighbors)
         self.dimensions = 2
         self.process = _ConvProcess(2)
         self.combine = keras.ops.add
-        # Ring geometry depends only on kernel size, so it can be derived now.
-        if share_neighbors:
-            self._ring_maps, self.num_rings = ring_maps_2d(self.hexbase_size)
+        # Weight-group geometry depends only on kernel size + mode, so it can be
+        # derived now.
+        if self.share_neighbors:
+            self._ring_maps, self.num_rings = weight_maps_2d(
+                self.hexbase_size, self.share_neighbors
+            )
         self.kwargs = {"bias": None}
 
     def build(self, input_shape):
@@ -895,7 +1000,7 @@ class Conv3d(HexBase, keras.layers.Layer):
             self.depth_stride = stride[0]
         self.debug = debug
         self.use_bias = bias
-        self.share_neighbors = share_neighbors
+        self.share_neighbors = _normalize_share_neighbors(share_neighbors)
         # Depth (time) border handling. "valid" (default) = no depth pad, output
         # depth = D - kernel + 1 (original hexagdly behaviour). "same" = zero-pad
         # (kernel-1)//2 on each side so output depth = input depth, kernel centred
@@ -908,8 +1013,10 @@ class Conv3d(HexBase, keras.layers.Layer):
         self.dimensions = 3
         self.process = _ConvProcess(3)
         self.combine = keras.ops.add
-        if share_neighbors:
-            self._ring_maps, self.num_rings = ring_maps_2d(self.hexbase_size)
+        if self.share_neighbors:
+            self._ring_maps, self.num_rings = weight_maps_2d(
+                self.hexbase_size, self.share_neighbors
+            )
         self.kwargs = {"bias": None}
 
     def build(self, input_shape):

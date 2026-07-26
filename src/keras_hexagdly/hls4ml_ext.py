@@ -39,10 +39,28 @@ Two strategies are available via the ``strategy`` argument to
     Vitis HLS clang to segfault during static elaboration.  Useful for
     C-simulation at any size but not for RTL synthesis beyond small grids.
 
-"gather" (not yet implemented):
-    A proper sparse gather layer backed by a custom hls4ml KerasV3LayerHandler
-    + HLS C++ template.  Scales to full camera size (DigiCam N=1296) without
-    a large static array.  Raises NotImplementedError until implemented.
+"gather":
+    A sparse gather layer (HexGather) + ring-MAC (HexRingMAC), backed by custom
+    hls4ml KerasV3LayerHandlers + HLS C++ kernels.  Scales to full camera size
+    (DigiCam N=1296) without a large static array.  Works in io_parallel and
+    io_stream; in io_stream it materialises the frame and the K× gathered tensor
+    in registers (see the linebuffer strategy for the memory-lean alternative).
+
+"linebuffer" (Conv2d/Conv3d and MaxPool2d/MaxPool3d):
+    A single fused layer per op (HexConvLineBuffer / HexConvLineBuffer3D /
+    HexPoolLineBuffer / HexPoolLineBuffer3D) that keeps the (H, W) grid.  In
+    io_stream the HLS kernel slides a line buffer over the streamed image — only
+    rows_resident+1 (= 2*kernel_size + 1) input rows resident — instead of
+    buffering the whole frame + gathered tensor, which sharply cuts FF/LUT.  In
+    io_parallel a line buffer gives no benefit (the gather im2col is already
+    frame-buffered), so the handler prints a warning and falls back to a
+    frame-buffered fused kernel (same cost as "gather").
+
+    2D conv/pool support any hex stride: output pixel (oh, ow) maps to input base
+    (stride*oh, stride*ow) with constant per-parity tap offsets.  The 3D variants
+    are hex-stride 1 (depth handled as a dense/pooled axis); the depth axis is
+    depth_size frames resident — the optimal streaming-3D memory floor (3D cannot
+    reach O(rows) like 2D: depth taps are N=H*W tokens apart in the stream).
 
 MaxPool2d uses a gather EinsumDense + MaxPooling1D regardless of strategy
 (max is not linear so neither folded nor slotwise applies; the gather matrix
@@ -523,19 +541,20 @@ def _conv3d_slotwise(layer, x):
 
 
 def _get_ring_idx(layer, cells):
-    """Return (K,) int32 array mapping each cell slot to its hex ring index.
+    """Return (K,) int32 array mapping each cell slot to its weight-group index.
 
-    Only meaningful when share_neighbors=True.  Uses ring_maps_2d (the same
-    empirical ring map already used by get_cell_weights) so the ring assignment
-    is guaranteed consistent with the weight layout.
+    Only meaningful when share_neighbors is truthy. Uses weight_maps_2d (the
+    same map already used by get_cell_weights, keyed by layer.share_neighbors'
+    mode) so the group assignment is guaranteed consistent with the weight
+    layout regardless of which sharing mode ("ring"/"diag"/"sym") is active.
 
     Keyed off hexbase_size (the spatial kernel size), not kernel_size: for
     Conv2d the two are identical, but Conv3d's kernel_size may be a (depth,
     spatial) tuple, so hexbase_size is the correct spatial ring geometry.
     """
-    from keras_hexagdly.layers import ring_maps_2d
+    from keras_hexagdly.layers import weight_maps_2d
 
-    ring_maps, _ = ring_maps_2d(layer.hexbase_size)
+    ring_maps, _ = weight_maps_2d(layer.hexbase_size, layer.share_neighbors)
     return np.array([int(ring_maps[i][r, c]) for i, r, c in cells], dtype=np.int32)
 
 
@@ -697,6 +716,143 @@ def _conv3d_gather(layer, x):
     )
 
 
+def _conv2d_linebuffer(layer, x):
+    """Conv2d -> single fused HexConvLineBuffer (linebuffer strategy).
+
+    Same neighbor table + weights as _conv2d_gather, but gather and MAC are
+    fused into ONE layer that keeps the (H, W) grid.  No Reshape / flatten and
+    no intermediate gathered FIFO: in io_stream this lets the HLS kernel slide a
+    line buffer over the image instead of materialising the whole frame + K×
+    gathered tensor.  Any hex stride is supported: output pixel (oh, ow) maps to
+    input base (stride*oh, stride*ow) and the per-parity tap offsets are constant
+    (build_parity_offset_tables).
+    """
+    from keras_hexagdly.hex_gather import HexConvLineBuffer
+
+    H, W = int(x.shape[1]), int(x.shape[2])
+    nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
+    bias = layer.bias_tensor.numpy() if layer.use_bias else None
+
+    if layer.share_neighbors:
+        weights = layer.ring_weights.numpy()  # (num_rings, Cin, Cout)
+        ring_idx = _get_ring_idx(layer, cells)  # (K,)
+    else:
+        weights = get_cell_weights(layer, cells)  # (K, Cin, Cout)
+        ring_idx = None
+
+    return HexConvLineBuffer(
+        neighbor_idx=nbr,
+        H=H,
+        W=W,
+        stride=layer.hexbase_stride,
+        H_out=H_out,
+        W_out=W_out,
+        weights_array=weights,
+        ring_idx=ring_idx,
+        bias=bias,
+        name=f"{layer.name}_linebuffer",
+    )(x)
+
+
+def _maxpool2d_linebuffer(layer, x):
+    """MaxPool2d -> single fused HexPoolLineBuffer (linebuffer strategy).
+
+    Line-buffer analogue of _maxpool2d_gather: keeps the (H, W) grid and reduces
+    the max over the K neighbor taps as the image streams, instead of
+    materialising the gathered tensor.  Any hex stride is supported.
+    """
+    from keras_hexagdly.hex_gather import HexPoolLineBuffer
+
+    H, W = int(x.shape[1]), int(x.shape[2])
+    nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
+
+    return HexPoolLineBuffer(
+        neighbor_idx=nbr,
+        H=H,
+        W=W,
+        stride=layer.hexbase_stride,
+        H_out=H_out,
+        W_out=W_out,
+        name=f"{layer.name}_linebuffer",
+    )(x)
+
+
+def _conv3d_linebuffer(layer, x):
+    """Conv3d -> single fused HexConvLineBuffer3D (linebuffer strategy).
+
+    Fuses the per-depth-tap gather+MAC+Add scaffolding of _conv3d_gather into one
+    layer that keeps the (D, H, W) grid.  Spatial neighbor table and per-tap
+    weights are identical; the depth axis rides through as a dense conv handled
+    inside the layer.  Only depth_stride=1 (as with _conv3d_gather).
+    """
+    from keras_hexagdly.hex_gather import HexConvLineBuffer3D
+
+    if layer.hexbase_stride != 1:
+        raise NotImplementedError(
+            "linebuffer strategy supports hex stride=1 only "
+            f"(got stride={layer.hexbase_stride}). Use strategy='gather'."
+        )
+    if layer.depth_stride != 1:
+        raise NotImplementedError(
+            f"Conv3d linebuffer export only supports depth_stride=1, got {layer.depth_stride}."
+        )
+
+    H, W = int(x.shape[2]), int(x.shape[3])
+    nbr, cells, _ = build_neighbor_table_3d(layer, int(x.shape[1]), H, W)
+
+    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
+    _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
+
+    bias = layer.bias_tensor.numpy() if layer.use_bias else None
+
+    if layer.share_neighbors:
+        weights = layer.ring_weights.numpy()  # (D_kernel, num_rings, Cin, Cout)
+        ring_idx = _get_ring_idx(layer, cells)  # (K,)
+    else:
+        weights = get_cell_weights_3d(layer, cells)  # (D_kernel, K, Cin, Cout)
+        ring_idx = None
+
+    return HexConvLineBuffer3D(
+        neighbor_idx=nbr,
+        H=H_out,
+        W=W_out,
+        weights_array=weights,
+        depth_size=layer.depth_size,
+        depth_stride=layer.depth_stride,
+        depth_padding=layer.depth_padding,
+        ring_idx=ring_idx,
+        bias=bias,
+        name=f"{layer.name}_linebuffer",
+    )(x)
+
+
+def _maxpool3d_linebuffer(layer, x):
+    """MaxPool3d -> single fused HexPoolLineBuffer3D (linebuffer strategy).
+
+    Line-buffer analogue of _maxpool3d_gather: keeps the (D, H, W) grid and maxes
+    over the depth pool window + K spatial taps as the volume streams.  Hex stride
+    1 only (spatial output grid == input grid); depth_size/depth_stride arbitrary.
+    """
+    from keras_hexagdly.hex_gather import HexPoolLineBuffer3D
+
+    if layer.hexbase_stride != 1:
+        raise NotImplementedError(
+            "MaxPool3d linebuffer supports hex stride=1 only "
+            f"(got {layer.hexbase_stride}). Use strategy='gather'."
+        )
+    H, W = int(x.shape[2]), int(x.shape[3])
+    nbr, cells, _ = build_neighbor_table_3d(layer, int(x.shape[1]), H, W)
+
+    return HexPoolLineBuffer3D(
+        neighbor_idx=nbr,
+        H=H,
+        W=W,
+        depth_size=layer.depth_size,
+        depth_stride=layer.depth_stride,
+        name=f"{layer.name}_linebuffer",
+    )(x)
+
+
 def _maxpool3d_gather(layer, x):
     """MaxPool3d -> Reshape + HexGather3D + HexMaxPool3D + Reshape.
 
@@ -742,7 +898,7 @@ def _maxpool3d_gather(layer, x):
 # Model surgery: walk the functional DAG and swap hex layers
 # ---------------------------------------------------------------------------
 
-_STRATEGIES = ("folded", "slotwise", "gather")
+_STRATEGIES = ("folded", "slotwise", "gather", "linebuffer")
 
 _REPLACEMENTS_FOLDED = {
     hgly.Conv2d: _conv2d_replacement,
@@ -763,6 +919,15 @@ _REPLACEMENTS_GATHER = {
     hgly.MaxPool2d: _maxpool2d_gather,  # HexGather + HexMaxPool (no large matrix)
     hgly.Conv3d: _conv3d_gather,  # HexGather3D + HexRingMAC3D (depth-aware)
     hgly.MaxPool3d: _maxpool3d_gather,  # HexGather3D + HexMaxPool3D (depth-aware)
+}
+
+# linebuffer: fused single-layer conv (line-buffer HLS kernel in io_stream).
+# Pooling has no MAC to fuse, so it reuses the gather pool builders unchanged.
+_REPLACEMENTS_LINEBUFFER = {
+    hgly.Conv2d: _conv2d_linebuffer,
+    hgly.MaxPool2d: _maxpool2d_linebuffer,
+    hgly.Conv3d: _conv3d_linebuffer,
+    hgly.MaxPool3d: _maxpool3d_linebuffer,
 }
 
 
@@ -808,6 +973,8 @@ def patch_model_for_hls(model, strategy="slotwise"):
 
     if strategy == "gather":
         replacements = _REPLACEMENTS_GATHER
+    elif strategy == "linebuffer":
+        replacements = _REPLACEMENTS_LINEBUFFER
     elif strategy == "slotwise":
         replacements = _REPLACEMENTS_SLOTWISE
     else:

@@ -35,7 +35,7 @@ positions (via GridTransform) and re-indexing if needed.
 import keras
 import numpy as np
 
-from keras_hexagdly.layers import Conv2d_CustomKernel, ring_maps_2d
+from keras_hexagdly.layers import Conv2d_CustomKernel, weight_maps_2d
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -139,6 +139,103 @@ def build_neighbor_table(layer, H, W):
     return neighbor_idx, cells, (H_out, W_out)
 
 
+def build_parity_offset_tables(neighbor_idx, W_in, H_out, W_out, stride=1):
+    """Derive per-column-parity (dr, dc) tap offsets from a flat neighbor table.
+
+    The line-buffer HLS kernel does not use the flat (N_out, K) index table: it
+    slides a window over the streamed grid, so it needs — for each output column
+    parity — the fixed (row, col) offset of every neighbor slot relative to the
+    output pixel's *base* input position.  These offsets are constant across the
+    interior of the grid and depend only on the parity of the output column
+    (hexagdly's zig-zag layout: even/odd columns are shifted half a pixel, so a
+    given slot reaches a different row offset depending on parity — the exact
+    even/odd split the original HexBase forward pass encodes via its differing
+    top/bottom pads).
+
+    Base position: output pixel (oh, ow) maps to input base (stride*oh,
+    stride*ow); every tap is base + (dr, dc).  This holds for any stride (the
+    parity row-shift for stride>1 is absorbed into the offset tables), verified
+    empirically over kernel_size 1..3 and stride 1..3.  At stride 1 base ==
+    (oh, ow), the original formulation.
+
+    Derived *empirically* from ``neighbor_idx`` (as built by
+    ``build_neighbor_table``) — no re-derivation of the zig-zag pad/slice
+    arithmetic.
+
+    Args:
+        neighbor_idx: int ndarray (N_out, K), -1 = border/invalid slot; indices
+                      into the flat input grid (m = h*W_in + w).
+        W_in:         input grid width (for decoding flat input indices).
+        H_out, W_out: output grid dims (H_out*W_out == N_out).
+        stride:       hex stride (input base = stride * output position).
+
+    Returns:
+        offsets_even:  int32 ndarray (K, 2) of (dr, dc) for even output columns.
+        offsets_odd:   int32 ndarray (K, 2) of (dr, dc) for odd  output columns.
+        rows_resident: int, the vertical span of the tap footprint over both
+                       parities, ``dr_max - dr_min`` — the number of input rows a
+                       line buffer must keep resident (hex analogue of hls4ml
+                       conv's ``filt_height - 1``).
+
+    Raises:
+        ValueError: if H_out * W_out != N_out, if the grid is too small to
+            contain a fully-interior pixel of each parity, or if the offsets are
+            not consistent across interior pixels of the same parity.
+    """
+    neighbor_idx = np.asarray(neighbor_idx)
+    N_out, K = neighbor_idx.shape
+    if H_out * W_out != N_out:
+        raise ValueError(
+            f"build_parity_offset_tables: H_out*W_out={H_out * W_out} != N_out={N_out}"
+        )
+
+    def _offsets_for_pixel(n):
+        """(K, 2) offsets for output pixel n, or None if any slot is a border."""
+        oh, ow = divmod(n, W_out)
+        base_h, base_w = stride * oh, stride * ow
+        offs = np.empty((K, 2), dtype=np.int32)
+        for k in range(K):
+            m = int(neighbor_idx[n, k])
+            if m < 0:
+                return None  # slot clipped at border -> pixel not fully interior
+            offs[k] = (m // W_in - base_h, m % W_in - base_w)
+        return offs
+
+    tables = {}
+    for parity in (0, 1):
+        # Fully-interior output pixels of this column parity (all slots valid).
+        # Prefer central pixels so the pick is robust on odd-shaped grids.
+        cols = [w for w in range(W_out) if w % 2 == parity]
+        candidates = sorted(
+            (h * W_out + w for h in range(H_out) for w in cols),
+            key=lambda m: (
+                -min(m // W_out, H_out - 1 - m // W_out, m % W_out, W_out - 1 - m % W_out)
+            ),
+        )
+        ref = None
+        for n in candidates:
+            offs = _offsets_for_pixel(n)
+            if offs is None:
+                continue
+            if ref is None:
+                ref = offs
+            elif not np.array_equal(offs, ref):
+                raise ValueError(
+                    f"Inconsistent tap offsets across interior pixels of parity "
+                    f"{parity} (pixel {n}). The grid geometry may be unsupported."
+                )
+        if ref is None:
+            raise ValueError(
+                f"Grid {H_out}x{W_out} too small: no fully-interior output pixel of "
+                f"column parity {parity} to derive tap offsets from. Use a larger grid."
+            )
+        tables[parity] = ref
+
+    all_dr = np.concatenate([tables[0][:, 0], tables[1][:, 0]])
+    rows_resident = int(all_dr.max() - all_dr.min())
+    return tables[0], tables[1], rows_resident
+
+
 def get_cell_weights(layer, cells):
     """Extract a (K, Cin, Cout) weight array from a built Conv2d.
 
@@ -155,7 +252,7 @@ def get_cell_weights(layer, cells):
     n = layer.kernel_size
 
     if layer.share_neighbors:
-        ring_maps, _ = ring_maps_2d(n)
+        ring_maps, _ = weight_maps_2d(n, layer.share_neighbors)
         W_rings = layer.ring_weights.numpy()  # (num_rings, Cin, Cout)
         W = np.stack([W_rings[int(ring_maps[i][r, c])] for i, r, c in cells])
     else:
@@ -267,7 +364,7 @@ def get_cell_weights_3d(layer, cells):
     n = layer.hexbase_size
 
     if layer.share_neighbors:
-        ring_maps, _ = ring_maps_2d(n)
+        ring_maps, _ = weight_maps_2d(n, layer.share_neighbors)
         W_rings = layer.ring_weights.numpy()  # (D, num_rings, Cin, Cout)
         D = W_rings.shape[0]
         ring_indices = [int(ring_maps[i][r, c]) for i, r, c in cells]

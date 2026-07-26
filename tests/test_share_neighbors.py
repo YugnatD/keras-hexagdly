@@ -1,8 +1,18 @@
-"""Tests for `share_neighbors`, a functionality NEW in this port with no
-equivalent in upstream PyTorch HexagDLy -- so there is no oracle to check
-against here. Instead these tests verify the defining properties directly:
-weight sharing by hex ring, trainability, and equivalence to a full
-(non-shared) kernel whose cells are filled by broadcasting the ring weights.
+"""Tests for `share_neighbors` that need no oracle: the defining properties
+of weight sharing (equivalence to a full non-shared kernel, gradient tying,
+3D depth independence) and API surface (back-compat alias, error handling).
+
+Everything that DOES need an oracle -- the hand-verified Conv2d/Conv3d/
+MaxPool2d/MaxPool3d ground truth and the pure-Python first-principles
+share_neighbors oracle -- lives in the shared `hexagdly-oracle` package
+(https://github.com/YugnatD/hexagdly-oracle)'s tests/test_layers.py,
+not here, so it is never duplicated (or silently allowed to diverge, as
+happened once with the ring_maps_2d(2) parity-probe bug this whole oracle
+setup was built to catch). Cross-framework agreement with pytorch-hexagdly
+is checked in hexagdly-oracle's tests/test_cross_framework.py. Comparison
+against the plain upstream `hexagdly` PyPI package (no share_neighbors
+support at all) is tests/test_vs_pytorch_hexagdly.py, which stays local to
+this repo since pytorch-hexagdly has no equivalent check to share it with.
 """
 
 import keras
@@ -10,6 +20,7 @@ import numpy as np
 import pytest
 
 import keras_hexagdly as hgly
+from keras_hexagdly.layers import weight_maps_2d
 
 
 def test_ring_maps_geometry():
@@ -91,3 +102,28 @@ def test_share_neighbors_gradient_tied():
         loss2 = tf.reduce_sum(layer(x))
     opt.apply_gradients([(tape2.gradient(loss2, layer.ring_weights), layer.ring_weights)])
     assert not np.allclose(before, layer.ring_weights.numpy())
+
+
+# -----------------------------------------------------------------------------
+# API surface parity with pytorch-hexagdly. No oracle needed for these.
+# -----------------------------------------------------------------------------
+def test_share_neighbors_true_is_ring_alias():
+    """Back-compat: the old bool API (share_neighbors=True) must still work
+    and must mean "ring", keras-hexagdly's only mode before this port."""
+    layer = hgly.Conv2d(2, 3, kernel_size=1, share_neighbors=True)
+    assert layer.share_neighbors == "ring"
+
+
+@pytest.mark.parametrize("mode", ["diag", "sym"])
+def test_diag_sym_reject_kernel_size_3(mode):
+    """Neither this port nor pytorch-hexagdly has diag/sym tables beyond
+    kernel_size=2 (upstream's _get_parity_maps raises KeyError there);
+    keras-hexagdly must fail the same way -- loudly -- rather than silently
+    falling back to something else."""
+    with pytest.raises(NotImplementedError):
+        weight_maps_2d(3, mode)
+
+
+def test_unknown_mode_rejected():
+    with pytest.raises(ValueError):
+        hgly.Conv2d(2, 3, kernel_size=1, share_neighbors="bogus")
