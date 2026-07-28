@@ -211,9 +211,15 @@ InitAccum:
         acc[o] = (acc_T)bias[o];
     }
 
-    // Iteration ir consumes ring sums [ir*IN_PER, (ir+1)*IN_PER) against a
-    // contiguous IN_PER*Cout slice of the weight array, so the whole slice is a
-    // single wide word after the ARRAY_RESHAPE applied by the caller.
+    // Iteration ir consumes ring sums [ir*IN_PER, (ir+1)*IN_PER) against the
+    // CONTIGUOUS slice [ir*MAC_BLOCK, (ir+1)*MAC_BLOCK) of the weight array
+    // (MAC_BLOCK = IN_PER*Cout), i.e. MAC_BLOCK parallel scalar reads. The
+    // caller leaves `weights` unconstrained and lets Vitis split it into small
+    // distributed ROMs, which costs 0 BRAM as long as MAC_BLOCK stays modest --
+    // see the measured sweep in nnet_hex_conv_linebuffer_stream.h before adding
+    // any ARRAY_RESHAPE here. If this loop is ever reordered to a strided index
+    // (nnet_dense_resource's ir + j*RF), that analysis has to be redone: the
+    // access pattern is what decides which reshape mode, if any, applies.
 ReuseLoop:
     for (unsigned ir = 0; ir < RF; ir++) {
         // rewind: the loop restarts on the next output pixel without draining,

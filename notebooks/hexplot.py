@@ -95,12 +95,13 @@ def _crop_to_footprint(grid):
 
 
 def _shared_kernel_hextensor(layer, in_channel):
-    """Ring-shared kernels: paint each ring's weight onto its true hex shell.
+    """share_neighbors="ring" ONLY: paint each ring's weight onto its true hex shell.
 
-    With share_neighbors the layer has one weight per hexagonal ring
-    (``layer.ring_weights``, shape ``(num_rings, in, out)``). Each weight is
-    placed on every cell at that hex distance, using put_shape geometry so the
-    rings line up with how plot_hextensor draws the grid.
+    Only valid for "ring" sharing, where the weight group IS the hex-distance
+    shell (``layer.ring_weights``, shape ``(num_rings, in, out)``, one weight
+    per hex distance). Each weight is placed on every cell at that hex
+    distance, using put_shape geometry so the rings line up with how
+    plot_hextensor draws the grid.
 
     The geometry is taken from put_shape (not the layer's own kernel offsets)
     because the conv's internal sub-kernel ring indexing is vertically mirrored
@@ -108,6 +109,11 @@ def _shared_kernel_hextensor(layer, in_channel):
     ring index does NOT give concentric rings on screen. Hex *distance* is
     frame-independent, so placing ring weight w_r on the true distance-r shell
     is both what the weight means and consistent with the example images.
+
+    Do NOT call this for "diag"/"sym": their weight groups are antipodal /
+    adjacent-60deg PAIRS, not distance shells, so this would paint a
+    ring-shaped picture regardless of the actual (non-ring) grouping --
+    exactly the bug kernel_to_hextensor's mode dispatch exists to avoid.
     """
     n = layer.hexbase_size
     ring_weights = keras.ops.convert_to_numpy(layer.ring_weights)  # (rings, in, out)
@@ -122,27 +128,64 @@ def _shared_kernel_hextensor(layer, in_channel):
     return _crop_to_footprint(grid)
 
 
+def _probe_layer(layer):
+    """A throwaway stride=1 copy of `layer`, same kernel_size/mode/weights.
+
+    Probing the real layer directly only works cleanly at stride=1: at
+    stride>1 the output grid is subsampled, so a single input impulse only
+    falls inside a couple of output pixels' receptive fields instead of the
+    dense, continuous footprint a stride=1 layer would show -- the kernel
+    LOOKS truncated to a tiny fragment, not because the weights are wrong,
+    but because impulse-response visualisation needs densely overlapping
+    receptive fields to trace out the full shape. The weights themselves are
+    stride-independent (only which output pixels get computed changes), so
+    copying them onto a fresh stride=1 instance and probing that gives the
+    complete kernel shape regardless of the original layer's stride.
+    """
+    mode = getattr(layer, "share_neighbors", False)
+    probe = type(layer)(
+        in_channels=layer.in_channels,
+        out_channels=layer.out_channels,
+        kernel_size=layer.hexbase_size,
+        stride=1,
+        bias=False,
+        share_neighbors=mode,
+    )
+    g = 6 * layer.hexbase_size + 11
+    probe(keras.ops.zeros((1, g, g, layer.in_channels)))  # trigger build()
+    if mode:
+        probe.ring_weights.assign(keras.ops.convert_to_numpy(layer.ring_weights))
+    else:
+        for i in range(layer.hexbase_size + 1):
+            src = keras.ops.convert_to_numpy(getattr(layer, "kernel" + str(i)))
+            probe._base_kernels[i].assign(src)
+    return probe
+
+
 def _impulse_response_hextensor(layer, in_channel):
     """General kernels: visualise the filter via its impulse response.
 
-    A single 1.0 (in input channel ``in_channel``) is fed through the trained
-    layer and the bias subtracted back out; the output is the filter's response
-    to a point source -- the standard way to picture a conv kernel, and it works
-    for any layer (ring-shared or not). The impulse is placed on an odd column,
-    where the hexagonal response footprint coincides exactly with a put_shape
-    hexagon, so it crops to a clean hex tile. Cells outside the footprint are
-    left NaN so plot_hextensor skips them rather than drawing them as zeros.
+    A single 1.0 (in input channel ``in_channel``) is fed through a stride=1
+    probe copy of the layer (see `_probe_layer` for why: probing the real
+    layer directly truncates the picture whenever stride>1) and the output is
+    the filter's response to a point source -- the standard way to picture a
+    conv kernel, and it works for any layer (ring-shared or not). The impulse
+    is placed on an odd column, where the hexagonal response footprint
+    coincides exactly with a put_shape hexagon, so it crops to a clean hex
+    tile. Cells outside the footprint are left NaN so plot_hextensor skips
+    them rather than drawing them as zeros.
     """
     n = layer.hexbase_size
     in_channels = layer.in_channels
+    probe = _probe_layer(layer) if layer.hexbase_stride != 1 else layer
     g = 6 * n + 11
     cen = g // 2
     cen = cen if cen % 2 == 1 else cen + 1  # impulse on an odd column
     impulse = np.zeros((1, g, g, in_channels), dtype=np.float32)
     impulse[0, cen, cen, in_channel] = 1.0
 
-    response = keras.ops.convert_to_numpy(layer(keras.ops.convert_to_tensor(impulse)))[0]
-    if layer.use_bias:
+    response = keras.ops.convert_to_numpy(probe(keras.ops.convert_to_tensor(impulse)))[0]
+    if probe.use_bias:
         response = response - keras.ops.convert_to_numpy(layer.bias_tensor)
 
     grid = np.where(
@@ -157,14 +200,22 @@ def kernel_to_hextensor(layer, in_channel=0):
     Returns a ``(1, h, w, out_channels)`` tensor -- one panel per output channel
     -- ready for ``plot_hextensor``. Works for any 2D hexagdly conv:
 
-      * share_neighbors=True  -> the three (or n+1) ring weights are drawn as
-        concentric hexagonal rings.
-      * share_neighbors=False -> the filter is shown via its impulse response
-        (its reaction to a single point input), a textured hexagonal tile.
+      * share_neighbors="ring" (or the legacy True alias) -> the n+1 ring
+        weights are drawn as concentric hexagonal rings, using
+        _shared_kernel_hextensor's distance-based geometry (only valid for
+        "ring": its weight groups ARE hex-distance shells).
+      * share_neighbors="diag"/"sym", or False -> the filter is shown via its
+        impulse response (its reaction to a single point input), which is
+        mode-agnostic (it just reads whatever weight the real forward pass
+        applied at each cell, regardless of how cells were grouped) and
+        therefore correct for antipodal-pair (diag) or adjacent-pair (sym)
+        sharing, where distance-based shells would be wrong -- painting a
+        ring-shaped picture for a diag/sym kernel is exactly that bug.
 
     ``in_channel`` selects which input channel's slice of the kernel to show
     (relevant when the layer has more than one input channel).
     """
-    if getattr(layer, "share_neighbors", False):
+    mode = getattr(layer, "share_neighbors", False)
+    if mode == "ring" or mode is True:
         return _shared_kernel_hextensor(layer, in_channel)
     return _impulse_response_hextensor(layer, in_channel)

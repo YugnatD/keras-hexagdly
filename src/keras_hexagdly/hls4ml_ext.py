@@ -40,7 +40,7 @@ Two strategies are available via the ``strategy`` argument to
     C-simulation at any size but not for RTL synthesis beyond small grids.
 
 "gather":
-    A sparse gather layer (HexGather) + ring-MAC (HexRingMAC), backed by custom
+    A fused hex conv layer (HexConvLineBuffer), backed by custom
     hls4ml KerasV3LayerHandlers + HLS C++ kernels.  Scales to full camera size
     (DigiCam N=1296) without a large static array.  Works in io_parallel and
     io_stream; in io_stream it materialises the frame and the K× gathered tensor
@@ -178,26 +178,238 @@ def _maxpool2d_replacement(layer, x):
     return keras.layers.Reshape((H_out, W_out, C), name=f"{layer.name}_reshape_out")(pooled)
 
 
-def _maxpool2d_gather(layer, x):
-    """MaxPool2d with strategy='gather' -> Reshape + HexGather + HexMaxPool + Reshape.
+def _conv3d_replacement(layer, x):
+    """Conv3d -> per-depth-tap (Crop1D + EinsumDense) + Add + Reshape.
 
-    HexGather replaces the large EinsumDense selection matrix with a tiny
-    (N_out, K) integer index table.  HexMaxPool takes the max over K slots.
-    Border slots were set to 0 by HexGather — matches hexagdly zero-padding.
+    Only depth_stride=1 is supported; raises NotImplementedError otherwise.
+    Both depth_padding='valid' and 'same' are handled.
+
+    For each depth tap d the input slice x[:, d:D_out+d, :, :, :] is extracted
+    via Cropping1D (after optional ZeroPadding1D for 'same'), then a spatial
+    EinsumDense with equation 'abmc,mcno->abno' (a=batch, b=D_out, m=N_in,
+    c=Cin, n=N_out, o=Cout) applies the gather+MAC.  The D_kernel taps are
+    finally summed via Add.
     """
-    from keras_hexagdly.hex_gather import HexGather, HexMaxPool
+    D_in = int(x.shape[1])
+    H, W = int(x.shape[2]), int(x.shape[3])
+    Cin = int(x.shape[4])
+    N_in = H * W
+    D_kernel = layer.depth_size
+    depth_stride = layer.depth_stride
+    Cout = layer.out_channels
 
+    if depth_stride != 1:
+        raise NotImplementedError(
+            f"Conv3d hls4ml export only supports depth_stride=1, got {depth_stride}. "
+            "Layers with depth_stride > 1 require a custom temporal-unfold handler."
+        )
+
+    # Handle depth_padding: pad the depth axis before cropping per tap.
+    if layer.depth_padding == "same":
+        pad_top = (D_kernel - 1) // 2
+        pad_bot = D_kernel - 1 - pad_top
+        D_eff = D_in  # output depth == input depth for 'same'
+    else:
+        pad_top = 0
+        pad_bot = 0
+        D_eff = D_in - D_kernel + 1  # valid conv output depth
+
+    nbr, cells, _ = build_neighbor_table_3d(layer, D_in, H, W)
+    W_k = get_cell_weights_3d(layer, cells)  # (D_kernel, K, Cin, Cout)
+    K = len(cells)
+
+    # Get H_out, W_out from a proxy
+    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
+    _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
+    N_out = H_out * W_out
+
+    # Reshape to (B, D_padded, N_in*Cin) for Cropping1D / ZeroPadding1D.
+    D_padded = D_in + pad_top + pad_bot
+    x_seq = keras.layers.Reshape((D_in, N_in * Cin), name=f"{layer.name}_reshape_seq")(x)
+    if pad_top > 0 or pad_bot > 0:
+        x_seq = keras.layers.ZeroPadding1D(padding=(pad_top, pad_bot), name=f"{layer.name}_zpad")(
+            x_seq
+        )
+
+    tap_outputs = []
+    for d in range(D_kernel):
+        # Crop to extract the D_eff frames for this tap.
+        crop_start = d
+        crop_end = D_padded - D_eff - d  # = D_kernel - 1 - d
+        if crop_start == 0 and crop_end == 0:
+            x_d_seq = x_seq
+        else:
+            x_d_seq = keras.layers.Cropping1D(
+                cropping=(crop_start, crop_end),
+                name=f"{layer.name}_crop_d{d}",
+            )(x_seq)  # (B, D_eff, N_in*Cin)
+
+        x_d = keras.layers.Reshape((D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}")(x_d_seq)
+
+        # Build folded spatial kernel for this depth tap: (N_in, Cin, N_out, Cout)
+        A_d = np.zeros((N_in, Cin, N_out, Cout), np.float32)
+        for n in range(N_out):
+            for k in range(K):
+                m = int(nbr[n, k])
+                if m >= 0:
+                    A_d[m, :, n, :] += W_k[d, k]
+
+        # Bias only on the last depth tap to avoid adding it D_kernel times.
+        use_bias = layer.use_bias and (d == D_kernel - 1)
+        einsum = keras.layers.EinsumDense(
+            "abmc,mcno->abno",
+            output_shape=(D_eff, N_out, Cout),
+            bias_axes="o" if use_bias else None,
+            name=f"{layer.name}_einsum_d{d}",
+        )
+        y_d = einsum(x_d)
+        if use_bias:
+            einsum.set_weights([A_d, layer.bias_tensor.numpy()])
+        else:
+            einsum.set_weights([A_d])
+
+        tap_outputs.append(y_d)
+
+    # Sum over depth taps.
+    if D_kernel == 1:
+        y_flat = tap_outputs[0]
+    else:
+        y_flat = keras.layers.Add(name=f"{layer.name}_add")(tap_outputs)
+
+    return keras.layers.Reshape((D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(
+        y_flat
+    )
+
+
+def _maxpool3d_replacement(layer, x):
+    raise NotImplementedError(
+        "MaxPool3d export is only implemented for strategy='gather'. "
+        "Max is not linear, so the folded/slotwise EinsumDense decompositions do "
+        "not apply. Use patch_model_for_hls(model, strategy='gather'), which maps "
+        "MaxPool3d to HexPoolLineBuffer3D."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _binary_add(tensors, name_prefix):
+    """Reduce a list of tensors to one value using a binary tree of Add layers.
+
+    hls4ml's Add handler asserts exactly 2 inputs, so a flat multi-input Add
+    is not allowed.  A left-fold binary tree produces only 2-input Add nodes
+    and is equivalent for commutative addition.
+    """
+    assert len(tensors) > 0
+    acc = tensors[0]
+    for i, t in enumerate(tensors[1:], start=1):
+        acc = keras.layers.Add(name=f"{name_prefix}_add{i}")([acc, t])
+    return acc
+
+
+# ---------------------------------------------------------------------------
+# Slotwise builders (strategy="slotwise")
+# ---------------------------------------------------------------------------
+
+
+def _get_ring_idx(layer, cells):
+    """Return (K,) int32 array mapping each cell slot to its weight-group index.
+
+    Only meaningful when share_neighbors is truthy. Uses weight_maps_2d (the
+    same map already used by get_cell_weights, keyed by layer.share_neighbors'
+    mode) so the group assignment is guaranteed consistent with the weight
+    layout regardless of which sharing mode ("ring"/"diag"/"sym") is active.
+
+    Keyed off hexbase_size (the spatial kernel size), not kernel_size: for
+    Conv2d the two are identical, but Conv3d's kernel_size may be a (depth,
+    spatial) tuple, so hexbase_size is the correct spatial ring geometry.
+    """
+    from keras_hexagdly.layers import weight_maps_2d
+
+    ring_maps, _ = weight_maps_2d(layer.hexbase_size, layer.share_neighbors)
+    return np.array([int(ring_maps[i][r, c]) for i, r, c in cells], dtype=np.int32)
+
+
+def _conv2d_replacement(layer, x):
+    """Conv2d -> Reshape + EinsumDense + Reshape.
+
+    The (N_in, Cin, N_out, Cout) kernel A encodes the neighbor gather folded
+    into the MAC: A[m, c, n, o] += W_k[k, c, o] for each slot k where
+    nbr[n, k] == m.  Invalid slots (-1) are skipped so they contribute 0.
+    """
+    H, W = int(x.shape[1]), int(x.shape[2])
+    Cin = int(x.shape[3])
+    N_in = H * W
+    Cout = layer.out_channels
+
+    nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
+    W_k = get_cell_weights(layer, cells)  # (K, Cin, Cout)
+    N_out = H_out * W_out
+    K = len(cells)
+
+    A = np.zeros((N_in, Cin, N_out, Cout), np.float32)
+    for n in range(N_out):
+        for k in range(K):
+            m = int(nbr[n, k])
+            if m >= 0:
+                A[m, :, n, :] += W_k[k]
+
+    x_flat = keras.layers.Reshape((N_in, Cin), name=f"{layer.name}_reshape_in")(x)
+
+    use_bias = layer.use_bias
+    einsum = keras.layers.EinsumDense(
+        "amc,mcno->ano",
+        output_shape=(N_out, Cout),
+        bias_axes="o" if use_bias else None,
+        name=f"{layer.name}_einsum",
+    )
+    y_flat = einsum(x_flat)
+    if use_bias:
+        einsum.set_weights([A, layer.bias_tensor.numpy()])
+    else:
+        einsum.set_weights([A])
+
+    return keras.layers.Reshape((H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(y_flat)
+
+
+def _maxpool2d_replacement(layer, x):
+    """MaxPool2d -> Reshape + EinsumDense (gather) + MaxPooling1D(K,K) + Reshape.
+
+    The (N_out*K, N_in) selection matrix S gathers the K neighbors of every
+    output pixel into a contiguous N_out*K-length sequence.  MaxPooling1D with
+    pool_size=K and strides=K then reduces each K-block to a single max value.
+    """
     H, W = int(x.shape[1]), int(x.shape[2])
     C = int(x.shape[3])
     N_in = H * W
 
     nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
+    N_out = H_out * W_out
+    K = len(cells)
+
+    S = np.zeros((N_out * K, N_in), np.float32)
+    for n in range(N_out):
+        for k in range(K):
+            m = int(nbr[n, k])
+            if m >= 0:
+                S[n * K + k, m] = 1.0
 
     x_flat = keras.layers.Reshape((N_in, C), name=f"{layer.name}_reshape_in")(x)
 
-    gathered = HexGather(neighbor_idx=nbr, name=f"{layer.name}_gather")(x_flat)  # (B, N_out, K, C)
+    gather = keras.layers.EinsumDense(
+        "amc,pm->apc",
+        output_shape=(N_out * K, C),
+        bias_axes=None,
+        name=f"{layer.name}_gather",
+    )
+    gathered = gather(x_flat)
+    gather.set_weights([S])
 
-    pooled = HexMaxPool(name=f"{layer.name}_maxpool")(gathered)  # (B, N_out, C)
+    pooled = keras.layers.MaxPooling1D(pool_size=K, strides=K, name=f"{layer.name}_pool1d")(
+        gathered
+    )
 
     return keras.layers.Reshape((H_out, W_out, C), name=f"{layer.name}_reshape_out")(pooled)
 
@@ -310,410 +522,13 @@ def _maxpool3d_replacement(layer, x):
         "MaxPool3d export is only implemented for strategy='gather'. "
         "Max is not linear, so the folded/slotwise EinsumDense decompositions do "
         "not apply. Use patch_model_for_hls(model, strategy='gather'), which maps "
-        "MaxPool3d to HexGather3D + HexMaxPool3D."
+        "MaxPool3d to HexPoolLineBuffer3D."
     )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _binary_add(tensors, name_prefix):
-    """Reduce a list of tensors to one value using a binary tree of Add layers.
-
-    hls4ml's Add handler asserts exactly 2 inputs, so a flat multi-input Add
-    is not allowed.  A left-fold binary tree produces only 2-input Add nodes
-    and is equivalent for commutative addition.
-    """
-    assert len(tensors) > 0
-    acc = tensors[0]
-    for i, t in enumerate(tensors[1:], start=1):
-        acc = keras.layers.Add(name=f"{name_prefix}_add{i}")([acc, t])
-    return acc
-
-
-# ---------------------------------------------------------------------------
-# Slotwise builders (strategy="slotwise")
-# ---------------------------------------------------------------------------
-
-
-def _conv2d_slotwise(layer, x):
-    """Conv2d -> K × (gather EinsumDense + MAC EinsumDense) + Add + Reshape.
-
-    For each neighbor slot k:
-      1. A (N_out, N_in) binary selection matrix S_k gathers input pixel
-         nbr[n,k] into output position n (0 for invalid slots).
-         EinsumDense equation: 'amc,nm->anc'  (batch a, N_in m, N_out n, Cin c)
-      2. A (Cin, Cout) weight matrix W_k applies the learned kernel.
-         EinsumDense equation: 'anc,co->ano'
-    Outputs are summed over all K slots via Add.
-
-    Largest single static array: (N_out, N_in) per slot — ~160k at 20×20,
-    well within Vitis HLS elaboration limits.
-    """
-    H, W = int(x.shape[1]), int(x.shape[2])
-    Cin = int(x.shape[3])
-    N_in = H * W
-    Cout = layer.out_channels
-
-    nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
-    W_k = get_cell_weights(layer, cells)  # (K, Cin, Cout)
-    N_out = H_out * W_out
-    K = len(cells)
-
-    x_flat = keras.layers.Reshape((N_in, Cin), name=f"{layer.name}_reshape_in")(x)
-
-    # Bias is folded into the last MAC EinsumDense (bias_axes="o"); EinsumDense
-    # supports bias natively and hls4ml converts it — no Lambda/Add (which hls4ml
-    # cannot convert). Only one slot carries the bias so it is added exactly once.
-    bias_vec = layer.bias_tensor.numpy() if layer.use_bias else None
-
-    slot_outputs = []
-    # Determine which retained slot will carry the bias (the last non-skipped one).
-    last_active = None
-    for k in range(K):
-        S_probe = any(int(nbr[n, k]) >= 0 for n in range(N_out))
-        if S_probe or np.any(W_k[k]):
-            last_active = k
-
-    for k in range(K):
-        # Binary selection matrix: S_k[n, m] = 1 iff nbr[n, k] == m.
-        S_k = np.zeros((N_out, N_in), np.float32)
-        for n in range(N_out):
-            m = int(nbr[n, k])
-            if m >= 0:
-                S_k[n, m] = 1.0
-
-        # Skip zero-weight slots (e.g. all-zero kernel cell).
-        if not np.any(S_k) and not np.any(W_k[k]):
-            continue
-
-        # Gather: (B, N_in, Cin) -> (B, N_out, Cin)
-        gather = keras.layers.EinsumDense(
-            "amc,nm->anc",
-            output_shape=(N_out, Cin),
-            bias_axes=None,
-            name=f"{layer.name}_gather_k{k}",
-        )
-        gathered = gather(x_flat)
-        gather.set_weights([S_k])
-
-        # MAC: (B, N_out, Cin) -> (B, N_out, Cout). Fold bias into this slot's
-        # EinsumDense if it is the one chosen to carry it.
-        carry_bias = bias_vec is not None and k == last_active
-        mac = keras.layers.EinsumDense(
-            "anc,co->ano",
-            output_shape=(N_out, Cout),
-            bias_axes="o" if carry_bias else None,
-            name=f"{layer.name}_mac_k{k}",
-        )
-        y_k = mac(gathered)
-        mac.set_weights([W_k[k], bias_vec] if carry_bias else [W_k[k]])
-
-        slot_outputs.append(y_k)
-
-    if len(slot_outputs) == 0:
-        # Degenerate: all-zero kernel. Emit one EinsumDense with a zero folded
-        # kernel (plus bias if present) so the graph stays hls4ml-convertible.
-        proj = keras.layers.EinsumDense(
-            "amc,mcno->ano",
-            output_shape=(N_out, Cout),
-            bias_axes="o" if bias_vec is not None else None,
-            name=f"{layer.name}_zero_proj",
-        )
-        y_flat = proj(x_flat)
-        zero_A = np.zeros((N_in, Cin, N_out, Cout), np.float32)
-        proj.set_weights([zero_A, bias_vec] if bias_vec is not None else [zero_A])
-    else:
-        y_flat = _binary_add(slot_outputs, name_prefix=layer.name)
-
-    return keras.layers.Reshape((H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(y_flat)
-
-
-def _conv3d_slotwise(layer, x):
-    """Conv3d -> per-depth-tap slotwise replacement + Add + Reshape.
-
-    Combines the per-depth-tap structure of _conv3d_replacement with the
-    per-slot decomposition of _conv2d_slotwise.  Only depth_stride=1 supported.
-    """
-    D_in = int(x.shape[1])
-    H, W = int(x.shape[2]), int(x.shape[3])
-    Cin = int(x.shape[4])
-    N_in = H * W
-    D_kernel = layer.depth_size
-    depth_stride = layer.depth_stride
-    Cout = layer.out_channels
-
-    if depth_stride != 1:
-        raise NotImplementedError(
-            f"Conv3d hls4ml export only supports depth_stride=1, got {depth_stride}."
-        )
-
-    if layer.depth_padding == "same":
-        pad_top = (D_kernel - 1) // 2
-        pad_bot = D_kernel - 1 - pad_top
-        D_eff = D_in
-    else:
-        pad_top = 0
-        pad_bot = 0
-        D_eff = D_in - D_kernel + 1
-
-    nbr, cells, _ = build_neighbor_table_3d(layer, D_in, H, W)
-    W_k = get_cell_weights_3d(layer, cells)  # (D_kernel, K, Cin, Cout)
-    K = len(cells)
-
-    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
-    _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
-    N_out = H_out * W_out
-
-    D_padded = D_in + pad_top + pad_bot
-    x_seq = keras.layers.Reshape((D_in, N_in * Cin), name=f"{layer.name}_reshape_seq")(x)
-    if pad_top > 0 or pad_bot > 0:
-        x_seq = keras.layers.ZeroPadding1D(padding=(pad_top, pad_bot), name=f"{layer.name}_zpad")(
-            x_seq
-        )
-
-    # Bias is folded into the last active MAC EinsumDense (bias_axes="o") rather
-    # than added via a Lambda, which hls4ml cannot convert. Find that (d,k) pair.
-    bias_vec = layer.bias_tensor.numpy() if layer.use_bias else None
-    last_active = None
-    for d in range(D_kernel):
-        for k in range(K):
-            S_probe = any(int(nbr[n, k]) >= 0 for n in range(N_out))
-            if S_probe or np.any(W_k[d, k]):
-                last_active = (d, k)
-
-    tap_slot_outputs = []
-    for d in range(D_kernel):
-        crop_start = d
-        crop_end = D_padded - D_eff - d
-        if crop_start == 0 and crop_end == 0:
-            x_d_seq = x_seq
-        else:
-            x_d_seq = keras.layers.Cropping1D(
-                cropping=(crop_start, crop_end),
-                name=f"{layer.name}_crop_d{d}",
-            )(x_seq)
-
-        x_d = keras.layers.Reshape((D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}")(x_d_seq)
-
-        for k in range(K):
-            S_k = np.zeros((N_out, N_in), np.float32)
-            for n in range(N_out):
-                m = int(nbr[n, k])
-                if m >= 0:
-                    S_k[n, m] = 1.0
-
-            if not np.any(S_k) and not np.any(W_k[d, k]):
-                continue
-
-            gather = keras.layers.EinsumDense(
-                "abmc,nm->abnc",
-                output_shape=(D_eff, N_out, Cin),
-                bias_axes=None,
-                name=f"{layer.name}_gather_d{d}_k{k}",
-            )
-            gathered = gather(x_d)
-            gather.set_weights([S_k])
-
-            carry_bias = bias_vec is not None and (d, k) == last_active
-            mac = keras.layers.EinsumDense(
-                "abnc,co->abno",
-                output_shape=(D_eff, N_out, Cout),
-                bias_axes="o" if carry_bias else None,
-                name=f"{layer.name}_mac_d{d}_k{k}",
-            )
-            y_dk = mac(gathered)
-            mac.set_weights([W_k[d, k], bias_vec] if carry_bias else [W_k[d, k]])
-            tap_slot_outputs.append(y_dk)
-
-    y_flat = _binary_add(tap_slot_outputs, name_prefix=layer.name)
-
-    return keras.layers.Reshape((D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(
-        y_flat
-    )
-
-
-# ---------------------------------------------------------------------------
-# Gather builders (strategy="gather")
-# ---------------------------------------------------------------------------
-
-
-def _get_ring_idx(layer, cells):
-    """Return (K,) int32 array mapping each cell slot to its weight-group index.
-
-    Only meaningful when share_neighbors is truthy. Uses weight_maps_2d (the
-    same map already used by get_cell_weights, keyed by layer.share_neighbors'
-    mode) so the group assignment is guaranteed consistent with the weight
-    layout regardless of which sharing mode ("ring"/"diag"/"sym") is active.
-
-    Keyed off hexbase_size (the spatial kernel size), not kernel_size: for
-    Conv2d the two are identical, but Conv3d's kernel_size may be a (depth,
-    spatial) tuple, so hexbase_size is the correct spatial ring geometry.
-    """
-    from keras_hexagdly.layers import weight_maps_2d
-
-    ring_maps, _ = weight_maps_2d(layer.hexbase_size, layer.share_neighbors)
-    return np.array([int(ring_maps[i][r, c]) for i, r, c in cells], dtype=np.int32)
-
-
-def _conv2d_gather(layer, x):
-    """Conv2d -> HexGather + HexRingMAC + Reshape.
-
-    One HexGather replaces all K EinsumDense selection matrices.
-    One HexRingMAC replaces all K MAC EinsumDense layers, exploiting
-    share_neighbors to store only (num_rings, Cin, Cout) instead of (K, Cin, Cout).
-
-    Graph:
-        Reshape(N_in, Cin)
-        → HexGather(N_out, K)              # (B, N_out, K, Cin)
-        → HexRingMAC(weights, ring_idx)    # (B, N_out, Cout)
-        → Reshape(H_out, W_out, Cout)
-    """
-    from keras_hexagdly.hex_gather import HexGather, HexRingMAC
-
-    H, W = int(x.shape[1]), int(x.shape[2])
-    Cin = int(x.shape[3])
-    N_in = H * W
-    Cout = layer.out_channels
-
-    nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
-
-    x_flat = keras.layers.Reshape((N_in, Cin), name=f"{layer.name}_reshape_in")(x)
-
-    # HexGather: index table (N_out, K) — tiny integer ROM
-    gathered = HexGather(neighbor_idx=nbr, name=f"{layer.name}_gather")(
-        x_flat
-    )  # (B, N_out, K, Cin)
-
-    # Bias is baked into HexRingMAC (seeded into the accumulator on the FPGA)
-    # so the export graph needs no extra Add/Lambda — hls4ml can't convert those.
-    bias = layer.bias_tensor.numpy() if layer.use_bias else None
-
-    # HexRingMAC: weights + optional ring_idx + bias
-    if layer.share_neighbors:
-        W_rings = layer.ring_weights.numpy()  # (num_rings, Cin, Cout)
-        ring_idx = _get_ring_idx(layer, cells)  # (K,)
-        y_flat = HexRingMAC(
-            weights_array=W_rings,
-            ring_idx=ring_idx,
-            bias=bias,
-            name=f"{layer.name}_mac",
-        )(gathered)
-    else:
-        from keras_hexagdly.indexed import get_cell_weights
-
-        W_k = get_cell_weights(layer, cells)  # (K, Cin, Cout)
-        y_flat = HexRingMAC(
-            weights_array=W_k,
-            ring_idx=None,
-            bias=bias,
-            name=f"{layer.name}_mac",
-        )(gathered)
-
-    return keras.layers.Reshape((H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(y_flat)
-
-
-def _conv3d_gather(layer, x):
-    """Conv3d -> per-depth-tap (Crop1D + HexGather3D + HexRingMAC3D) + Add + Reshape.
-
-    The spatial neighbor gather is sparse (a small (N_out, K) index ROM) exactly
-    as in Conv2d; the depth axis is dense and rides through HexGather3D /
-    HexRingMAC3D as a passthrough leading dimension.  Only depth_stride=1 is
-    supported (matches the slotwise path).  Both depth_padding='valid'/'same'
-    are handled via the same ZeroPadding1D + Cropping1D scaffolding as
-    _conv3d_slotwise.
-
-    For each depth tap d:
-        Crop the D_eff frames for this tap -> (B, D_eff, N_in, Cin)
-        HexGather3D(nbr)   -> (B, D_eff, N_out, K, Cin)
-        HexRingMAC3D(W[d]) -> (B, D_eff, N_out, Cout)
-    The D_kernel taps are summed via a binary Add tree, then bias is added.
-    """
-    from keras_hexagdly.hex_gather import HexGather3D, HexRingMAC3D
-
-    D_in = int(x.shape[1])
-    H, W = int(x.shape[2]), int(x.shape[3])
-    Cin = int(x.shape[4])
-    N_in = H * W
-    D_kernel = layer.depth_size
-    depth_stride = layer.depth_stride
-    Cout = layer.out_channels
-
-    if depth_stride != 1:
-        raise NotImplementedError(
-            f"Conv3d hls4ml export only supports depth_stride=1, got {depth_stride}."
-        )
-
-    if layer.depth_padding == "same":
-        pad_top = (D_kernel - 1) // 2
-        pad_bot = D_kernel - 1 - pad_top
-        D_eff = D_in
-    else:
-        pad_top = 0
-        pad_bot = 0
-        D_eff = D_in - D_kernel + 1
-
-    nbr, cells, _ = build_neighbor_table_3d(layer, D_in, H, W)
-
-    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
-    _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
-
-    # Per-tap weight sets: share -> (D_kernel, num_rings, Cin, Cout) + ring_idx;
-    # full -> (D_kernel, K, Cin, Cout).
-    if layer.share_neighbors:
-        W_all = layer.ring_weights.numpy()  # (D_kernel, num_rings, Cin, Cout)
-        ring_idx = _get_ring_idx(layer, cells)  # (K,)
-    else:
-        W_all = get_cell_weights_3d(layer, cells)  # (D_kernel, K, Cin, Cout)
-        ring_idx = None
-
-    D_padded = D_in + pad_top + pad_bot
-    x_seq = keras.layers.Reshape((D_in, N_in * Cin), name=f"{layer.name}_reshape_seq")(x)
-    if pad_top > 0 or pad_bot > 0:
-        x_seq = keras.layers.ZeroPadding1D(padding=(pad_top, pad_bot), name=f"{layer.name}_zpad")(
-            x_seq
-        )
-
-    tap_outputs = []
-    for d in range(D_kernel):
-        crop_start = d
-        crop_end = D_padded - D_eff - d
-        if crop_start == 0 and crop_end == 0:
-            x_d_seq = x_seq
-        else:
-            x_d_seq = keras.layers.Cropping1D(
-                cropping=(crop_start, crop_end),
-                name=f"{layer.name}_crop_d{d}",
-            )(x_seq)
-
-        x_d = keras.layers.Reshape((D_eff, N_in, Cin), name=f"{layer.name}_reshape_d{d}")(x_d_seq)
-
-        gathered = HexGather3D(neighbor_idx=nbr, name=f"{layer.name}_gather_d{d}")(
-            x_d
-        )  # (B, D_eff, N_out, K, Cin)
-
-        # Bias is baked into the MAC (no Lambda — stock hls4ml can't convert it).
-        # Add it on the final tap only so it contributes exactly once.
-        bias_d = layer.bias_tensor.numpy() if (layer.use_bias and d == D_kernel - 1) else None
-        y_d = HexRingMAC3D(
-            weights_array=W_all[d],
-            ring_idx=ring_idx,
-            bias=bias_d,
-            name=f"{layer.name}_mac_d{d}",
-        )(gathered)  # (B, D_eff, N_out, Cout)
-
-        tap_outputs.append(y_d)
-
-    if D_kernel == 1:
-        y_flat = tap_outputs[0]
-    else:
-        y_flat = _binary_add(tap_outputs, name_prefix=layer.name)
-
-    return keras.layers.Reshape((D_eff, H_out, W_out, Cout), name=f"{layer.name}_reshape_out")(
-        y_flat
-    )
 
 
 def _conv2d_linebuffer(layer, x):
@@ -757,7 +572,7 @@ def _conv2d_linebuffer(layer, x):
 def _maxpool2d_linebuffer(layer, x):
     """MaxPool2d -> single fused HexPoolLineBuffer (linebuffer strategy).
 
-    Line-buffer analogue of _maxpool2d_gather: keeps the (H, W) grid and reduces
+    Line-buffer pooling: keeps the (H, W) grid and reduces
     the max over the K neighbor taps as the image streams, instead of
     materialising the gathered tensor.  Any hex stride is supported.
     """
@@ -780,10 +595,10 @@ def _maxpool2d_linebuffer(layer, x):
 def _conv3d_linebuffer(layer, x):
     """Conv3d -> single fused HexConvLineBuffer3D (linebuffer strategy).
 
-    Fuses the per-depth-tap gather+MAC+Add scaffolding of _conv3d_gather into one
+    Fuses the per-depth-tap gather+MAC+Add scaffolding into one
     layer that keeps the (D, H, W) grid.  Spatial neighbor table and per-tap
     weights are identical; the depth axis rides through as a dense conv handled
-    inside the layer.  Only depth_stride=1 (as with _conv3d_gather).
+    inside the layer.  Only depth_stride=1 is supported.
     """
     from keras_hexagdly.hex_gather import HexConvLineBuffer3D
 
@@ -853,76 +668,10 @@ def _maxpool3d_linebuffer(layer, x):
     )(x)
 
 
-def _maxpool3d_gather(layer, x):
-    """MaxPool3d -> Reshape + HexGather3D + HexMaxPool3D + Reshape.
+_STRATEGIES = ("linebuffer", "folded")
 
-    One HexGather3D gathers each input frame's K spatial neighbors; HexMaxPool3D
-    then reduces the max over both the depth pool window (depth_size taps at
-    stride depth_stride) and the K slots, in a single custom HLS kernel.  This
-    avoids any per-tap slicing / concatenation, so strided depth pooling
-    (depth_stride > 1) needs no strided-slice op in the graph — the HLS kernel
-    walks the window directly.  Border slots are zeroed by HexGather3D, matching
-    hexagdly's zero-padding at the grid border.
-
-    Graph:
-        Reshape(D_in, N_in, C)
-        → HexGather3D(nbr)                       # (B, D_in, N_out, K, C)
-        → HexMaxPool3D(depth_size, depth_stride)  # (B, D_out, N_out, C)
-        → Reshape(D_out, H_out, W_out, C)
-    """
-    from keras_hexagdly.hex_gather import HexGather3D, HexMaxPool3D
-
-    D_in = int(x.shape[1])
-    H, W = int(x.shape[2]), int(x.shape[3])
-    C = int(x.shape[4])
-    N_in = H * W
-
-    nbr, cells, (D_out, H_out, W_out) = build_neighbor_table_3d(layer, D_in, H, W)
-
-    x_flat = keras.layers.Reshape((D_in, N_in, C), name=f"{layer.name}_reshape_in")(x)
-
-    gathered = HexGather3D(neighbor_idx=nbr, name=f"{layer.name}_gather")(
-        x_flat
-    )  # (B, D_in, N_out, K, C)
-
-    pooled = HexMaxPool3D(
-        depth_size=layer.depth_size,
-        depth_stride=layer.depth_stride,
-        name=f"{layer.name}_maxpool",
-    )(gathered)  # (B, D_out, N_out, C)
-
-    return keras.layers.Reshape((D_out, H_out, W_out, C), name=f"{layer.name}_reshape_out")(pooled)
-
-
-# ---------------------------------------------------------------------------
-# Model surgery: walk the functional DAG and swap hex layers
-# ---------------------------------------------------------------------------
-
-_STRATEGIES = ("folded", "slotwise", "gather", "linebuffer")
-
-_REPLACEMENTS_FOLDED = {
-    hgly.Conv2d: _conv2d_replacement,
-    hgly.MaxPool2d: _maxpool2d_replacement,
-    hgly.Conv3d: _conv3d_replacement,
-    hgly.MaxPool3d: _maxpool3d_replacement,
-}
-
-_REPLACEMENTS_SLOTWISE = {
-    hgly.Conv2d: _conv2d_slotwise,
-    hgly.MaxPool2d: _maxpool2d_replacement,  # pool is strategy-agnostic
-    hgly.Conv3d: _conv3d_slotwise,
-    hgly.MaxPool3d: _maxpool3d_replacement,
-}
-
-_REPLACEMENTS_GATHER = {
-    hgly.Conv2d: _conv2d_gather,
-    hgly.MaxPool2d: _maxpool2d_gather,  # HexGather + HexMaxPool (no large matrix)
-    hgly.Conv3d: _conv3d_gather,  # HexGather3D + HexRingMAC3D (depth-aware)
-    hgly.MaxPool3d: _maxpool3d_gather,  # HexGather3D + HexMaxPool3D (depth-aware)
-}
-
-# linebuffer: fused single-layer conv (line-buffer HLS kernel in io_stream).
-# Pooling has no MAC to fuse, so it reuses the gather pool builders unchanged.
+# linebuffer: fused single-layer conv (line-buffer HLS kernel in io_stream),
+# with matching line-buffer pooling. This is the production path.
 _REPLACEMENTS_LINEBUFFER = {
     hgly.Conv2d: _conv2d_linebuffer,
     hgly.MaxPool2d: _maxpool2d_linebuffer,
@@ -930,8 +679,18 @@ _REPLACEMENTS_LINEBUFFER = {
     hgly.MaxPool3d: _maxpool3d_linebuffer,
 }
 
+# folded: the most direct transcription of the maths, kept as an INDEPENDENT
+# cross-check for the test suite. Not a deployment path -- Vitis HLS clang
+# segfaults at synthesis on grids larger than ~9x9.
+_REPLACEMENTS_FOLDED = {
+    hgly.Conv2d: _conv2d_replacement,
+    hgly.MaxPool2d: _maxpool2d_replacement,
+    hgly.Conv3d: _conv3d_replacement,
+    hgly.MaxPool3d: _maxpool3d_replacement,
+}
 
-def patch_model_for_hls(model, strategy="slotwise"):
+
+def patch_model_for_hls(model, strategy="linebuffer"):
     """Return a new Keras functional model with hex layers replaced by hls4ml-native ops.
 
     Walks the model's layer graph in topological order.  Every hex layer is
@@ -941,21 +700,26 @@ def patch_model_for_hls(model, strategy="slotwise"):
     Args:
         model:    A built keras.Model whose hex layers have been trained.
         strategy: Export strategy for conv layers. One of:
-                  - "slotwise" (default): K separate gather+MAC pairs per layer.
-                    Largest static array is (N_out, N_in) per slot — safe for
-                    Vitis HLS synthesis at typical camera sizes.
-                  - "folded": one EinsumDense with the full (N_in,Cin,N_out,Cout)
-                    kernel. Simpler graph; fine for C-simulation but causes Vitis
-                    HLS clang to segfault at synthesis on grids larger than ~9×9.
-                  - "gather": HexGather + HexRingMAC layers.  Conv2d uses a
-                    sparse (N_out, K) integer index table instead of dense
-                    selection matrices — the key improvement for synthesis at
-                    full camera scale.  Requires Phases 3-4 (custom hls4ml
-                    handler + HLS C++ kernel) to synthesize; C-simulation
-                    with stock hls4ml is not yet supported.  Conv3d uses the
-                    depth-aware HexGather3D + HexRingMAC3D variants (spatial
-                    gather is sparse; the depth axis rides through as a
-                    passthrough dimension).  Only depth_stride=1 is supported.
+                  - "linebuffer" (default): the production path. One fused node
+                    per hex layer, keeping the (H, W, C) grid; in io_stream it
+                    slides a register window over shift-register line buffers,
+                    so only 2*kernel_size+1 image rows are ever resident. In
+                    io_parallel it falls back to a frame-buffered gather+MAC of
+                    equivalent cost. Covers Conv2d, Conv3d, MaxPool2d and
+                    MaxPool3d.
+                  - "folded": one EinsumDense with the full
+                    (N_in,Cin,N_out,Cout) kernel. This is the most direct
+                    transcription of the maths, kept as an INDEPENDENT
+                    CROSS-CHECK for the tests -- it is not a deployment path:
+                    Vitis HLS clang segfaults at synthesis on grids larger than
+                    ~9x9.
+
+                  The "slotwise" and "gather" strategies were removed: in
+                  io_stream, gather materialised the whole frame AND the
+                  N_out*K*Cin gathered tensor in registers (measured 34378 FF
+                  against 3077 for a native conv of comparable neighbourhood),
+                  which is exactly what "linebuffer" was written to avoid, and
+                  in io_parallel the two collapse to the same kernel.
 
     Returns:
         A new keras.Model — plain Keras, no hls4ml dependency.  Pass this to
@@ -971,14 +735,8 @@ def patch_model_for_hls(model, strategy="slotwise"):
     if strategy not in _STRATEGIES:
         raise ValueError(f"Unknown strategy {strategy!r}. Choose from: {_STRATEGIES}.")
 
-    if strategy == "gather":
-        replacements = _REPLACEMENTS_GATHER
-    elif strategy == "linebuffer":
-        replacements = _REPLACEMENTS_LINEBUFFER
-    elif strategy == "slotwise":
-        replacements = _REPLACEMENTS_SLOTWISE
-    else:
-        replacements = _REPLACEMENTS_FOLDED
+    replacements = (_REPLACEMENTS_LINEBUFFER if strategy == "linebuffer"
+                    else _REPLACEMENTS_FOLDED)
 
     # Map from original tensor id -> replacement tensor.
     tensor_map = {id(t): t for t in model.inputs}
@@ -1013,3 +771,127 @@ def patch_model_for_hls(model, strategy="slotwise"):
 
     new_outputs = [tensor_map[id(t)] for t in model.outputs]
     return keras.Model(model.inputs, new_outputs, name=model.name + "_hls")
+
+
+# -----------------------------------------------------------------------------
+# hls4ml configuration helpers
+# -----------------------------------------------------------------------------
+
+# Largest MAC_BLOCK (parallel weight reads per cycle) the stream kernels stay
+# well-behaved at. Past it Vitis stops splitting the weight array into small
+# distributed ROMs and starts duplicating it instead: measured on a 19x16x32
+# layer, MAC_BLOCK 512 costs 0 BRAM while 1216 costs 6080 (295% of a Virtex-7).
+# See the sweep table in nnet_hex_conv_linebuffer_stream.h.
+_MAX_MAC_BLOCK = 512
+
+def _hex_mac_shape(layer):
+    """(num_weight_rows * n_chan, n_filt) for a patched hex layer, else None."""
+    w = getattr(layer, "mac_weights", None)
+    if w is None:
+        return None
+    shape = tuple(w.shape)
+    if len(shape) == 3:              # (rows, Cin, Cout)
+        return shape[0] * shape[1], shape[2]
+    if len(shape) == 4:              # 3D: (depth, rows, Cin, Cout)
+        return shape[0] * shape[1] * shape[2], shape[3]
+    return None
+
+
+def recommended_reuse_factor(layer, max_mac_block=_MAX_MAC_BLOCK):
+    """Smallest ReuseFactor keeping this layer's MAC_BLOCK within budget.
+
+    MAC_BLOCK = ceil(n_in / rf) * n_filt is how many multipliers the kernel
+    instantiates, and also how many weights it reads per cycle. Returns 1 for
+    layers that are already small enough.
+    """
+    shape = _hex_mac_shape(layer)
+    if shape is None:
+        return 1
+    n_in, n_filt = shape
+    if n_filt >= max_mac_block:      # a single output slice already exceeds it
+        return n_in
+    per_cycle = max(1, max_mac_block // n_filt)
+    return max(1, -(-n_in // per_cycle))
+
+
+def hex_reuse_config(config, model, max_mac_block=_MAX_MAC_BLOCK, verbose=True):
+    """Give every hex layer in `model` an explicit per-layer ReuseFactor.
+
+    Two problems this solves, both measured:
+
+    1. `config_from_keras_model(granularity='name')` writes ReuseFactor=1 into
+       the LayerName entry of every layer it RECOGNISES, and that per-layer
+       value overrides Model.ReuseFactor. Hex layers are not recognised, so they
+       get no entry and silently fall through to the model-level value instead --
+       a hex-vs-standard comparison then runs the two at different reuse factors
+       without saying so.
+
+    2. The kernels have a narrow viable window. Too low a reuse factor and the
+       multiplier count explodes; in the middle, the weight ROM is duplicated
+       and BRAM explodes (measured 906% of a Virtex-7 at MAC_BLOCK=2432); too
+       high and latency explodes. This picks the low end of the safe range.
+
+    Mutates and returns `config`.
+    """
+    import warnings
+
+    layer_cfg = config.setdefault("LayerName", {})
+    for layer in model.layers:
+        if _hex_mac_shape(layer) is None:
+            continue
+        rf = recommended_reuse_factor(layer, max_mac_block)
+        entry = layer_cfg.setdefault(layer.name, {})
+        entry["ReuseFactor"] = rf
+        entry.setdefault("Strategy", "Resource")
+        if verbose:
+            n_in, n_filt = _hex_mac_shape(layer)
+            warnings.warn(
+                f"hex_reuse_config: {layer.name} -> ReuseFactor={rf} "
+                f"(MAC_BLOCK={-(-n_in // rf) * n_filt}, n_in={n_in}, n_filt={n_filt})",
+                stacklevel=2,
+            )
+    return config
+
+
+def check_hls_config(config, model):
+    """Warn about hls4ml settings known to mis-synthesise with these kernels.
+
+    Returns the list of warning strings (also issued via `warnings.warn`), so a
+    caller can assert on it in tests.
+    """
+    import warnings
+
+    issues = []
+    model_cfg = config.get("Model", {})
+    layer_cfg = config.get("LayerName", {})
+
+    # Known RTL-correctness failure, see nnet_hex_conv_linebuffer_stream.h:
+    # Strategy='Latency' + ReuseFactor=1 + a repack_stream-triggering layer
+    # downstream (Flatten/Reshape) gives a constant, bias-only output in real
+    # cosim while C-simulation stays correct.
+    reshapes = any(isinstance(l, (keras.layers.Flatten, keras.layers.Reshape))
+                   for l in model.layers)
+    for layer in model.layers:
+        if _hex_mac_shape(layer) is None:
+            continue
+        entry = layer_cfg.get(layer.name, {})
+        strat = str(entry.get("Strategy", model_cfg.get("Strategy", "Latency"))).lower()
+        rf = int(entry.get("ReuseFactor", model_cfg.get("ReuseFactor", 1)))
+        if reshapes and strat == "latency" and rf == 1:
+            issues.append(
+                f"{layer.name}: Strategy='Latency' with ReuseFactor=1 and a "
+                "Flatten/Reshape downstream is known to produce WRONG RTL "
+                "(bias-only output) while C-simulation passes. Use "
+                "Strategy='Resource' with ReuseFactor>=2."
+            )
+        shape = _hex_mac_shape(layer)
+        mac_block = -(-shape[0] // max(rf, 1)) * shape[1]
+        if mac_block > _MAX_MAC_BLOCK:
+            issues.append(
+                f"{layer.name}: ReuseFactor={rf} gives MAC_BLOCK={mac_block} "
+                f"(> {_MAX_MAC_BLOCK}); the weight ROM is likely to be duplicated "
+                f"into BRAM. Use ReuseFactor>={recommended_reuse_factor(layer)}."
+            )
+    for msg in issues:
+        warnings.warn("check_hls_config: " + msg, stacklevel=2)
+    return issues

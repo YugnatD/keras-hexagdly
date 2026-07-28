@@ -69,7 +69,7 @@ hls_model = hls4ml.converters.convert_from_keras_model(
     hls_config=cfg,
     backend="Vivado",
     output_dir=OUT_DIR,
-    part="xczu28dr-ffvg1517-2-e",
+    part="xc7vx485tffg1927-2",
     io_type="io_stream",
 )
 

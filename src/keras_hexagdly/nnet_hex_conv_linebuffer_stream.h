@@ -243,16 +243,32 @@ void hex_conv_linebuffer_stream(
     constexpr unsigned MAC_BLOCK  = MAC_IN_PER * CONFIG_T::n_filt;
     #pragma HLS ALLOCATION operation instances=mul limit=MAC_BLOCK
 
-    // Weight storage is deliberately left to Vitis rather than forced into a
-    // reshaped BRAM ROM the way nnet_dense_resource does. That rule
-    // (ARRAY_RESHAPE block factor=<products per cycle> + ROM_nP_BRAM) only
-    // behaves when the per-cycle slice is small; here it is MAC_BLOCK wide,
-    // and forcing e.g. a 160-element slice produced 3840-bit memory words that
-    // Vitis serviced with 17040 BRAMs (788% of the device) for an array whose
-    // total content is ~233 Kb -- and at low reuse it degenerated further into
-    // a 29184-bit part-select mux that collapsed Fmax to 24 MHz. The weights
-    // are compile-time constants, so leaving them unconstrained lets Vitis
-    // const-fold them into the (already capped) multipliers instead.
+    // Weight storage is deliberately left unconstrained for RF > 1 -- measured,
+    // not assumed. Iteration ir reads the contiguous slice
+    // [ir*MAC_BLOCK, (ir+1)*MAC_BLOCK), i.e. MAC_BLOCK parallel scalar reads,
+    // and Vitis serves that either by splitting the array into small
+    // distributed ROMs (free) or by duplicating it (ruinous). Sweep on a
+    // 19x16x32 layer, 8x8 frame, io_stream, ap_fixed<24,12>, Resource --
+    // BRAM / DSP of this kernel:
+    //
+    //   MAC_BLOCK  RF   unconstrained        cyclic reshape
+    //        1216   8   6080 / 1216          811 / 2431
+    //         512  19      0 /  512          341 / 1023
+    //         256  38      0 /  256          171 /  511
+    //         128  76     64 /  128           85 /  255
+    //          64 152     32 /   64                 --
+    //
+    // Unconstrained wins on BOTH axes everywhere except MAC_BLOCK=1216, and it
+    // holds DSP at exactly MAC_BLOCK -- the ALLOCATION cap above, respected to
+    // the multiplier. A reshape always doubles DSP, because packing weights
+    // into one wide word defeats Vitis' per-element bit-width minimisation
+    // (14-bit ROM entries become 24-bit, and a 24x24 product no longer fits one
+    // DSP48). It does rescue the MAC_BLOCK=1216 cliff, but raising the reuse
+    // factor beats it outright: RF=19 unconstrained costs 0 BRAM / 512 DSP
+    // against RF=8 + reshape at 811 / 2431, for 1210 extra cycles.
+    //
+    // Practical rule, enforced by hls4ml_ext.hex_reuse_config(): keep
+    // MAC_BLOCK <= 512. Raw reports in docs/rom-investigation/reports/.
     if (CONFIG_T::reuse_factor == 1) {
         #pragma HLS ARRAY_PARTITION variable=weights complete
     }

@@ -183,7 +183,16 @@ class HexBase:
         self.depth_size = None
         self.hexbase_stride = None
         self.depth_stride = None
-        self.input_size_is_known = False
+        # Cache key (the [..., H, W] shape the slices/pads below were computed
+        # for), not a one-shot "computed yet?" flag: operation_with_arbitrary_
+        # stride is reachable more than once with genuinely different spatial
+        # shapes on the SAME layer instance (e.g. a diagnostic helper probing
+        # an already-built/already-called layer with a different-sized input;
+        # see notebooks/hexplot.py). A plain "computed once" flag would keep
+        # serving the first shape's slices/pads forever, silently misindexing
+        # -- or, when the odd/even column counts happen to differ, crashing
+        # with a shape-mismatch inside keras.ops.concatenate/add.
+        self._arbitrary_stride_shape_cache = None
         self.odd_columns_slices = []
         self.odd_columns_pads = []
         self.even_columns_slices = []
@@ -330,18 +339,30 @@ class HexBase:
         odd_columns = None
         even_columns = None
 
-        for i in range(self.hexbase_size + 1):
-            dilation_base = (1, 1) if i == 0 else (1, 2 * i)
-
-            if not self.input_size_is_known:
+        # Recompute the per-sub-kernel slices/pads whenever the actual [..., H, W]
+        # shape differs from the one they were last computed for -- not just
+        # once ever. See the cache field's docstring in __init__ for why: this
+        # method can be reached again with a genuinely different spatial shape
+        # on the same layer instance, and reusing stale slices/pads silently
+        # misindexes (or crashes on shape mismatch when the odd/even column
+        # counts happen to differ between the two shapes).
+        current_shape = tuple(self._hw_ordered_size(input))
+        if current_shape != self._arbitrary_stride_shape_cache:
+            self.odd_columns_slices = []
+            self.odd_columns_pads = []
+            self.even_columns_slices = []
+            self.even_columns_pads = []
+            for i in range(self.hexbase_size + 1):
                 slices, pads = self.shape_for_odd_columns(self._hw_ordered_size(input), i)
                 self.odd_columns_slices.append(slices)
                 self.odd_columns_pads.append(pads)
                 slices, pads = self.shape_for_even_columns(self._hw_ordered_size(input), i)
                 self.even_columns_slices.append(slices)
                 self.even_columns_pads.append(pads)
-                if i == self.hexbase_size:
-                    self.input_size_is_known = True
+            self._arbitrary_stride_shape_cache = current_shape
+
+        for i in range(self.hexbase_size + 1):
+            dilation_base = (1, 1) if i == 0 else (1, 2 * i)
 
             if odd_columns is None:
                 odd_columns = self.process(
