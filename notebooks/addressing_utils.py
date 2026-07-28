@@ -5,10 +5,10 @@ hexagonal detector layout to a square-tensor index is identical regardless
 of which deep learning framework consumes the result.
 """
 
-import numpy as np
 import matplotlib.colors as mcolors
-from matplotlib.patches import RegularPolygon
+import numpy as np
 from matplotlib.collections import PatchCollection
+from matplotlib.patches import RegularPolygon
 
 
 class Detector:

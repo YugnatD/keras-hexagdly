@@ -690,7 +690,7 @@ _REPLACEMENTS_FOLDED = {
 }
 
 
-def patch_model_for_hls(model, strategy="linebuffer"):
+def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
     """Return a new Keras functional model with hex layers replaced by hls4ml-native ops.
 
     Walks the model's layer graph in topological order.  Every hex layer is
@@ -725,18 +725,36 @@ def patch_model_for_hls(model, strategy="linebuffer"):
         A new keras.Model — plain Keras, no hls4ml dependency.  Pass this to
         ``hls4ml.converters.convert_from_keras_model()``.
 
+        allow_unvalidated: opt out of the support guard. The 2D path
+                  (Conv2d/MaxPool2d, io_stream) is the one validated by RTL
+                  cosimulation; 3D is C-simulation only. Set True to export it
+                  anyway, knowingly.
+
     Raises:
         TypeError:           if ``model`` is not a keras.Model.
+        NotImplementedError: for 3D layers unless allow_unvalidated=True.
         ValueError:          if ``strategy`` is not a recognised value.
         NotImplementedError: for MaxPool3d layers, or Conv3d with depth_stride > 1.
     """
     if not isinstance(model, keras.Model):
         raise TypeError(f"Expected a keras.Model, got {type(model).__name__}.")
+
+    if not allow_unvalidated:
+        volumetric = [l.name for l in model.layers if isinstance(l, (hgly.Conv3d, hgly.MaxPool3d))]
+        if volumetric:
+            raise NotImplementedError(
+                f"3D layers {volumetric} are not a validated export path. They "
+                "pass C-simulation, but the 3D kernel buffers whole frames along "
+                "the depth axis (depth-major streaming leaves it no choice), and "
+                "synthesis is pathologically slow as a result -- over 40 min on a "
+                "4x8x8 toy where the 2D path takes 9 min on a full 24x24 model, "
+                "and no RTL cosimulation has ever completed on it. Pass "
+                "allow_unvalidated=True to proceed anyway."
+            )
     if strategy not in _STRATEGIES:
         raise ValueError(f"Unknown strategy {strategy!r}. Choose from: {_STRATEGIES}.")
 
-    replacements = (_REPLACEMENTS_LINEBUFFER if strategy == "linebuffer"
-                    else _REPLACEMENTS_FOLDED)
+    replacements = _REPLACEMENTS_LINEBUFFER if strategy == "linebuffer" else _REPLACEMENTS_FOLDED
 
     # Map from original tensor id -> replacement tensor.
     tensor_map = {id(t): t for t in model.inputs}
@@ -784,15 +802,16 @@ def patch_model_for_hls(model, strategy="linebuffer"):
 # See the sweep table in nnet_hex_conv_linebuffer_stream.h.
 _MAX_MAC_BLOCK = 512
 
+
 def _hex_mac_shape(layer):
     """(num_weight_rows * n_chan, n_filt) for a patched hex layer, else None."""
     w = getattr(layer, "mac_weights", None)
     if w is None:
         return None
     shape = tuple(w.shape)
-    if len(shape) == 3:              # (rows, Cin, Cout)
+    if len(shape) == 3:  # (rows, Cin, Cout)
         return shape[0] * shape[1], shape[2]
-    if len(shape) == 4:              # 3D: (depth, rows, Cin, Cout)
+    if len(shape) == 4:  # 3D: (depth, rows, Cin, Cout)
         return shape[0] * shape[1] * shape[2], shape[3]
     return None
 
@@ -808,7 +827,7 @@ def recommended_reuse_factor(layer, max_mac_block=_MAX_MAC_BLOCK):
     if shape is None:
         return 1
     n_in, n_filt = shape
-    if n_filt >= max_mac_block:      # a single output slice already exceeds it
+    if n_filt >= max_mac_block:  # a single output slice already exceeds it
         return n_in
     per_cycle = max(1, max_mac_block // n_filt)
     return max(1, -(-n_in // per_cycle))
@@ -853,13 +872,35 @@ def hex_reuse_config(config, model, max_mac_block=_MAX_MAC_BLOCK, verbose=True):
     return config
 
 
-def check_hls_config(config, model):
-    """Warn about hls4ml settings known to mis-synthesise with these kernels.
+def check_hls_config(config, model, io_type="io_stream", allow_unvalidated=False):
+    """Check an hls4ml config against what these kernels actually support.
 
-    Returns the list of warning strings (also issued via `warnings.warn`), so a
-    caller can assert on it in tests.
+    Raises for the unsupported io_type; warns about settings that synthesise
+    badly. Returns the list of warning strings (also issued via
+    `warnings.warn`), so a caller can assert on it in tests.
+
+    Args:
+        io_type: pass the same value you will give
+                 `convert_from_keras_model`. Only "io_stream" is a validated
+                 path -- see below.
+        allow_unvalidated: proceed on io_parallel anyway.
+
+    io_parallel is refused by default: it registerises every intermediate
+    tensor, and Vitis' clang frontend segfaults elaborating that many registers
+    at realistic layer sizes (documented in docs/pytorch/build_hls4ml_project.py).
+    It works on toy models, which is why the test suite still exercises it, but
+    it is not something to build on.
     """
     import warnings
+
+    if io_type != "io_stream" and not allow_unvalidated:
+        raise NotImplementedError(
+            f"io_type={io_type!r} is not a validated export path for these "
+            "kernels. io_parallel registerises every intermediate tensor and "
+            "Vitis' clang frontend segfaults on realistic sizes; only io_stream "
+            "is covered by C-simulation and RTL cosimulation. Pass "
+            "allow_unvalidated=True to proceed anyway."
+        )
 
     issues = []
     model_cfg = config.get("Model", {})
@@ -869,8 +910,9 @@ def check_hls_config(config, model):
     # Strategy='Latency' + ReuseFactor=1 + a repack_stream-triggering layer
     # downstream (Flatten/Reshape) gives a constant, bias-only output in real
     # cosim while C-simulation stays correct.
-    reshapes = any(isinstance(l, (keras.layers.Flatten, keras.layers.Reshape))
-                   for l in model.layers)
+    reshapes = any(
+        isinstance(l, (keras.layers.Flatten, keras.layers.Reshape)) for l in model.layers
+    )
     for layer in model.layers:
         if _hex_mac_shape(layer) is None:
             continue

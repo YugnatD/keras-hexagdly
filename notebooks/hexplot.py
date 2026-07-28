@@ -5,12 +5,12 @@ notebooks/hexagdly_tools.py:plot_hextensor -- same hexagon placement
 (addressing scheme), just reading (N, H, W, C) tensors instead of (N, C, H, W).
 """
 
-import numpy as np
 import keras
 import matplotlib.pyplot as plt
-from matplotlib.patches import RegularPolygon
-from matplotlib.collections import PatchCollection
+import numpy as np
 from matplotlib import gridspec
+from matplotlib.collections import PatchCollection
+from matplotlib.patches import RegularPolygon
 
 
 def plot_hextensor(tensor, image_range=(0, None), channel_range=(0, None),

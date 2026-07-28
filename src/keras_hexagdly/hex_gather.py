@@ -21,6 +21,7 @@ removed on 2026-07-28.
 import keras
 import numpy as np
 
+
 @keras.saving.register_keras_serializable(package="hexagdly_tf")
 class HexConvLineBuffer(keras.layers.Layer):
     """Fused hex neighbor gather + ring-MAC on the 2D grid.
@@ -107,8 +108,8 @@ class HexConvLineBuffer(keras.layers.Layer):
         Cin = x.shape[-1]
         x_flat = keras.ops.reshape(x, (-1, self.H * self.W, Cin))  # (B, N_in, Cin)
 
-        valid = self.neighbor_idx >= 0  # (N_out, K)
-        safe_idx = keras.ops.where(valid, self.neighbor_idx, 0)
+        valid = keras.ops.greater_equal(self.neighbor_idx, 0)  # (N_out, K)
+        safe_idx = keras.ops.maximum(self.neighbor_idx, 0)
         gathered = keras.ops.take(x_flat, safe_idx, axis=1)  # (B, N_out, K, Cin)
         mask = keras.ops.cast(keras.ops.reshape(valid, (1, self.N_out, self.K, 1)), gathered.dtype)
         gathered = gathered * mask
@@ -250,8 +251,15 @@ class HexConvLineBuffer3D(keras.layers.Layer):
         D_padded = D_in + pad_top + pad_bot
         D_eff = D_padded - self.depth_size + 1
 
-        valid = self.neighbor_idx >= 0
-        safe_idx = keras.ops.where(valid, self.neighbor_idx, 0)
+        # maximum(), not where(): the border sentinel is -1, so clamping at 0
+        # picks the same placeholder slot the mask below zeroes out anyway. The
+        # where() form is what it replaced, and on the jax backend that one
+        # raises during predict() -- ops.where over a Variable index forces a
+        # read outside the trainer's stateless scope, where the variable has
+        # been purged (TypeError: 'NoneType' object is not callable). Direct
+        # __call__ and the TensorFlow backend never hit it.
+        valid = keras.ops.greater_equal(self.neighbor_idx, 0)
+        safe_idx = keras.ops.maximum(self.neighbor_idx, 0)
         G = keras.ops.take(x_flat, safe_idx, axis=2)  # (B, D_padded, N_out, K, Cin)
         mask = keras.ops.cast(keras.ops.reshape(valid, (1, 1, self.N_out, self.K, 1)), G.dtype)
         G = G * mask
@@ -345,8 +353,15 @@ class HexPoolLineBuffer(keras.layers.Layer):
         # x: (B, H, W, C)
         C = x.shape[-1]
         x_flat = keras.ops.reshape(x, (-1, self.H * self.W, C))
-        valid = self.neighbor_idx >= 0
-        safe_idx = keras.ops.where(valid, self.neighbor_idx, 0)
+        # maximum(), not where(): the border sentinel is -1, so clamping at 0
+        # picks the same placeholder slot the mask below zeroes out anyway. The
+        # where() form is what it replaced, and on the jax backend that one
+        # raises during predict() -- ops.where over a Variable index forces a
+        # read outside the trainer's stateless scope, where the variable has
+        # been purged (TypeError: 'NoneType' object is not callable). Direct
+        # __call__ and the TensorFlow backend never hit it.
+        valid = keras.ops.greater_equal(self.neighbor_idx, 0)
+        safe_idx = keras.ops.maximum(self.neighbor_idx, 0)
         gathered = keras.ops.take(x_flat, safe_idx, axis=1)  # (B, N_out, K, C)
         mask = keras.ops.cast(keras.ops.reshape(valid, (1, self.N_out, self.K, 1)), gathered.dtype)
         gathered = gathered * mask
@@ -414,8 +429,15 @@ class HexPoolLineBuffer3D(keras.layers.Layer):
         C = x.shape[-1]
         d_in = x.shape[1]
         x_flat = keras.ops.reshape(x, (-1, d_in, self.H * self.W, C))
-        valid = self.neighbor_idx >= 0
-        safe_idx = keras.ops.where(valid, self.neighbor_idx, 0)
+        # maximum(), not where(): the border sentinel is -1, so clamping at 0
+        # picks the same placeholder slot the mask below zeroes out anyway. The
+        # where() form is what it replaced, and on the jax backend that one
+        # raises during predict() -- ops.where over a Variable index forces a
+        # read outside the trainer's stateless scope, where the variable has
+        # been purged (TypeError: 'NoneType' object is not callable). Direct
+        # __call__ and the TensorFlow backend never hit it.
+        valid = keras.ops.greater_equal(self.neighbor_idx, 0)
+        safe_idx = keras.ops.maximum(self.neighbor_idx, 0)
         G = keras.ops.take(x_flat, safe_idx, axis=2)  # (B, D_in, N_out, K, C)
         mask = keras.ops.cast(keras.ops.reshape(valid, (1, 1, self.N_out, self.K, 1)), G.dtype)
         G = G * mask

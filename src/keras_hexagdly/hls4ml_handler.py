@@ -228,6 +228,7 @@ def _accum_type_str(node, n_terms):
 # KerasV3 handlers
 # ---------------------------------------------------------------------------
 
+
 def keras_ops_to_numpy(var):
     """Convert a Keras variable / tensor to numpy safely."""
     import keras
@@ -371,6 +372,7 @@ hex_max_pool_stream_function_template = (
 def _is_stream(node):
     """Return True when the model is configured for io_stream."""
     return node.model.config.get_config_value("IOType") == "io_stream"
+
 
 hex_max_pool_config_template = """\
 struct config{index} : nnet::hex_max_pool_config {{

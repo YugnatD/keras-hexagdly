@@ -5,23 +5,32 @@ and pooling methods for hexagonally sampled data, originally written for
 PyTorch by Tim Lukas Holch and Constantin Steppa (ai4iacts).
 
 This port reproduces HexagDLy's hexagonal addressing scheme and sub-kernel
-decomposition exactly (bit-for-bit equivalent outputs, see
-[tests/test_vs_pytorch_hexagdly.py](tests/test_vs_pytorch_hexagdly.py)), but
+decomposition exactly (bit-for-bit equivalent outputs, cross-checked against the
+upstream PyTorch package in
+[hexagdly-oracle](https://github.com/YugnatD/hexagdly-oracle)), but
 is built on [Keras 3](https://keras.io) so it runs on any backend
 (TensorFlow, JAX, PyTorch) and uses a channels-last (`NHWC`/`NDHWC`) tensor
 layout instead of PyTorch's channels-first.
 
-It also adds two functionalities that do not exist in upstream HexagDLy:
+It also adds three functionalities that do not exist in upstream HexagDLy:
 
-- **`share_neighbors`** (`Conv2d`, `Conv3d`): ties the weights of a hexagonal
-  kernel by ring (ring 0 = center cell, ring *r* = the `6*r` cells at hex
-  distance *r*), instead of every cell having its own independent weight.
-  Reduces parameter count and enforces exact 6-fold rotational symmetry of
-  the learned kernel.
+- **`share_neighbors`** (`Conv2d`, `Conv3d`): ties the weights of several cells
+  of a hexagonal kernel together instead of giving every cell its own
+  independent weight, which cuts the parameter count and imposes a geometric
+  symmetry on the learned kernel. Three modes -- `"ring"`, `"diag"`, `"sym"` --
+  are [illustrated below](#new-share_neighbors----weight-sharing-across-kernel-cells).
 - **`depth_padding="same"`** (`Conv3d` only): zero-pads the depth/time axis
   so the temporal kernel is centred on each time step and the output depth
   equals the input depth, instead of HexagDLy's `"valid"`-only behaviour
   (output depth shrinks by `kernel - 1`).
+- **[hls4ml export](#fpga-export-via-hls4ml)** for FPGA synthesis, currently
+  limited to `io_stream` and the 2D layers.
+
+Weights trained with [pytorch-hexagdly](https://github.com/YugnatD/pytorch-hexagdly)
+can be loaded into these layers -- see
+[`keras_hexagdly.torch_interop`](src/keras_hexagdly/torch_interop.py) and
+[`notebooks/pytorch_to_keras_example.ipynb`](notebooks/pytorch_to_keras_example.ipynb).
+No torch dependency is required: a plain `.npz` of the state dict works.
 
 See [NOTICE.md](NOTICE.md) for attribution details and citation information.
 
@@ -55,11 +64,39 @@ y = hexconv(x)
 `in_channels` can be omitted; it is then inferred from the input on first
 call, like a standard Keras layer: `hgly.Conv2d(out_channels, kernel_size=kernel_size, stride=stride)`.
 
-### New: weight sharing by hexagonal ring
+### New: `share_neighbors` -- weight sharing across kernel cells
+
+Available on `Conv2d` and `Conv3d`. `share_neighbors` reduces the number of
+learnable parameters by grouping kernel cells that share a single weight.
+Three modes are available, illustrated below for `kernel_size=2` (19 cells):
+
+| `share_neighbors="ring"` | `share_neighbors="diag"` | `share_neighbors="sym"` |
+|:---:|:---:|:---:|
+| ![ring](figures/share_ring_k2.png) | ![diag](figures/share_diag_k2.png) | ![sym](figures/share_sym_k2.png) |
+| **3 weights** -- cells at the same hex distance from center share one weight (concentric rings). | **10 weights** -- visually opposite (antipodal) cells share one weight. | **10 weights** -- geometrically adjacent 60 degree pairs share one weight. |
+
+- **`"ring"`**: the most aggressive reduction. All 6 direct neighbours share one
+  weight, all 12 outer cells share another. Enforces exact 6-fold rotational
+  symmetry of the learned kernel.
+- **`"diag"`**: antipodal symmetry -- each cell and its mirror image through the
+  center share a weight. Useful when the kernel should be point-symmetric.
+- **`"sym"`**: 60 degree adjacent pairs -- consecutive neighbours along the kernel
+  boundary share a weight. Useful when the kernel should reflect local
+  rotational symmetry.
+
+For `kernel_size=1` (7 cells): ring=2 weights, diag=4, sym=4.
+For `kernel_size=2` (19 cells): ring=3 weights, diag=10, sym=10.
+Compare to the default `share_neighbors=None`, which gives 7 and 19 independent
+weights. `"ring"` works at any kernel size; `"diag"` and `"sym"` are defined for
+`kernel_size` 1 and 2 only, matching
+[pytorch-hexagdly](https://github.com/YugnatD/pytorch-hexagdly), which does not
+define them beyond n=2 either.
 
 ```python
-hexconv = hgly.Conv2d(in_channels, out_channels, kernel_size=3, share_neighbors=True)
+hexconv = hgly.Conv2d(in_channels, out_channels, kernel_size=2, share_neighbors="ring")
 ```
+
+`share_neighbors=True` is accepted as an alias for `"ring"`.
 
 ### New: same-padded temporal convolution (Conv3d)
 
@@ -85,6 +122,53 @@ Ported from [HexagDLy's own notebooks](https://github.com/ai4iacts/hexagdly/tree
 - [`keras_hexagdly_cnn_example.ipynb`](notebooks/keras_hexagdly_cnn_example.ipynb) -- a small CNN classifying toy hexagonal shapes, trained with `model.fit`.
 - [`keras_hexagdly_hex_vs_square.ipynb`](notebooks/keras_hexagdly_hex_vs_square.ipynb) -- parameter-count and timing benchmark of hex vs. square kernels, plus a hex-CNN-vs-square-CNN classification comparison.
 
+## FPGA export via hls4ml
+
+The hex layers can be synthesised to HLS C++ through
+[hls4ml](https://github.com/fastmachinelearning/hls4ml). The layers are replaced
+by a fused line-buffer kernel that keeps only the resident rows of the frame in
+a shift register, rather than materialising the whole gathered tensor.
+
+```python
+import hls4ml
+from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+from keras_hexagdly.hls4ml_ext import patch_model_for_hls, hex_reuse_config, check_hls_config
+
+register_hex_gather_layers("Vitis")
+hls_ready = patch_model_for_hls(model)                 # strategy="linebuffer"
+
+config = hls4ml.utils.config_from_keras_model(hls_ready, granularity="name")
+hex_reuse_config(config, hls_ready)                    # per-layer ReuseFactor
+check_hls_config(config, hls_ready, io_type="io_stream")
+
+hls_model = hls4ml.converters.convert_from_keras_model(
+    hls_ready, hls_config=config, io_type="io_stream", backend="Vitis",
+)
+```
+
+### Supported scope
+
+**Only `io_stream` and the 2D layers (`Conv2d`, `MaxPool2d`) are supported for
+now.** That is the combination that is covered by C-simulation and validated by
+RTL co-simulation.
+
+| | `io_stream` | `io_parallel` |
+|---|---|---|
+| `Conv2d`, `MaxPool2d` | **supported** | not supported |
+| `Conv3d`, `MaxPool3d` | not supported | not supported |
+
+The unsupported paths are not silently wrong -- they raise. `patch_model_for_hls`
+raises `NotImplementedError` on a 3D layer, and `check_hls_config` raises on
+`io_type="io_parallel"`. Both accept `allow_unvalidated=True` if you want to
+experiment with them anyway, but nothing about their numerics or resource usage
+is guaranteed.
+
+`hex_reuse_config` matters more than it looks: hls4ml's
+`config_from_keras_model(granularity="name")` writes `ReuseFactor=1` into every
+layer entry it recognises, which overrides the model-level value -- but custom
+layers get no entry and inherit the model-level one instead. Without an explicit
+per-layer setting, a single model ends up mixing two different reuse factors.
+
 ## Testing
 
 ```
@@ -99,42 +183,42 @@ that mis-names the built wheel `UNKNOWN`. Verified clean with a modern pip
 Either way, `pytest tests/` works without installing anything -- `conftest.py`
 puts `src/` and `tests/` on `sys.path`.)
 
+Most of the suite no longer lives here. It has moved to
+**[hexagdly-oracle](https://github.com/YugnatD/hexagdly-oracle)**, the shared
+test repo for this library and
+[pytorch-hexagdly](https://github.com/YugnatD/pytorch-hexagdly): hand-verified
+layer outputs, `share_neighbors` weight-sharing oracles, `depth_padding`,
+mixed precision, serialization, edge cases, indexed-equivalence and the hls4ml
+export tests (including C-simulation). `tests/` here keeps only what is
+genuinely local.
+
+To run the full suite, check the oracle out as a sibling directory:
+
+```
+git clone https://github.com/YugnatD/hexagdly-oracle
+PYTHONPATH=hexagdly-oracle/src pytest tests/ hexagdly-oracle/tests/
+```
+
 Verified to pass on all three Keras 3 backends (set `KERAS_BACKEND=tensorflow|torch|jax`
 before importing keras; tensorflow is the default if unset):
 
 ```
-KERAS_BACKEND=tensorflow pytest tests/   # 272 passed, 7 skipped
-KERAS_BACKEND=torch       pytest tests/   # 269 passed, 10 skipped
-KERAS_BACKEND=jax         pytest tests/   # 269 passed, 10 skipped (slower: per-shape JIT compile)
+KERAS_BACKEND=tensorflow   # 891 passed,  7 skipped
+KERAS_BACKEND=torch        # 881 passed, 17 skipped
+KERAS_BACKEND=jax          # 806 passed, 92 skipped (slower: per-shape JIT compile)
 ```
 
 A GitHub Actions workflow ([.github/workflows/test.yml](.github/workflows/test.yml))
 runs this matrix (3 backends x 3 Python versions) plus `ruff check`/`ruff format --check`
-on every push and PR.
+on every push and PR, checking out the oracle repo as part of the job.
 
-The test suite has six parts:
-
-- `test_Conv2d.py`, `test_Conv3d.py`, `test_*_CustomKernel.py`,
-  `test_MaxPool2d.py`, `test_MaxPool3d.py`: standalone tests with
-  hand-computed expected outputs, ported from
-  [HexagDLy's own test suite](https://github.com/ai4iacts/hexagdly/tree/master/tests).
-- `test_vs_pytorch_hexagdly.py`: cross-checks every layer against the
-  upstream PyTorch `hexagdly` PyPI package (random inputs, weights copied
-  across frameworks, gradients, batch independence, odd/even column parity,
-  large strides, asymmetric 3D kernels) -- the oracle that proves this port
-  faithful. Also includes two *forward-compatibility* tests that stay
-  skipped today (upstream hexagdly 2.0.2 has neither feature) but will
-  automatically start cross-checking `share_neighbors`/`depth_padding`
-  against upstream the day a future hexagdly release adds them.
-- `test_mixed_precision.py`: `keras.mixed_precision` / per-layer `dtype=`
-  policies -- variables stay float32, compute happens in float16, on every
-  backend.
-- `test_share_neighbors.py`, `test_depth_padding.py`: standalone tests for
-  the two new functionalities, which have no PyTorch equivalent to check
-  against.
-- `test_edge_cases.py`, `test_serialization.py`, `test_geometry.py`: input
-  validation, minimum viable sizes, dtype handling, NaN/Inf checks, and
-  `get_config`/`from_config` + full `model.save`/`load_model` round-trips.
+Note for GPU users on the torch backend: the Keras torch backend runs on CUDA
+when a GPU is visible, and PyTorch defaults to `cudnn.allow_tf32 = True`, so
+convolutions are computed in TF32 (~1e-3 relative precision). That is enough to
+break equivalence assertions on hex kernels, which are wide by construction
+because dilation is done by zero insertion. The oracle's `conftest.py` pins the
+flag off for the test session; the library itself never touches global torch
+settings.
 
 ## Disclaimer
 

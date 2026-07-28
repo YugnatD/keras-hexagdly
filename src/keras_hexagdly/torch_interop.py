@@ -51,7 +51,7 @@ def _key(prefix, name):
 
 def to_numpy(value):
     """array-like -> numpy, accepting torch tensors without importing torch."""
-    if hasattr(value, "detach"):        # torch.Tensor, duck-typed
+    if hasattr(value, "detach"):  # torch.Tensor, duck-typed
         value = value.detach().cpu()
     return np.asarray(value)
 
@@ -81,8 +81,8 @@ def load_hex_conv2d_weights(layer, state_dict, prefix):
                 f"{layer.name}: share_neighbors={layer.share_neighbors!r} expects "
                 f"{key} in the state dict. Is the PyTorch layer sharing weights too?"
             )
-        w = to_numpy(state_dict[key])                      # (out, in, num_shared)
-        got = np.transpose(w, (2, 1, 0)).shape             # (num_shared, in, out)
+        w = to_numpy(state_dict[key])  # (out, in, num_shared)
+        got = np.transpose(w, (2, 1, 0)).shape  # (num_shared, in, out)
         expected = tuple(layer.ring_weights.shape)
         if got != expected:
             raise ValueError(
@@ -95,8 +95,11 @@ def load_hex_conv2d_weights(layer, state_dict, prefix):
         return
 
     n_sub = layer.hexbase_size + 1
-    missing = [_key(prefix, f"kernel{i}") for i in range(n_sub)
-               if _key(prefix, f"kernel{i}") not in state_dict]
+    missing = [
+        _key(prefix, f"kernel{i}")
+        for i in range(n_sub)
+        if _key(prefix, f"kernel{i}") not in state_dict
+    ]
     if missing:
         raise KeyError(
             f"{layer.name}: missing {missing} in the state dict. Available keys "
@@ -104,9 +107,9 @@ def load_hex_conv2d_weights(layer, state_dict, prefix):
         )
 
     for i in range(n_sub):
-        w = to_numpy(state_dict[_key(prefix, f"kernel{i}")])   # (out, in, kh, kw)
+        w = to_numpy(state_dict[_key(prefix, f"kernel{i}")])  # (out, in, kh, kw)
         expected = tuple(layer._base_kernels[i].shape)
-        got = np.transpose(w, (2, 3, 1, 0)).shape          # (kh, kw, in, out)
+        got = np.transpose(w, (2, 3, 1, 0)).shape  # (kh, kw, in, out)
         if got != expected:
             raise ValueError(
                 f"{layer.name}.kernel{i}: PyTorch weight {w.shape} transposes to "
@@ -178,7 +181,7 @@ def load_torch_state_dict(model, state_dict, mapping):
     import keras_hexagdly as hgly
 
     for keras_name, prefix in mapping.items():
-        layer = model.get_layer(keras_name)   # raises if absent
+        layer = model.get_layer(keras_name)  # raises if absent
         if isinstance(layer, hgly.Conv2d):
             load_hex_conv2d_weights(layer, state_dict, prefix)
         elif isinstance(layer, keras.layers.Dense):
@@ -191,8 +194,7 @@ def load_torch_state_dict(model, state_dict, mapping):
                 "weights directly rather than leaving it at its initialisation."
             )
 
-    unmapped = [l.name for l in model.layers
-                if l.weights and l.name not in mapping]
+    unmapped = [l.name for l in model.layers if l.weights and l.name not in mapping]
     if unmapped:
         raise ValueError(
             f"these layers carry weights but are not in `mapping`, so they would "
@@ -208,9 +210,18 @@ def verify_against(keras_model, torch_model, x_nchw, atol=1e-4):
     returns plausible numbers. `torch_model` is called as-is, so this is the one
     place torch enters -- through the caller's object, never through an import.
     """
-    y_torch = to_numpy(torch_model(_as_torch_like(x_nchw, torch_model)))
-    axes = (0,) + tuple(range(2, x_nchw.ndim)) + (1,)
-    y_keras = np.asarray(keras_model.predict(np.transpose(x_nchw, axes), verbose=0))
+    to_last = lambda a: (0,) + tuple(range(2, a.ndim)) + (1,)  # noqa: E731
+
+    y_torch = to_numpy(torch_model(_as_tensor_like(x_nchw, torch_model)))
+    y_keras = np.asarray(keras_model.predict(np.transpose(x_nchw, to_last(x_nchw)), verbose=0))
+
+    # The OUTPUT needs converting too, not just the input: torch returns
+    # (N, C, ...) and Keras (N, ..., C). Flattening both and subtracting -- as an
+    # earlier revision did -- compares different memory layouts and reports a
+    # large error on a perfectly good model. Outputs of rank <= 2 (after a
+    # Flatten or Dense) have no channel axis to move.
+    if y_torch.ndim > 2:
+        y_torch = np.transpose(y_torch, to_last(y_torch))
     err = float(np.max(np.abs(y_torch.reshape(-1) - y_keras.reshape(-1))))
     if err > atol:
         raise AssertionError(
@@ -220,8 +231,17 @@ def verify_against(keras_model, torch_model, x_nchw, atol=1e-4):
     return err
 
 
-def _as_torch_like(x, torch_model):
-    """Wrap x in whatever tensor type `torch_model` expects, without importing torch."""
-    mod = type(torch_model).__module__.split(".")[0]
-    tensor_cls = __import__(mod).from_numpy if mod == "torch" else None
-    return tensor_cls(x) if tensor_cls is not None else x
+def _as_tensor_like(x, torch_model):
+    """Turn `x` into a tensor of the model's own kind, without importing torch.
+
+    Borrows it from the model's first parameter via `new_tensor`, which carries
+    the right dtype and device. Inspecting the model's module name instead does
+    not work -- a layer defined in `pytorch_hexagdly` reports that module, not
+    `torch`, so the conversion was silently skipped and the raw ndarray reached
+    the forward pass.
+    """
+    try:
+        param = next(torch_model.parameters())
+    except (AttributeError, StopIteration):
+        return x  # not a torch module; let the caller's object cope
+    return param.new_tensor(np.asarray(x))

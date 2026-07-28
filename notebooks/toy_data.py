@@ -17,7 +17,6 @@ SHAPES = {
 
 
 def put_shape(nx, ny, cx, cy, params):
-    d = np.zeros((nx, ny))
     i = np.indices((nx, ny)).astype(float)
     i[0] -= cx
     i[1] -= cy
