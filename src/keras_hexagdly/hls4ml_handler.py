@@ -239,151 +239,9 @@ def keras_ops_to_numpy(var):
         return np.asarray(var)
 
 
-# ---------------------------------------------------------------------------
-# HLS C++ config templates
-# ---------------------------------------------------------------------------
-
-hex_gather_config_template = """\
-struct config{index} : nnet::hex_gather_config {{
-    static const unsigned n_in   = {n_in};
-    static const unsigned n_out  = {n_out};
-    static const unsigned k      = {k};
-    static const unsigned n_chan  = {n_chan};
-    // Compile-time neighbor table (-1 = border -> zero): constant-folds to
-    // wires under full unroll, like hls4ml's generated im2col fill_buffer.
-    static const int indices[n_out * k];
-}};
-const int config{index}::indices[] = {{{indices_vals}}};\n"""
-
-hex_gather_function_template = (
-    "nnet::hex_gather<{input_t}, {output_t}, {config}>({input}, {output});"
-)
-
-hex_ring_mac_config_template = """\
-struct config{index} : nnet::hex_ring_mac_config {{
-    static const unsigned n_out          = {n_out};
-    static const unsigned k              = {k};
-    static const unsigned n_in_chan      = {n_in_chan};
-    static const unsigned n_out_chan     = {n_out_chan};
-    static const unsigned num_weight_rows = {num_weight_rows};
-    // ParallelizationFactor: n_pixels output pixels computed concurrently;
-    // the partition loop pipelines n_partitions iterations at II=reuse_factor.
-    static const unsigned n_pixels     = {n_pixels};
-    static const unsigned n_partitions = {n_partitions};
-    static const unsigned reuse_factor = {reuse};
-    // Parallel multiplier cap: per-partition work spread over reuse_factor
-    // cycles — satisfiable by construction (mirrors hls4ml conv/dense).
-    static const unsigned multiplier_limit =
-        DIV_ROUNDUP(n_pixels * num_weight_rows * n_in_chan * n_out_chan, reuse_factor);
-    // Slot -> weight row, baked at export (ring index when share_neighbors,
-    // identity otherwise). No runtime indirection.
-    static const unsigned row_map[k];
-    typedef {mac_weights_t.name} weight_t;
-    typedef {mac_bias_t.name}    bias_t;
-    // Accumulator widened by ceil(log2(#summed terms)) integer+total bits over
-    // the weight type so the neighbor sum cannot overflow (same bit-growth idiom
-    // hls4ml uses for dense/conv accumulators).
-    typedef {accum_t_str} accum_t;
-    // Product kernel chosen from the data/weight precisions, exactly as
-    // hls4ml does for its own layers (see _product_type).
-    template<class x_T, class y_T> using product = nnet::product::{product_type}<x_T, y_T>;
-}};
-const unsigned config{index}::row_map[] = {{{row_map_vals}}};\n"""
-
-hex_ring_mac_function_template = (
-    "nnet::hex_ring_mac<{input_t}, {mac_weights_t}, {mac_bias_t}, "
-    "{output_t}, {config}>"
-    "({input}, w{index}, b{index}, {output});"
-)
-
-
-# ---------------------------------------------------------------------------
-# io_stream config + function templates
-#
-# The config structs are identical to the parallel variants (same geometry).
-# Only the function call changes: stream kernels take hls::stream<> refs,
-# which hls4ml's TransformTypes pass already wired into the variable names
-# when IOType == 'io_stream'.  We select the right template in the
-# FunctionCallTemplate.format() method by checking IOType.
-# ---------------------------------------------------------------------------
-
-# Stream config templates reuse the same base structs as the parallel variants
-# (hex_gather_config / hex_ring_mac_config / hex_max_pool_config) because the
-# stream kernels unpack→parallel_kernel→repack and need identical geometry.
-# Only the function call template changes.
-
-hex_gather_stream_config_template = """\
-struct config{index} : nnet::hex_gather_config {{
-    static const unsigned n_in   = {n_in};
-    static const unsigned n_out  = {n_out};
-    static const unsigned k      = {k};
-    static const unsigned n_chan  = {n_chan};
-    static const int indices[n_out * k];
-}};
-const int config{index}::indices[] = {{{indices_vals}}};\n"""
-
-hex_gather_stream_function_template = (
-    "nnet::hex_gather_stream<{input_t}, {output_t}, {config}>({input}, {output});"
-)
-
-hex_ring_mac_stream_config_template = """\
-struct config{index} : nnet::hex_ring_mac_config {{
-    static const unsigned n_out          = {n_out};
-    static const unsigned k              = {k};
-    static const unsigned n_in_chan      = {n_in_chan};
-    static const unsigned n_out_chan     = {n_out_chan};
-    static const unsigned num_weight_rows = {num_weight_rows};
-    static const unsigned n_pixels     = {n_pixels};
-    static const unsigned n_partitions = {n_partitions};
-    static const unsigned reuse_factor = {reuse};
-    static const unsigned multiplier_limit =
-        DIV_ROUNDUP(n_pixels * num_weight_rows * n_in_chan * n_out_chan, reuse_factor);
-    static const unsigned row_map[k];
-    typedef {mac_weights_t.name} weight_t;
-    typedef {mac_bias_t.name}    bias_t;
-    typedef {accum_t_str} accum_t;
-    // Product kernel chosen from the data/weight precisions, exactly as
-    // hls4ml does for its own layers (see _product_type).
-    template<class x_T, class y_T> using product = nnet::product::{product_type}<x_T, y_T>;
-}};
-const unsigned config{index}::row_map[] = {{{row_map_vals}}};\n"""
-
-hex_ring_mac_stream_function_template = (
-    "nnet::hex_ring_mac_stream<{input_t}, {mac_weights_t}, {mac_bias_t}, "
-    "{output_t}, {config}>"
-    "({input}, w{index}, b{index}, {output});"
-)
-
-hex_max_pool_stream_config_template = """\
-struct config{index} : nnet::hex_max_pool_config {{
-    static const unsigned n_out  = {n_out};
-    static const unsigned k      = {k};
-    static const unsigned n_chan  = {n_chan};
-}};\n"""
-
-hex_max_pool_stream_function_template = (
-    "nnet::hex_max_pool_stream<{input_t}, {output_t}, {config}>({input}, {output});"
-)
-
-# Stream function templates need the stream header (for the wrapper) plus
-# the parallel header (included transitively, but listed explicitly for clarity).
-
-
 def _is_stream(node):
     """Return True when the model is configured for io_stream."""
     return node.model.config.get_config_value("IOType") == "io_stream"
-
-
-hex_max_pool_config_template = """\
-struct config{index} : nnet::hex_max_pool_config {{
-    static const unsigned n_out  = {n_out};
-    static const unsigned k      = {k};
-    static const unsigned n_chan  = {n_chan};
-}};\n"""
-
-hex_max_pool_function_template = (
-    "nnet::hex_max_pool<{input_t}, {output_t}, {config}>({input}, {output});"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -393,9 +251,9 @@ hex_max_pool_function_template = (
 # variants selected by IOType:
 #   io_stream   -> nnet_hex_conv_linebuffer_stream.h  (real line buffer: only
 #                  rows_resident+1 image rows resident; the memory win).
-#   io_parallel -> nnet_hex_conv_linebuffer.h         (frame-buffered gather+MAC,
-#                  same cost as strategy="gather"; a warning is printed because
-#                  line buffering only reduces memory in io_stream).
+#   io_parallel -> nnet_hex_conv_linebuffer.h         (frame-buffered gather+MAC;
+#                  a warning is printed because line buffering only reduces
+#                  memory in io_stream).
 # ---------------------------------------------------------------------------
 
 
@@ -1120,15 +978,6 @@ class HexConvLineBuffer3DFunctionTemplate(FunctionCallTemplate):
 
 
 # ---------------------------------------------------------------------------
-# 3D (depth-aware) variants — Conv3d gather export
-#
-# The 3D nodes mirror the 2D ones with an extra n_depth
-# dimension.  hls4ml flattens the depth axis into the leading part of the flat
-# array; the HLS kernels (nnet_hex_gather_3d.h / nnet_hex_ring_mac_3d.h) loop
-# over n_depth frames applying the identical 2D spatial gather / MAC to each.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -1138,8 +987,9 @@ _registered = False
 def register_hex_gather_layers(backend_name="Vivado"):
     """Register the line-buffer hex layers with hls4ml.
 
-    Call once before ``hls4ml.converters.convert_from_keras_model`` when using
-    ``strategy='gather'``.  Idempotent — safe to call multiple times.
+    Call once before ``hls4ml.converters.convert_from_keras_model`` when the
+    model went through ``patch_model_for_hls(..., strategy='linebuffer')`` (the
+    default).  Idempotent — safe to call multiple times.
     """
     global _registered
     if _registered:

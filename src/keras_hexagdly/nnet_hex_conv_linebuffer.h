@@ -84,7 +84,7 @@ struct hex_conv_linebuffer_config {
 // -----------------------------------------------------------------------------
 // Shared per-output-pixel ring-MAC body (adds-then-scale ring sharing).
 //
-// Identical arithmetic to nnet_hex_ring_mac.h: fold the K taps into
+// Arithmetic: fold the K taps into
 // num_weight_rows ring sums (row_map is compile-time), one multiply per
 // (ring, Cin, Cout), balanced accum into acc seeded with bias. w*(x_a+x_b) ==
 // w*x_a + w*x_b holds exactly because the ring sum forms in the widened accum_t

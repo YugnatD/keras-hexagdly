@@ -160,7 +160,7 @@ class HexConvLineBuffer3D(keras.layers.Layer):
     Input:  (B, D_in, H, W, Cin)
     Output: (B, D_out, H, W, Cout)
 
-    Equivalent to the Conv3d gather export (_conv3d_gather): the spatial neighbor
+    The spatial neighbor
     gather is identical to HexConvLineBuffer; the depth axis is a dense 1D conv
     of ``depth_size`` taps at ``depth_stride`` (=1 only), summed, with bias added
     once.  depth_padding 'valid' or 'same' controls D_out (== D_in for 'same',
