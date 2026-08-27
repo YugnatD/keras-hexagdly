@@ -917,9 +917,7 @@ class Conv2d(HexBase, keras.layers.Layer):
                 kh = 1 + 2 * self.hexbase_size - i
                 kw = 1 if i == 0 else 2
                 count = kh * kw * in_channels
-                values = pool[offset : offset + count].reshape(
-                    kh, kw, in_channels, out_channels
-                )
+                values = pool[offset : offset + count].reshape(kh, kw, in_channels, out_channels)
                 offset += count
                 self._base_kernels.append(
                     self.add_weight(
