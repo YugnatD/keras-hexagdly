@@ -40,9 +40,9 @@ N_CLASSES = 3
 
 inp = keras.Input(shape=(H, W, 1), name="image")
 x = hgly.Conv2d(
-    out_channels=4, kernel_size=1, stride=1, share_neighbors=True, bias=True, name="conv1"
+    filters=4, kernel_size=1, strides=1, share_neighbors=True, use_bias=True, name="conv1"
 )(inp)
-x = hgly.MaxPool2d(kernel_size=1, stride=2, name="pool1")(x)
+x = hgly.MaxPool2d(kernel_size=1, strides=2, name="pool1")(x)
 x = keras.layers.Flatten(name="flat")(x)
 x = keras.layers.Dense(8, activation="relu", name="fc1")(x)
 out = keras.layers.Dense(N_CLASSES, name="logits")(x)

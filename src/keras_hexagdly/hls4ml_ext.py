@@ -117,7 +117,7 @@ def _conv2d_replacement(layer, x):
     H, W = int(x.shape[1]), int(x.shape[2])
     Cin = int(x.shape[3])
     N_in = H * W
-    Cout = layer.out_channels
+    Cout = layer.filters
 
     nbr, cells, (H_out, W_out) = build_neighbor_table(layer, H, W)
     W_k = get_cell_weights(layer, cells)  # (K, Cin, Cout)
@@ -207,7 +207,7 @@ def _conv3d_replacement(layer, x):
     N_in = H * W
     D_kernel = layer.depth_size
     depth_stride = layer.depth_stride
-    Cout = layer.out_channels
+    Cout = layer.filters
 
     if depth_stride != 1:
         raise NotImplementedError(
@@ -230,7 +230,7 @@ def _conv3d_replacement(layer, x):
     K = len(cells)
 
     # Get H_out, W_out from a proxy
-    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
+    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, strides=layer.hexbase_stride)
     _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
     N_out = H_out * W_out
 
@@ -402,8 +402,8 @@ def _conv3d_linebuffer(layer, x):
 
     if layer.hexbase_stride != 1:
         raise NotImplementedError(
-            "Conv3d linebuffer export supports hex stride=1 only "
-            f"(got stride={layer.hexbase_stride})."
+            "Conv3d linebuffer export supports hex strides=1 only "
+            f"(got strides={layer.hexbase_stride})."
         )
     if layer.depth_stride != 1:
         raise NotImplementedError(
@@ -413,7 +413,7 @@ def _conv3d_linebuffer(layer, x):
     H, W = int(x.shape[2]), int(x.shape[3])
     nbr, cells, _ = build_neighbor_table_3d(layer, int(x.shape[1]), H, W)
 
-    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, stride=layer.hexbase_stride)
+    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, strides=layer.hexbase_stride)
     _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
 
     bias = layer.bias_tensor.numpy() if layer.use_bias else None
@@ -450,7 +450,7 @@ def _maxpool3d_linebuffer(layer, x):
 
     if layer.hexbase_stride != 1:
         raise NotImplementedError(
-            f"MaxPool3d linebuffer export supports hex stride=1 only (got {layer.hexbase_stride})."
+            f"MaxPool3d linebuffer export supports hex strides=1 only (got {layer.hexbase_stride})."
         )
     H, W = int(x.shape[2]), int(x.shape[3])
     nbr, cells, _ = build_neighbor_table_3d(layer, int(x.shape[1]), H, W)

@@ -71,7 +71,7 @@ def _probe_layer(kernel_size, stride, i_active, r_active, c_active):
         if ii == i_active:
             sk[0, 0, r_active, c_active] = 1.0
         sub_kernels.append(sk)
-    return Conv2d_CustomKernel(sub_kernels=sub_kernels, stride=stride, bias=None)
+    return Conv2d_CustomKernel(sub_kernels=sub_kernels, strides=stride, bias=None)
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +337,7 @@ def build_neighbor_table_3d(layer, D, H, W):
     depth_stride = layer.depth_stride
 
     # Build a 2D proxy to derive the spatial table.
-    proxy = hgly.MaxPool2d(kernel_size=hex_size, stride=hex_stride)
+    proxy = hgly.MaxPool2d(kernel_size=hex_size, strides=hex_stride)
     nbr, cells, (H_out, W_out) = build_neighbor_table(proxy, H, W)
 
     # Compute output depth (same arithmetic as a 1D valid conv).

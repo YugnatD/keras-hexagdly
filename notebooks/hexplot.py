@@ -129,26 +129,25 @@ def _shared_kernel_hextensor(layer, in_channel):
 
 
 def _probe_layer(layer):
-    """A throwaway stride=1 copy of `layer`, same kernel_size/mode/weights.
+    """A throwaway strides=1 copy of `layer`, same kernel_size/mode/weights.
 
-    Probing the real layer directly only works cleanly at stride=1: at
+    Probing the real layer directly only works cleanly at strides=1: at
     stride>1 the output grid is subsampled, so a single input impulse only
     falls inside a couple of output pixels' receptive fields instead of the
-    dense, continuous footprint a stride=1 layer would show -- the kernel
+    dense, continuous footprint a strides=1 layer would show -- the kernel
     LOOKS truncated to a tiny fragment, not because the weights are wrong,
     but because impulse-response visualisation needs densely overlapping
     receptive fields to trace out the full shape. The weights themselves are
     stride-independent (only which output pixels get computed changes), so
-    copying them onto a fresh stride=1 instance and probing that gives the
+    copying them onto a fresh strides=1 instance and probing that gives the
     complete kernel shape regardless of the original layer's stride.
     """
     mode = getattr(layer, "share_neighbors", False)
     probe = type(layer)(
-        in_channels=layer.in_channels,
-        out_channels=layer.out_channels,
+        filters=layer.filters,
         kernel_size=layer.hexbase_size,
-        stride=1,
-        bias=False,
+        strides=1,
+        use_bias=False,
         share_neighbors=mode,
     )
     g = 6 * layer.hexbase_size + 11
@@ -165,7 +164,7 @@ def _probe_layer(layer):
 def _impulse_response_hextensor(layer, in_channel):
     """General kernels: visualise the filter via its impulse response.
 
-    A single 1.0 (in input channel ``in_channel``) is fed through a stride=1
+    A single 1.0 (in input channel ``in_channel``) is fed through a strides=1
     probe copy of the layer (see `_probe_layer` for why: probing the real
     layer directly truncates the picture whenever stride>1) and the output is
     the filter's response to a point source -- the standard way to picture a

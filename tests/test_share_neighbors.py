@@ -47,11 +47,11 @@ def test_share_neighbors_equals_full_broadcast(n, stride):
     x = rng.standard_normal((2, H, W, Cin)).astype(np.float32)
     rw = rng.standard_normal((n + 1, Cin, Cout)).astype(np.float32)  # (nr,in,out)
 
-    shared = hgly.Conv2d(Cin, Cout, kernel_size=n, stride=stride, bias=False, share_neighbors=True)
+    shared = hgly.Conv2d(Cout, kernel_size=n, strides=stride, use_bias=False, share_neighbors=True)
     _ = shared(keras.ops.zeros((1, H, W, Cin)))
     shared.ring_weights.assign(rw)
 
-    full = hgly.Conv2d(Cin, Cout, kernel_size=n, stride=stride, bias=False)
+    full = hgly.Conv2d(Cout, kernel_size=n, strides=stride, use_bias=False)
     _ = full(keras.ops.zeros((1, H, W, Cin)))
     maps, _ = hgly.ring_maps_2d(n)
     for i in range(n + 1):
@@ -67,7 +67,7 @@ def test_share_neighbors_3d_ties_hex_axes_only():
     rng = np.random.default_rng(32)
     n, D, H, W, Cin, Cout = 1, 4, 11, 9, 2, 3
     x = rng.standard_normal((2, D, H, W, Cin)).astype(np.float32)
-    layer = hgly.Conv3d(Cin, Cout, kernel_size=(D, n), stride=1, bias=False, share_neighbors=True)
+    layer = hgly.Conv3d(Cout, kernel_size=(D, n), strides=1, use_bias=False, share_neighbors=True)
     _ = layer(keras.ops.zeros((1, D, H, W, Cin)))
     assert tuple(layer.ring_weights.shape) == (D, n + 1, Cin, Cout)
     out = layer(keras.ops.convert_to_tensor(x))
@@ -84,7 +84,7 @@ def test_share_neighbors_gradient_tied():
     rng = np.random.default_rng(33)
     n, H, W = 2, 11, 9
     x = tf.constant(rng.standard_normal((2, H, W, 1)).astype(np.float32))
-    layer = hgly.Conv2d(1, 1, kernel_size=n, stride=1, bias=False, share_neighbors=True)
+    layer = hgly.Conv2d(1, kernel_size=n, strides=1, use_bias=False, share_neighbors=True)
     _ = layer(keras.ops.zeros((1, H, W, 1)))
 
     with tf.GradientTape() as tape:
@@ -110,7 +110,7 @@ def test_share_neighbors_gradient_tied():
 def test_share_neighbors_true_is_ring_alias():
     """Back-compat: the old bool API (share_neighbors=True) must still work
     and must mean "ring", keras-hexagdly's only mode before this port."""
-    layer = hgly.Conv2d(2, 3, kernel_size=1, share_neighbors=True)
+    layer = hgly.Conv2d(3, kernel_size=1, share_neighbors=True)
     assert layer.share_neighbors == "ring"
 
 
@@ -126,4 +126,4 @@ def test_diag_sym_reject_kernel_size_3(mode):
 
 def test_unknown_mode_rejected():
     with pytest.raises(ValueError):
-        hgly.Conv2d(2, 3, kernel_size=1, share_neighbors="bogus")
+        hgly.Conv2d(3, kernel_size=1, share_neighbors="bogus")

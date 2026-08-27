@@ -129,7 +129,7 @@ def _load_hex_bias(layer, state_dict, prefix):
         layer.bias_tensor.assign(to_numpy(state_dict[bias_key]))
     elif bias_key in state_dict:
         raise ValueError(
-            f"{layer.name}: built with bias=False but the state dict carries "
+            f"{layer.name}: built with use_bias=False but the state dict carries "
             f"{bias_key}; the weights would be silently dropped"
         )
 

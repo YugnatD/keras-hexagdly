@@ -44,7 +44,7 @@ def bench_keras_hexagdly(compiled=False):
     backend = keras.backend.backend()
     results = []
     for name, h, w, cin, cout, k, s in CASES:
-        layer = hgly.Conv2d(cin, cout, kernel_size=k, stride=s, bias=True)
+        layer = hgly.Conv2d(cout, kernel_size=k, strides=s, use_bias=True)
         x = keras.ops.convert_to_tensor(np.random.randn(BATCH, h, w, cin).astype(np.float32))
 
         call = layer
@@ -92,7 +92,7 @@ def bench_keras_hexagdly_cpu():
     results = []
     with keras.device("cpu"):
         for name, h, w, cin, cout, k, s in CASES:
-            layer = hgly.Conv2d(cin, cout, kernel_size=k, stride=s, bias=True)
+            layer = hgly.Conv2d(cout, kernel_size=k, strides=s, use_bias=True)
             x = keras.ops.convert_to_tensor(np.random.randn(BATCH, h, w, cin).astype(np.float32))
             for _ in range(N_WARMUP):
                 layer(x)

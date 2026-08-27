@@ -58,18 +58,24 @@ x = keras.random.uniform((1, 21, 21, 1))  # channels-last: (N, H, W, C)
 y = hexconv(x)
 ```
 
-`filters`/`strides`/`use_bias` are the Keras-native names and the preferred
-form going forward; `in_channels` is never required -- it's inferred from
-the input on first call, like a standard Keras layer.
+`filters`/`kernel_size`/`strides`/`use_bias` follow standard Keras layer
+conventions exactly (`filters`/`kernel_size` are positional-capable, just
+like `keras.layers.Conv2D(filters, kernel_size, strides=...)`). `in_channels`
+is never a constructor argument -- it's always inferred from the input on
+first call, like every standard Keras layer.
 
-The original PyTorch-hexagdly-style names (`in_channels`, `out_channels`,
-`stride`, `bias`) still work exactly as before -- e.g.
-`hgly.Conv2d(in_channels, out_channels, kernel_size, stride)` -- and will
-keep working indefinitely for backward compatibility with existing code and
-previously-saved models; using them now emits a `DeprecationWarning`
-pointing at the new name (`stride`/`bias` only -- `in_channels`/
-`out_channels` aren't deprecated, `filters` is just the additional
-Keras-idiomatic alias for `out_channels`).
+**Breaking change in 0.4.0**: the original PyTorch-hexagdly-style
+constructor names (`in_channels`, `out_channels`, `stride`, `bias`) have
+been removed entirely -- passing them now raises, rather than being
+silently accepted. This was a deliberate, one-time breaking change (see
+[CHANGELOG.md](CHANGELOG.md)) made specifically because those old names,
+combined with Python's positional argument binding, meant
+`Conv2d(32, 3, strides=2)` -- written the way anyone familiar with
+`keras.layers.Conv2D` naturally would -- silently built the wrong layer
+(`in_channels=32, out_channels=3, kernel_size=1`) instead of raising. If you
+have code or saved models depending on the old names, pin
+`keras-hexagdly==0.3.1`, the one transitional release where both forms
+worked side by side.
 
 ### New: `share_neighbors` -- weight sharing across kernel cells
 

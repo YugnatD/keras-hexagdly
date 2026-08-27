@@ -3,6 +3,37 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.0] - 2026-08-27
+
+### Removed (BREAKING)
+
+- **The original PyTorch-hexagdly-style constructor names are gone**:
+  `in_channels`, `out_channels`, `stride`, `bias` no longer exist on
+  `Conv2d`/`Conv3d`/`Conv2d_CustomKernel`/`Conv3d_CustomKernel`/
+  `MaxPool2d`/`MaxPool3d` (`Conv2d_CustomKernel`/`Conv3d_CustomKernel`'s
+  `bias` -- the bias *array*, not a boolean flag -- is unaffected, it was
+  never part of this rename). Passing any of the removed names now raises
+  (`TypeError`/`ValueError`), not a warning.
+  - `filters`/`kernel_size` are now genuinely positional, matching
+    `keras.layers.Conv2D(filters, kernel_size, strides=..., ...)` exactly.
+    This is why the old names had to go rather than staying deprecated
+    forever: keeping the old 2-positional `Conv2d(in_channels,
+    out_channels, ...)` form alive indefinitely would have meant
+    `Conv2d(32, 3, strides=2)` -- written the way anyone coming from
+    `keras.layers.Conv2D` naturally would -- kept silently building the
+    wrong layer (`in_channels=32, out_channels=3, kernel_size=1`) instead of
+    raising. That silent-misinterpretation risk, not just naming taste, is
+    the actual reason for this breaking change.
+  - `in_channels` is not reintroduced under any name -- it's always inferred
+    from the input in `build()`, like every standard Keras layer.
+  - `get_config()`/`from_config()` only ever produced/consumed the new names
+    as of 0.3.1, so this release does not change what a `.keras` file
+    written by 0.3.1 (or this version) contains -- only files written by
+    0.3.0 or earlier (using the pre-rename names) can no longer be loaded.
+    If you need those, pin `keras-hexagdly==0.3.1` (the one release where
+    both name sets were accepted) to re-save them under the new names, then
+    upgrade.
+
 ## [0.3.1] - 2026-08-27
 
 **Transitional release.** This version accepts both the old and new
