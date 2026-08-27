@@ -20,6 +20,8 @@ def x():
 
 
 def test_new_and_old_style_construction_are_numerically_identical(x):
+    x_t = keras.ops.convert_to_tensor(x)
+
     keras.utils.set_random_seed(0)
     new = hgly.Conv2d(filters=4, kernel_size=1, strides=1, use_bias=True)
     new.build(x.shape)
@@ -28,7 +30,9 @@ def test_new_and_old_style_construction_are_numerically_identical(x):
     old = hgly.Conv2d(3, 4, kernel_size=1, stride=1, bias=True)
     old.build(x.shape)
 
-    assert np.allclose(new(x), old(x))
+    y_new = keras.ops.convert_to_numpy(new(x_t))
+    y_old = keras.ops.convert_to_numpy(old(x_t))
+    assert np.allclose(y_new, y_old)
 
 
 def test_old_style_kwargs_emit_deprecation_warning():
