@@ -53,16 +53,23 @@ pip install keras-hexagdly[dev]
 import keras
 import keras_hexagdly as hgly
 
-kernel_size, stride = 1, 4
-in_channels, out_channels = 1, 3
-
-hexconv = hgly.Conv2d(in_channels, out_channels, kernel_size, stride)
+hexconv = hgly.Conv2d(filters=3, kernel_size=1, strides=4)
 x = keras.random.uniform((1, 21, 21, 1))  # channels-last: (N, H, W, C)
 y = hexconv(x)
 ```
 
-`in_channels` can be omitted; it is then inferred from the input on first
-call, like a standard Keras layer: `hgly.Conv2d(out_channels, kernel_size=kernel_size, stride=stride)`.
+`filters`/`strides`/`use_bias` are the Keras-native names and the preferred
+form going forward; `in_channels` is never required -- it's inferred from
+the input on first call, like a standard Keras layer.
+
+The original PyTorch-hexagdly-style names (`in_channels`, `out_channels`,
+`stride`, `bias`) still work exactly as before -- e.g.
+`hgly.Conv2d(in_channels, out_channels, kernel_size, stride)` -- and will
+keep working indefinitely for backward compatibility with existing code and
+previously-saved models; using them now emits a `DeprecationWarning`
+pointing at the new name (`stride`/`bias` only -- `in_channels`/
+`out_channels` aren't deprecated, `filters` is just the additional
+Keras-idiomatic alias for `out_channels`).
 
 ### New: `share_neighbors` -- weight sharing across kernel cells
 
@@ -93,7 +100,7 @@ weights. `"ring"` works at any kernel size; `"diag"` and `"sym"` are defined for
 define them beyond n=2 either.
 
 ```python
-hexconv = hgly.Conv2d(in_channels, out_channels, kernel_size=2, share_neighbors="ring")
+hexconv = hgly.Conv2d(filters=3, kernel_size=2, share_neighbors="ring")
 ```
 
 `share_neighbors=True` is accepted as an alias for `"ring"`.

@@ -35,6 +35,8 @@ dilation+stride either, so pooling uses an explicit shifted-slice max -- see
 _MaxPoolProcess).
 """
 
+import warnings
+
 import keras
 import numpy as np
 
@@ -79,20 +81,55 @@ def _dilate_kernel(kernel, dilation):
 # ----------------------------------------------------------------------------
 
 
-def _resolve_channels(in_channels, out_channels):
-    """Map the two leading positionals to (in_channels, out_channels).
+def _resolve_channels(in_channels, out_channels, filters=None):
+    """Map the leading positionals/keywords to (in_channels, out_channels).
 
-    Two public call forms are supported:
-      * Conv2d(in_channels, out_channels, ...)  -- the original, explicit form
-      * Conv2d(out_channels, ...)               -- in_channels inferred in build()
-    If only one of the two is given it is out_channels (in_channels stays None and
-    is inferred from the input). out_channels must end up known at construction.
+    Three public call forms are supported:
+      * Conv2d(in_channels, out_channels, ...)  -- the original, explicit
+        PyTorch-hexagdly-style form (e.g. for loading a state dict via
+        torch_interop, where both channel counts are already known)
+      * Conv2d(out_channels, ...)               -- in_channels inferred in
+        build(); out_channels passed positionally
+      * Conv2d(filters=N, ...)                  -- Keras-style keyword form
+        (preferred going forward)
+    If only one of the two leading positionals is given it is out_channels
+    (in_channels stays None and is inferred from the input). Passing both
+    'filters' and 'out_channels' is a conflict -- pick one. filters/out_channels
+    must end up known at construction either way.
     """
-    if out_channels is None:
+    if filters is not None:
+        if out_channels is not None:
+            raise ValueError("pass either 'filters' or the deprecated 'out_channels', not both.")
+        out_channels = filters
+    elif out_channels is None:
         in_channels, out_channels = None, in_channels
     if out_channels is None:
-        raise ValueError("out_channels must be specified.")
+        raise ValueError("filters (or out_channels) must be specified.")
     return in_channels, out_channels
+
+
+def _resolve_deprecated_kwarg(new_value, old_value, default, new_name, old_name):
+    """Resolve a Keras-style kwarg against its deprecated PyTorch-style alias.
+
+    ``new_value`` is expected to default to ``None`` at the call site (a "not
+    given" sentinel); ``old_value`` keeps its original, real default so every
+    existing positional/keyword call using the old name is completely
+    unaffected. Passing both -- with the old one at a non-default value --
+    is treated as a conflict rather than silently picking one.
+    """
+    if new_value is not None:
+        if old_value != default:
+            raise ValueError(f"pass either {new_name!r} or the deprecated {old_name!r}, not both.")
+        return new_value
+    if old_value != default:
+        warnings.warn(
+            f"{old_name!r} is deprecated and will be removed in a future release, "
+            f"use {new_name!r} instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return old_value
+    return default
 
 
 def _require_positive_int(name, value):
@@ -840,6 +877,10 @@ class Conv2d(HexBase, keras.layers.Layer):
         debug=False,
         share_neighbors=False,
         name=None,
+        *,
+        filters=None,
+        strides=None,
+        use_bias=None,
         **kwargs,
     ):
         keras.layers.Layer.__init__(self, name=name, **kwargs)
@@ -850,17 +891,26 @@ class Conv2d(HexBase, keras.layers.Layer):
         # single positional. Disambiguate: if only one of the two leading
         # positionals is given, it is out_channels (in_channels stays None ->
         # inferred). If in_channels is supplied it is validated in build().
-        in_channels, out_channels = _resolve_channels(in_channels, out_channels)
+        # filters/strides/use_bias are the Keras-native names; out_channels/
+        # stride/bias are the original PyTorch-hexagdly-style names, kept
+        # working (with a DeprecationWarning where relevant) for back-compat
+        # with existing code and previously-saved models -- see
+        # _resolve_channels / _resolve_deprecated_kwarg.
+        in_channels, out_channels = _resolve_channels(in_channels, out_channels, filters)
+        strides = _resolve_deprecated_kwarg(strides, stride, 1, "strides", "stride")
+        use_bias = _resolve_deprecated_kwarg(use_bias, bias, True, "use_bias", "bias")
         _require_positive_int("kernel_size", kernel_size)
-        _require_positive_int("stride", stride)
+        _require_positive_int("strides", strides)
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.filters = out_channels
         self.kernel_size = kernel_size
-        self.stride = stride
+        self.stride = strides
+        self.strides = strides
         self.hexbase_size = kernel_size
-        self.hexbase_stride = stride
+        self.hexbase_stride = strides
         self.debug = debug
-        self.use_bias = bias
+        self.use_bias = use_bias
         self.share_neighbors = _normalize_share_neighbors(share_neighbors)
         self.dimensions = 2
         self.process = _ConvProcess(2)
@@ -953,14 +1003,17 @@ class Conv2d(HexBase, keras.layers.Layer):
         return self.operation_with_arbitrary_stride(input)
 
     def get_config(self):
+        # Emits the new Keras-style names going forward. __init__ still accepts
+        # the old names (in_channels/out_channels/stride/bias), so configs
+        # saved by older versions of this package keep loading correctly.
         config = super().get_config()
         config.update(
             {
                 "in_channels": self.in_channels,
-                "out_channels": self.out_channels,
+                "filters": self.filters,
                 "kernel_size": self.kernel_size,
-                "stride": self.stride,
-                "bias": self.use_bias,
+                "strides": self.strides,
+                "use_bias": self.use_bias,
                 "debug": self.debug,
                 "share_neighbors": self.share_neighbors,
             }
@@ -993,18 +1046,29 @@ class Conv3d(HexBase, keras.layers.Layer):
         share_neighbors=False,
         depth_padding="valid",
         name=None,
+        *,
+        filters=None,
+        strides=None,
+        use_bias=None,
         **kwargs,
     ):
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
         # in_channels is OPTIONAL and inferred in build(); see _resolve_channels.
-        in_channels, out_channels = _resolve_channels(in_channels, out_channels)
+        # filters/strides/use_bias are the Keras-native names; out_channels/
+        # stride/bias are kept working for back-compat -- see the matching
+        # note in Conv2d.__init__.
+        in_channels, out_channels = _resolve_channels(in_channels, out_channels, filters)
+        strides = _resolve_deprecated_kwarg(strides, stride, 1, "strides", "stride")
+        use_bias = _resolve_deprecated_kwarg(use_bias, bias, True, "use_bias", "bias")
         _require_positive_int_or_pair("kernel_size", kernel_size)
-        _require_positive_int_or_pair("stride", stride)
+        _require_positive_int_or_pair("strides", strides)
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.filters = out_channels
         self.kernel_size = kernel_size
-        self.stride = stride
+        self.stride = strides
+        self.strides = strides
         if isinstance(kernel_size, int):
             self.hexbase_size = kernel_size
             self.depth_size = kernel_size
@@ -1012,15 +1076,15 @@ class Conv3d(HexBase, keras.layers.Layer):
             assert len(kernel_size) == 2, "Need a tuple of two ints to set kernel size"
             self.hexbase_size = kernel_size[1]
             self.depth_size = kernel_size[0]
-        if isinstance(stride, int):
-            self.hexbase_stride = stride
-            self.depth_stride = stride
+        if isinstance(strides, int):
+            self.hexbase_stride = strides
+            self.depth_stride = strides
         else:
-            assert len(stride) == 2, "Need a tuple of two ints to set stride"
-            self.hexbase_stride = stride[1]
-            self.depth_stride = stride[0]
+            assert len(strides) == 2, "Need a tuple of two ints to set strides"
+            self.hexbase_stride = strides[1]
+            self.depth_stride = strides[0]
         self.debug = debug
-        self.use_bias = bias
+        self.use_bias = use_bias
         self.share_neighbors = _normalize_share_neighbors(share_neighbors)
         # Depth (time) border handling. "valid" (default) = no depth pad, output
         # depth = D - kernel + 1 (original hexagdly behaviour). "same" = zero-pad
@@ -1122,14 +1186,15 @@ class Conv3d(HexBase, keras.layers.Layer):
         return self.operation_with_arbitrary_stride(input)
 
     def get_config(self):
+        # See the Conv2d.get_config note -- same forward/back-compat split.
         config = super().get_config()
         config.update(
             {
                 "in_channels": self.in_channels,
-                "out_channels": self.out_channels,
+                "filters": self.filters,
                 "kernel_size": self.kernel_size,
-                "stride": self.stride,
-                "bias": self.use_bias,
+                "strides": self.strides,
+                "use_bias": self.use_bias,
                 "debug": self.debug,
                 "share_neighbors": self.share_neighbors,
                 "depth_padding": self.depth_padding,
@@ -1158,15 +1223,22 @@ class Conv2d_CustomKernel(HexBase, keras.layers.Layer):
         trainable=False,
         debug=False,
         name=None,
+        *,
+        strides=None,
         **kwargs,
     ):
-        _require_positive_int("stride", stride)
+        # Note: 'bias' here is the actual bias array (data), not a boolean
+        # flag like Conv2d's -- it has no Keras-native rename, unlike stride.
+        strides = _resolve_deprecated_kwarg(strides, stride, 1, "strides", "stride")
+        _require_positive_int("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
         self.dimensions = 2
         self.process = _ConvProcess(2)
         self.combine = keras.ops.add
-        self.hexbase_stride = stride
+        self.stride = strides
+        self.strides = strides
+        self.hexbase_stride = strides
         self._trainable_kernels = trainable
         self._debug = debug
 
@@ -1232,7 +1304,7 @@ class Conv2d_CustomKernel(HexBase, keras.layers.Layer):
         config.update(
             {
                 "sub_kernels": [sk.tolist() for sk in self._sub_kernels_init],
-                "stride": self.hexbase_stride,
+                "strides": self.hexbase_stride,
                 "bias": None if self._bias_init is None else self._bias_init.tolist(),
                 "trainable": self._trainable_kernels,
                 "debug": self._debug,
@@ -1261,24 +1333,31 @@ class Conv3d_CustomKernel(HexBase, keras.layers.Layer):
         trainable=False,
         debug=False,
         name=None,
+        *,
+        strides=None,
         **kwargs,
     ):
-        _require_positive_int_or_pair("stride", stride)
+        # Note: 'bias' here is the actual bias array (data), not a boolean
+        # flag like Conv3d's -- it has no Keras-native rename, unlike stride.
+        strides = _resolve_deprecated_kwarg(strides, stride, 1, "strides", "stride")
+        _require_positive_int_or_pair("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
         self.dimensions = 3
         self.process = _ConvProcess(3)
         self.combine = keras.ops.add
-        self._stride_init = stride
+        self.stride = strides
+        self.strides = strides
+        self._stride_init = strides
         self._trainable_kernels = trainable
         self._debug = debug
-        if isinstance(stride, int):
-            self.hexbase_stride = stride
-            self.depth_stride = stride
+        if isinstance(strides, int):
+            self.hexbase_stride = strides
+            self.depth_stride = strides
         else:
-            assert len(stride) == 2, "Need a tuple of two ints to set stride"
-            self.hexbase_stride = stride[1]
-            self.depth_stride = stride[0]
+            assert len(strides) == 2, "Need a tuple of two ints to set strides"
+            self.hexbase_stride = strides[1]
+            self.depth_stride = strides[0]
 
         # np.asarray here (not just list(...)): see the matching comment in
         # Conv2d_CustomKernel.__init__ -- config round-trips supply plain lists.
@@ -1343,7 +1422,7 @@ class Conv3d_CustomKernel(HexBase, keras.layers.Layer):
         config.update(
             {
                 "sub_kernels": [sk.tolist() for sk in self._sub_kernels_init],
-                "stride": self._stride_init,
+                "strides": self._stride_init,
                 "bias": None if self._bias_init is None else self._bias_init.tolist(),
                 "trainable": self._trainable_kernels,
                 "debug": self._debug,
@@ -1360,15 +1439,17 @@ class MaxPool2d(HexBase, keras.layers.Layer):
     when the layer is called -- the hex addressing arithmetic reads them as ints.
     """
 
-    def __init__(self, kernel_size=1, stride=1, name=None, **kwargs):
+    def __init__(self, kernel_size=1, stride=1, name=None, *, strides=None, **kwargs):
+        strides = _resolve_deprecated_kwarg(strides, stride, 1, "strides", "stride")
         _require_positive_int("kernel_size", kernel_size)
-        _require_positive_int("stride", stride)
+        _require_positive_int("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
         self.kernel_size = kernel_size
-        self.stride = stride
+        self.stride = strides
+        self.strides = strides
         self.hexbase_size = kernel_size
-        self.hexbase_stride = stride
+        self.hexbase_stride = strides
         self.dimensions = 2
         self.process = _MaxPoolProcess(2)
         self.combine = keras.ops.maximum
@@ -1382,7 +1463,7 @@ class MaxPool2d(HexBase, keras.layers.Layer):
 
     def get_config(self):
         config = super().get_config()
-        config.update({"kernel_size": self.kernel_size, "stride": self.stride})
+        config.update({"kernel_size": self.kernel_size, "strides": self.strides})
         return config
 
 
@@ -1395,25 +1476,27 @@ class MaxPool3d(HexBase, keras.layers.Layer):
     ints.
     """
 
-    def __init__(self, kernel_size=1, stride=1, name=None, **kwargs):
+    def __init__(self, kernel_size=1, stride=1, name=None, *, strides=None, **kwargs):
+        strides = _resolve_deprecated_kwarg(strides, stride, 1, "strides", "stride")
         _require_positive_int_or_pair("kernel_size", kernel_size)
-        _require_positive_int_or_pair("stride", stride)
+        _require_positive_int_or_pair("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
         self.kernel_size = kernel_size
-        self.stride = stride
+        self.stride = strides
+        self.strides = strides
         if isinstance(kernel_size, int):
             self.hexbase_size = kernel_size
             self.depth_size = kernel_size
         else:
             self.hexbase_size = kernel_size[1]
             self.depth_size = kernel_size[0]
-        if isinstance(stride, int):
-            self.hexbase_stride = stride
-            self.depth_stride = stride
+        if isinstance(strides, int):
+            self.hexbase_stride = strides
+            self.depth_stride = strides
         else:
-            self.hexbase_stride = stride[1]
-            self.depth_stride = stride[0]
+            self.hexbase_stride = strides[1]
+            self.depth_stride = strides[0]
         self.dimensions = 3
         self.process = _MaxPoolProcess(3)
         self.combine = keras.ops.maximum
@@ -1431,5 +1514,5 @@ class MaxPool3d(HexBase, keras.layers.Layer):
 
     def get_config(self):
         config = super().get_config()
-        config.update({"kernel_size": self.kernel_size, "stride": self.stride})
+        config.update({"kernel_size": self.kernel_size, "strides": self.strides})
         return config

@@ -3,7 +3,38 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [0.3.0] - 2026-07-28
+## [0.3.1] - 2026-08-27
+
+**Transitional release.** This version accepts both the old and new
+constructor names side by side (see below). The *next* release removes the
+old PyTorch-hexagdly-style names entirely -- pin `keras-hexagdly==0.3.1` if
+you specifically need the old names to keep working a little longer;
+otherwise migrate to the new names now, since this is the only version
+where both work.
+
+### Added
+
+- **Keras-native constructor keyword names**: `Conv2d`/`Conv3d` now accept
+  `filters` (alias for `out_channels`), and `Conv2d`/`Conv3d`/
+  `Conv2d_CustomKernel`/`Conv3d_CustomKernel`/`MaxPool2d`/`MaxPool3d` all
+  accept `strides` (alias for `stride`); `Conv2d`/`Conv3d` additionally
+  accept `use_bias` (alias for `bias`). These are the preferred names going
+  forward and match standard Keras layer conventions
+  (`keras.layers.Conv2D(filters=..., strides=..., use_bias=...)`).
+  `get_config()` now emits these new names.
+
+### Changed
+
+- **Deprecated the original PyTorch-hexagdly-style constructor names**:
+  `stride` and `bias` (on `Conv2d`/`Conv3d`; `Conv2d_CustomKernel`/
+  `Conv3d_CustomKernel`'s `bias` is the bias *array*, not a boolean flag, and
+  is unaffected/not deprecated) now emit a `DeprecationWarning` pointing at
+  `strides`/`use_bias`. `in_channels`/`out_channels` are unaffected (not
+  deprecated in this release) -- `filters` is simply the additional
+  Keras-idiomatic alias for `out_channels`. All old names keep working
+  exactly as before in this release, including loading models saved by
+  previous versions (whose serialized config uses the old key names) --
+  see `tests/test_param_rename_backcompat.py`.
 
 ### Changed
 
