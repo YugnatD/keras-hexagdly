@@ -3,6 +3,45 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.1] - 2026-08-27
+
+### Fixed
+
+- **`Conv2d`/`Conv3d`'s default (He-normal) weight initialization was
+  scaled too large, and grew larger with `kernel_size`.** Both layers split
+  each output channel's receptive field across several separately-shaped
+  sub-kernel tensors (`kernel0`, `kernel1`, ... -- or, with
+  `share_neighbors`, one shared value per hex ring) whose contributions are
+  *summed* to produce the output. Calling `keras.initializers.HeNormal()`
+  on each piece independently -- as this port originally did, faithfully
+  mirroring upstream `hexagdly`'s (and `pytorch_hexagdly`'s) per-sub-kernel
+  `kaiming_normal_()` calls -- calibrates each piece's variance as if it
+  alone were the entire receptive field. The summed output ends up with
+  variance inflated by roughly the number of sub-kernels: measured output
+  std for a single untrained layer, on unit-variance input, was ~1.4x too
+  high at `kernel_size=1` (2 sub-kernels) growing to ~1.9x too high at
+  `kernel_size=3` (4 sub-kernels), instead of holding constant near the
+  He-init target of `sqrt(2)` regardless of kernel size.
+  - This is a real, upstream-inherited bug, not a deliberate design choice
+    -- `Conv2d_CustomKernel`/`Conv3d_CustomKernel` are unaffected (they
+    require explicit caller-supplied `sub_kernels`, no default init path).
+  - Fixed by initializing from one pool sized by the *combined* fan-in
+    across all of a layer's sub-kernels/rings, then slicing pieces off it --
+    see `_combined_fan_in_pool` in `layers.py`. `debug=True` (all-ones
+    init) is unaffected.
+  - Practical symptom this explains: a hex conv stack noticeably
+    out-scaling an equivalent square `keras.layers.Conv2D` stack's
+    activations before training even starts, forcing a lower learning rate
+    or `batchnorm=True` just to make the two comparable -- that workaround
+    is no longer necessary for this specific cause (though it may still be
+    good practice for other reasons).
+  - No change to `get_config()`/`from_config()`, weight *shapes*, or the
+    convolution math itself -- only the *values* a freshly-built layer's
+    weights start at. A `.keras` file saved from a previously-built (and
+    at least partially trained) model is unaffected on load, since loading
+    restores the saved weight values rather than re-running the
+    initializer.
+
 ## [0.4.0] - 2026-08-27
 
 ### Removed (BREAKING)

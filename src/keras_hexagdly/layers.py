@@ -109,6 +109,34 @@ def _require_positive_int_or_pair(name, value):
     _require_positive_int(f"{name}[1]", b)
 
 
+def _combined_fan_in_pool(total_fan_in, out_channels, debug):
+    """Draw one correctly-scaled pool of weight values, to be sliced into a
+    hex conv's several sub-kernel/ring-weight pieces.
+
+    A hex convolution splits each output channel's receptive field across
+    several separately-shaped tensors (kernel0, kernel1, ... -- or, with
+    share_neighbors, one shared value per ring) whose contributions are
+    SUMMED to produce the output. Calling a variance-scaling initializer
+    (He-normal) on each piece independently -- as upstream hexagdly,
+    pytorch_hexagdly, and this port originally did -- calibrates each
+    piece's variance as if it alone were the entire receptive field, so the
+    summed output ends up with variance inflated by roughly the number of
+    pieces (measured: ~sqrt(N) too much stddev per layer, N = number of
+    sub-kernels, compounding across depth).
+
+    Since a variance-scaling initializer draws i.i.d. elements, a contiguous
+    slice of a pool sized by the TRUE combined fan-in is itself correctly
+    scaled -- so build() draws one (total_fan_in, out_channels) pool here and
+    slices+reshapes pieces off it for each sub-kernel/ring tensor, instead of
+    initializing each piece from its own (too-small) shape.
+
+    debug=True keeps using all-ones (Ones() sliced anywhere is still all
+    1s, so no special-casing needed there).
+    """
+    init = keras.initializers.Ones() if debug else keras.initializers.HeNormal()
+    return keras.ops.convert_to_numpy(init((total_fan_in, out_channels)))
+
+
 def _infer_in_channels(input_shape):
     """Infer the input channel count from a channels-last input_shape[-1].
 
@@ -847,7 +875,16 @@ class Conv2d(HexBase, keras.layers.Layer):
         self.in_channels = in_channels
         out_channels = self.filters
 
-        init = keras.initializers.Ones() if self.debug else keras.initializers.HeNormal()
+        # Total physical taps across kernel0..kernel{hexbase_size} -- the TRUE
+        # combined receptive field whose summed output needs variance-preserving
+        # init. See _combined_fan_in_pool for why this must be combined, not
+        # computed per sub-kernel.
+        total_taps = sum(
+            (1 + 2 * self.hexbase_size - i) * (1 if i == 0 else 2)
+            for i in range(self.hexbase_size + 1)
+        )
+        pool = _combined_fan_in_pool(total_taps * in_channels, out_channels, self.debug)
+        offset = 0
 
         # NOTE: trainable weights are created with self.add_weight (NOT a raw
         # Variable) so Keras tracks them in trainable_variables -- essential for
@@ -857,10 +894,15 @@ class Conv2d(HexBase, keras.layers.Layer):
         if self.share_neighbors:
             # One weight per hex ring, broadcast to every cell of that ring at
             # forward time (see _materialize_kernels). num_rings = n + 1.
+            count = self.num_rings * in_channels
+            values = pool[offset : offset + count].reshape(
+                self.num_rings, in_channels, out_channels
+            )
+            offset += count
             self.ring_weights = self.add_weight(
                 name="ring_weights",
                 shape=(self.num_rings, in_channels, out_channels),
-                initializer=init,
+                initializer=keras.initializers.Constant(values),
                 trainable=True,
             )
             # Ring-index tensors only depend on kernel geometry, not on the
@@ -874,11 +916,16 @@ class Conv2d(HexBase, keras.layers.Layer):
             for i in range(self.hexbase_size + 1):
                 kh = 1 + 2 * self.hexbase_size - i
                 kw = 1 if i == 0 else 2
+                count = kh * kw * in_channels
+                values = pool[offset : offset + count].reshape(
+                    kh, kw, in_channels, out_channels
+                )
+                offset += count
                 self._base_kernels.append(
                     self.add_weight(
                         name=f"base_kernel{i}",
                         shape=(kh, kw, in_channels, out_channels),
-                        initializer=init,
+                        initializer=keras.initializers.Constant(values),
                         trainable=True,
                     )
                 )
@@ -1012,7 +1059,14 @@ class Conv3d(HexBase, keras.layers.Layer):
         self.in_channels = in_channels
         out_channels = self.filters
 
-        init = keras.initializers.Ones() if self.debug else keras.initializers.HeNormal()
+        # Total physical taps across kernel0..kernel{hexbase_size} (including
+        # the depth axis) -- see Conv2d.build / _combined_fan_in_pool.
+        total_taps = self.depth_size * sum(
+            (1 + 2 * self.hexbase_size - i) * (1 if i == 0 else 2)
+            for i in range(self.hexbase_size + 1)
+        )
+        pool = _combined_fan_in_pool(total_taps * in_channels, out_channels, self.debug)
+        offset = 0
 
         # Trainable weights via self.add_weight (Keras tracks them); kernel{i} the
         # forward pass reads are derived tensors set per call (see _materialize_kernels).
@@ -1020,10 +1074,15 @@ class Conv3d(HexBase, keras.layers.Layer):
             # Share over the HEX axes only; the depth (time) axis stays fully
             # independent -- exactly TDSCAN's (L, num_rings, ...) layout. So
             # ring_weights is (depth, num_rings, in, out).
+            count = self.depth_size * self.num_rings * in_channels
+            values = pool[offset : offset + count].reshape(
+                self.depth_size, self.num_rings, in_channels, out_channels
+            )
+            offset += count
             self.ring_weights = self.add_weight(
                 name="ring_weights",
                 shape=(self.depth_size, self.num_rings, in_channels, out_channels),
-                initializer=init,
+                initializer=keras.initializers.Constant(values),
                 trainable=True,
             )
             # See Conv2d.build: cache the ring-index tensors once rather than
@@ -1036,11 +1095,16 @@ class Conv3d(HexBase, keras.layers.Layer):
             for i in range(self.hexbase_size + 1):
                 kh = 1 + 2 * self.hexbase_size - i
                 kw = 1 if i == 0 else 2
+                count = self.depth_size * kh * kw * in_channels
+                values = pool[offset : offset + count].reshape(
+                    self.depth_size, kh, kw, in_channels, out_channels
+                )
+                offset += count
                 self._base_kernels.append(
                     self.add_weight(
                         name=f"base_kernel{i}",
                         shape=(self.depth_size, kh, kw, in_channels, out_channels),
-                        initializer=init,
+                        initializer=keras.initializers.Constant(values),
                         trainable=True,
                     )
                 )
