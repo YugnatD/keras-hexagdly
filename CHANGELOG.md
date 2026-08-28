@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.2] - 2026-08-28
+
+### Fixed
+
+- `__version__` was a hardcoded string that drifted stale across three
+  releases in a row -- it still read `"0.3.0"` as of 0.4.1, despite
+  `pyproject.toml`'s actual package version having moved to 0.3.1, 0.4.0,
+  and 0.4.1 in the meantime. Anyone checking `keras_hexagdly.__version__`
+  at runtime to detect what's installed got a wrong answer.
+  Now derived from the installed package's own metadata
+  (`importlib.metadata.version("keras-hexagdly")`, set from
+  `pyproject.toml`'s `version` at build time) instead of a second,
+  manually-synced constant, so it can't drift out of sync again. Falls
+  back to `"unknown"` if run from source without an installed/editable
+  package.
+
 ## [0.4.1] - 2026-08-27
 
 ### Fixed
