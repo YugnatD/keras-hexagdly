@@ -2,6 +2,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 
 from .layers import (
+    AvgPool2d,
     Conv2d,
     Conv2d_CustomKernel,
     Conv3d,
@@ -12,6 +13,7 @@ from .layers import (
 )
 
 __all__ = [
+    "AvgPool2d",
     "Conv2d",
     "Conv2d_CustomKernel",
     "Conv3d",

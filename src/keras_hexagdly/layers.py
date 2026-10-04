@@ -35,6 +35,8 @@ dilation+stride either, so pooling uses an explicit shifted-slice max -- see
 _MaxPoolProcess).
 """
 
+import operator
+
 import keras
 import numpy as np
 
@@ -107,6 +109,45 @@ def _require_positive_int_or_pair(name, value):
         )
     _require_positive_int(f"{name}[0]", a)
     _require_positive_int(f"{name}[1]", b)
+
+
+def _require_same_padding(padding):
+    """Validate ``padding`` for the 2D hex layers.
+
+    Hex layers always pad so the output size depends only on the stride, never
+    on the kernel size -- the hexagonal analogue of Keras "same". The argument
+    exists so they accept the same keywords as keras.layers.Conv2D /
+    MaxPool2D; any other value is rejected rather than silently ignored.
+    """
+    if not isinstance(padding, str) or padding.lower() != "same":
+        raise ValueError(
+            f"padding={padding!r} is not supported: hexagonal layers always pad to "
+            "keep the grid, the analogue of 'same'. Use padding='same'."
+        )
+    return "same"
+
+
+def _require_bool(name, value):
+    """Reject a non-boolean flag rather than reading it as truthy.
+
+    Conv2d/Conv3d take ``use_bias`` in the fourth positional slot, where
+    keras.layers.Conv2D takes ``padding``: without this check,
+    ``Conv2d(8, 1, 1, "same")`` written the Keras way would silently mean
+    ``use_bias="same"``, i.e. True. Returns a plain bool so the config stays
+    serializable when a numpy bool is passed.
+    """
+    if not isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be a bool, got {value!r}.")
+    return bool(value)
+
+
+def _resolve_pool_size(pool_size, kernel_size):
+    """Accept the Keras name ``pool_size`` and the HexagDLy name ``kernel_size``."""
+    if pool_size is not None and kernel_size is not None:
+        raise ValueError("Pass either pool_size or kernel_size, not both.")
+    if pool_size is not None:
+        return pool_size
+    return 1 if kernel_size is None else kernel_size
 
 
 def _combined_fan_in_pool(total_fan_in, out_channels, debug):
@@ -342,6 +383,12 @@ class HexBase:
         )
         odd_columns = None
         even_columns = None
+        # With no more columns than the stride, the even-column group of the
+        # output is empty and the odd group is the whole output. Computing the
+        # empty group anyway runs an op on a zero-width input, which fails on
+        # the TensorFlow and torch backends (and in upstream HexagDLy), so it
+        # is skipped.
+        has_even_columns = self._hw_ordered_size(input)[-1] > self.hexbase_stride
 
         # Recompute the per-sub-kernel slices/pads whenever the actual [..., H, W]
         # shape differs from the one they were last computed for -- not just
@@ -393,6 +440,8 @@ class HexBase:
                     ),
                 )
 
+            if not has_even_columns:
+                continue
             if even_columns is None:
                 even_columns = self.process(
                     self.get_padded_input(
@@ -418,6 +467,9 @@ class HexBase:
                     ),
                 )
 
+        if not has_even_columns:
+            return odd_columns
+
         concatenated_columns = keras.ops.concatenate((odd_columns, even_columns), self.dimensions)
 
         n_odd_columns = list(odd_columns.shape)[self.dimensions]
@@ -434,6 +486,10 @@ class HexBase:
     def operation_with_single_hexbase_stride(self, input):
         input = self._stabilize_3d_shape(input)
         columns_mod2 = self._hw_ordered_size(input)[-1] % 2
+        # A single-column grid has no even columns, so the odd-kernel
+        # even-column group is empty -- skipped for the same reason as in
+        # operation_with_arbitrary_stride.
+        has_even_columns = self._hw_ordered_size(input)[-1] > 1
         odd_kernels_odd_columns = []
         odd_kernels_even_columns = []
         even_kernels_all_columns = []
@@ -453,15 +509,16 @@ class HexBase:
                 dilation=self.get_dilation((1, 2)),
                 stride=self.get_stride(),
             )
-            odd_kernels_even_columns = self.process(
-                self.get_padded_input(
-                    input,
-                    [0, 1 - columns_mod2, self.hexbase_size - 1, self.hexbase_size],
-                ),
-                self.kernel1,
-                dilation=self.get_dilation((1, 2)),
-                stride=self.get_stride(),
-            )
+            if has_even_columns:
+                odd_kernels_even_columns = self.process(
+                    self.get_padded_input(
+                        input,
+                        [0, 1 - columns_mod2, self.hexbase_size - 1, self.hexbase_size],
+                    ),
+                    self.kernel1,
+                    dilation=self.get_dilation((1, 2)),
+                    stride=self.get_stride(),
+                )
 
         if self.hexbase_size > 1:
             for i in range(2, self.hexbase_size + 1):
@@ -494,15 +551,19 @@ class HexBase:
                             stride=self.get_stride(),
                         ),
                     )
-                    odd_kernels_even_columns = self.combine(
-                        odd_kernels_even_columns,
-                        self.process(
-                            self.get_padded_input(input, [i - 1, i - columns_mod2, x - 1, x]),
-                            getattr(self, "kernel" + str(i)),
-                            dilation=self.get_dilation((1, 2 * i)),
-                            stride=self.get_stride(),
-                        ),
-                    )
+                    if has_even_columns:
+                        odd_kernels_even_columns = self.combine(
+                            odd_kernels_even_columns,
+                            self.process(
+                                self.get_padded_input(input, [i - 1, i - columns_mod2, x - 1, x]),
+                                getattr(self, "kernel" + str(i)),
+                                dilation=self.get_dilation((1, 2 * i)),
+                                stride=self.get_stride(),
+                            ),
+                        )
+
+        if not has_even_columns:
+            return self.combine(even_kernels_all_columns, odd_kernels_odd_columns)
 
         odd_kernels_concatenated_columns = keras.ops.concatenate(
             (odd_kernels_odd_columns, odd_kernels_even_columns), self.dimensions
@@ -582,6 +643,8 @@ class _MaxPoolProcess:
     max pool. The "kernel" here is a window *size* tuple, as in the original.
     """
 
+    reduce = staticmethod(keras.ops.maximum)
+
     def __init__(self, dimensions):
         self.dimensions = dimensions
 
@@ -591,7 +654,7 @@ class _MaxPoolProcess:
             dh, dw = (1, 1) if dilation is None else dilation
             sh, sw = (1, 1) if stride is None else stride
             taps = [input[:, a * dh :: sh, b * dw :: sw, :] for a in range(kh) for b in range(kw)]
-            return _reduce_max_aligned(taps, (1, 2))
+            return _reduce_aligned(taps, (1, 2), self.reduce)
         else:
             kd, kh, kw = window
             dd, dh, dw = (1, 1, 1) if dilation is None else dilation
@@ -602,11 +665,24 @@ class _MaxPoolProcess:
                 for a in range(kh)
                 for b in range(kw)
             ]
-            return _reduce_max_aligned(taps, (1, 2, 3))
+            return _reduce_aligned(taps, (1, 2, 3), self.reduce)
 
 
-def _reduce_max_aligned(taps, axes):
-    """Element-wise max of window taps, each cropped to the common minimum size.
+class _SumPoolProcess(_MaxPoolProcess):
+    """Same window walk as _MaxPoolProcess, summing the taps instead.
+
+    Sums with ``+`` rather than keras.ops.add: on the TensorFlow backend
+    keras.ops.add rewrites some additions as bias_add, which fails on the
+    zero-width column group a narrow grid with a large stride produces.
+    keras.ops.maximum, used by MaxPool2d, has no such rewrite.
+    """
+
+    reduce = staticmethod(operator.add)
+
+
+def _reduce_aligned(taps, axes, op):
+    """Element-wise ``op`` (max or sum) of window taps, each cropped to the
+    common minimum size.
 
     Strided shifted slices differ in length by up to one along each axis; the
     last (most-shifted) tap is the shortest and its size equals the VALID-conv
@@ -622,7 +698,7 @@ def _reduce_max_aligned(taps, axes):
         for ax in axes:
             sl[ax] = slice(0, min_sizes[ax])
         t = t[tuple(sl)]
-        acc = t if acc is None else keras.ops.maximum(acc, t)
+        acc = t if acc is None else op(acc, t)
     return acc
 
 
@@ -832,6 +908,12 @@ class Conv2d(HexBase, keras.layers.Layer):
     dynamic (``None``); ``build`` raises a clear ``ValueError`` if either is. The
     channel dimension is always inferred from ``input_shape[-1]`` -- there is no
     constructor argument for it, matching standard Keras layers.
+
+    ``padding`` and ``activation`` are accepted as keyword arguments like in
+    ``keras.layers.Conv2D``, so either layer can be built from one set of
+    keyword arguments. ``activation`` takes the same values; ``padding`` only
+    accepts ``"same"``, since the hex grid is always padded and the output
+    size depends only on the stride.
     """
 
     def __init__(
@@ -843,6 +925,8 @@ class Conv2d(HexBase, keras.layers.Layer):
         debug=False,
         share_neighbors=False,
         name=None,
+        padding="same",
+        activation=None,
         **kwargs,
     ):
         keras.layers.Layer.__init__(self, name=name, **kwargs)
@@ -853,10 +937,12 @@ class Conv2d(HexBase, keras.layers.Layer):
         self.filters = filters
         self.kernel_size = kernel_size
         self.strides = strides
+        self.padding = _require_same_padding(padding)
+        self.activation = keras.activations.get(activation)
         self.hexbase_size = kernel_size
         self.hexbase_stride = strides
-        self.debug = debug
-        self.use_bias = use_bias
+        self.debug = _require_bool("debug", debug)
+        self.use_bias = _require_bool("use_bias", use_bias)
         self.share_neighbors = _normalize_share_neighbors(share_neighbors)
         self.dimensions = 2
         self.process = _ConvProcess(2)
@@ -961,8 +1047,10 @@ class Conv2d(HexBase, keras.layers.Layer):
     def call(self, input):
         self._materialize_kernels()
         if self.hexbase_stride == 1:
-            return self.operation_with_single_hexbase_stride(input)
-        return self.operation_with_arbitrary_stride(input)
+            out = self.operation_with_single_hexbase_stride(input)
+        else:
+            out = self.operation_with_arbitrary_stride(input)
+        return self.activation(out)
 
     def get_config(self):
         # NOTE: no 'in_channels' key -- it's not a constructor argument (always
@@ -974,6 +1062,8 @@ class Conv2d(HexBase, keras.layers.Layer):
                 "filters": self.filters,
                 "kernel_size": self.kernel_size,
                 "strides": self.strides,
+                "padding": self.padding,
+                "activation": keras.activations.serialize(self.activation),
                 "use_bias": self.use_bias,
                 "debug": self.debug,
                 "share_neighbors": self.share_neighbors,
@@ -994,6 +1084,10 @@ class Conv3d(HexBase, keras.layers.Layer):
     cannot be dynamic (``None``); ``build`` raises a clear ``ValueError`` if any
     is. The channel dimension is always inferred from ``input_shape[-1]`` -- there
     is no constructor argument for it, matching standard Keras layers.
+
+    ``activation`` takes the same values as in ``keras.layers.Conv3D``. Border
+    handling stays split as before: the hex plane is always padded, and the
+    depth axis is controlled by ``depth_padding``.
     """
 
     def __init__(
@@ -1006,6 +1100,7 @@ class Conv3d(HexBase, keras.layers.Layer):
         share_neighbors=False,
         depth_padding="valid",
         name=None,
+        activation=None,
         **kwargs,
     ):
         keras.layers.Layer.__init__(self, name=name, **kwargs)
@@ -1016,6 +1111,7 @@ class Conv3d(HexBase, keras.layers.Layer):
         self.filters = filters
         self.kernel_size = kernel_size
         self.strides = strides
+        self.activation = keras.activations.get(activation)
         if isinstance(kernel_size, int):
             self.hexbase_size = kernel_size
             self.depth_size = kernel_size
@@ -1030,8 +1126,8 @@ class Conv3d(HexBase, keras.layers.Layer):
             assert len(strides) == 2, "Need a tuple of two ints to set strides"
             self.hexbase_stride = strides[1]
             self.depth_stride = strides[0]
-        self.debug = debug
-        self.use_bias = use_bias
+        self.debug = _require_bool("debug", debug)
+        self.use_bias = _require_bool("use_bias", use_bias)
         self.share_neighbors = _normalize_share_neighbors(share_neighbors)
         # Depth (time) border handling. "valid" (default) = no depth pad, output
         # depth = D - kernel + 1 (original hexagdly behaviour). "same" = zero-pad
@@ -1146,8 +1242,10 @@ class Conv3d(HexBase, keras.layers.Layer):
             bot = self.depth_size - 1 - pad  # handles even kernels too
             input = keras.ops.pad(input, [[0, 0], [top, bot], [0, 0], [0, 0], [0, 0]])
         if self.hexbase_stride == 1:
-            return self.operation_with_single_hexbase_stride(input)
-        return self.operation_with_arbitrary_stride(input)
+            out = self.operation_with_single_hexbase_stride(input)
+        else:
+            out = self.operation_with_arbitrary_stride(input)
+        return self.activation(out)
 
     def get_config(self):
         # NOTE: no 'in_channels' key -- see the matching note in Conv2d.get_config.
@@ -1157,6 +1255,7 @@ class Conv3d(HexBase, keras.layers.Layer):
                 "filters": self.filters,
                 "kernel_size": self.kernel_size,
                 "strides": self.strides,
+                "activation": keras.activations.serialize(self.activation),
                 "use_bias": self.use_bias,
                 "debug": self.debug,
                 "share_neighbors": self.share_neighbors,
@@ -1392,16 +1491,27 @@ class MaxPool2d(HexBase, keras.layers.Layer):
 
     Precondition: the spatial dimensions (``H``, ``W``) must be statically known
     when the layer is called -- the hex addressing arithmetic reads them as ints.
+
+    The window size can be passed as ``pool_size`` (the keras.layers.MaxPool2D
+    name) or ``kernel_size`` (the HexagDLy name). ``padding`` only accepts
+    ``"same"``, as in :class:`Conv2d`. The arguments come in the
+    keras.layers.MaxPool2D order -- ``pool_size, strides, padding, name`` --
+    so Keras-style positional calls mean the same thing here.
     """
 
-    def __init__(self, kernel_size=1, strides=1, name=None, **kwargs):
-        _require_positive_int("kernel_size", kernel_size)
+    def __init__(
+        self, pool_size=None, strides=1, padding="same", name=None, kernel_size=None, **kwargs
+    ):
+        pool_size = _resolve_pool_size(pool_size, kernel_size)
+        _require_positive_int("pool_size", pool_size)
         _require_positive_int("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
-        self.kernel_size = kernel_size
+        self.pool_size = pool_size
+        self.kernel_size = pool_size
         self.strides = strides
-        self.hexbase_size = kernel_size
+        self.padding = _require_same_padding(padding)
+        self.hexbase_size = pool_size
         self.hexbase_stride = strides
         self.dimensions = 2
         self.process = _MaxPoolProcess(2)
@@ -1416,7 +1526,66 @@ class MaxPool2d(HexBase, keras.layers.Layer):
 
     def get_config(self):
         config = super().get_config()
-        config.update({"kernel_size": self.kernel_size, "strides": self.strides})
+        config.update(
+            {"pool_size": self.pool_size, "strides": self.strides, "padding": self.padding}
+        )
+        return config
+
+
+@keras.saving.register_keras_serializable(package="hexagdly_tf")
+class AvgPool2d(HexBase, keras.layers.Layer):
+    """2D hexagonal average pooling. Channels-last.
+
+    Each output cell is the mean over the cells of its hexagonal window (the
+    same window as :class:`MaxPool2d`) that lie inside the grid. Positions past
+    the grid border count in neither the sum nor the divisor, like
+    ``keras.layers.AveragePooling2D(padding="same")``. Cells inside the grid
+    always count, including empty (zero) ones such as the cells around a
+    mapped camera image -- the same convention :class:`Conv2d` and
+    :class:`MaxPool2d` apply to them.
+
+    Arguments match :class:`MaxPool2d`. Not exportable to hls4ml yet:
+    ``patch_model_for_hls`` raises on it.
+    """
+
+    def __init__(
+        self, pool_size=None, strides=1, padding="same", name=None, kernel_size=None, **kwargs
+    ):
+        pool_size = _resolve_pool_size(pool_size, kernel_size)
+        _require_positive_int("pool_size", pool_size)
+        _require_positive_int("strides", strides)
+        keras.layers.Layer.__init__(self, name=name, **kwargs)
+        HexBase.__init__(self)
+        self.pool_size = pool_size
+        self.kernel_size = pool_size
+        self.strides = strides
+        self.padding = _require_same_padding(padding)
+        self.hexbase_size = pool_size
+        self.hexbase_stride = strides
+        self.dimensions = 2
+        self.process = _SumPoolProcess(2)
+        self.combine = operator.add  # see _SumPoolProcess for why not keras.ops.add
+        for i in range(self.hexbase_size + 1):
+            setattr(self, "kernel" + str(i), (1 + 2 * self.hexbase_size - i, 1 if i == 0 else 2))
+
+    def _window_sum(self, input):
+        if self.hexbase_stride == 1:
+            return self.operation_with_single_hexbase_stride(input)
+        return self.operation_with_arbitrary_stride(input)
+
+    def call(self, input):
+        # Summing a tensor of ones over the same windows counts the in-grid
+        # cells of each window, since the hex padding is zeros. The window
+        # centre is always in the grid, so the count is never zero.
+        total = self._window_sum(input)
+        count = self._window_sum(keras.ops.ones_like(input[..., :1]))
+        return total / count
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {"pool_size": self.pool_size, "strides": self.strides, "padding": self.padding}
+        )
         return config
 
 
@@ -1427,13 +1596,18 @@ class MaxPool3d(HexBase, keras.layers.Layer):
     Precondition: the spatial dimensions (``D``, ``H``, ``W``) must be statically
     known when the layer is called -- the hex addressing arithmetic reads them as
     ints.
+
+    The window size can be passed as ``pool_size`` (the Keras name) or
+    ``kernel_size`` (the HexagDLy name).
     """
 
-    def __init__(self, kernel_size=1, strides=1, name=None, **kwargs):
-        _require_positive_int_or_pair("kernel_size", kernel_size)
+    def __init__(self, pool_size=None, strides=1, name=None, kernel_size=None, **kwargs):
+        kernel_size = _resolve_pool_size(pool_size, kernel_size)
+        _require_positive_int_or_pair("pool_size", kernel_size)
         _require_positive_int_or_pair("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
+        self.pool_size = kernel_size
         self.kernel_size = kernel_size
         self.strides = strides
         if isinstance(kernel_size, int):
@@ -1465,5 +1639,5 @@ class MaxPool3d(HexBase, keras.layers.Layer):
 
     def get_config(self):
         config = super().get_config()
-        config.update({"kernel_size": self.kernel_size, "strides": self.strides})
+        config.update({"pool_size": self.pool_size, "strides": self.strides})
         return config

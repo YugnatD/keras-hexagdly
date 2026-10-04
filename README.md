@@ -12,7 +12,7 @@ is built on [Keras 3](https://keras.io) so it runs on any backend
 (TensorFlow, JAX, PyTorch) and uses a channels-last (`NHWC`/`NDHWC`) tensor
 layout instead of PyTorch's channels-first.
 
-It also adds three functionalities that do not exist in upstream HexagDLy:
+It also adds functionality that does not exist in upstream HexagDLy:
 
 - **`share_neighbors`** (`Conv2d`, `Conv3d`): ties the weights of several cells
   of a hexagonal kernel together instead of giving every cell its own
@@ -25,6 +25,26 @@ It also adds three functionalities that do not exist in upstream HexagDLy:
   (output depth shrinks by `kernel - 1`).
 - **[hls4ml export](#fpga-export-via-hls4ml)** for FPGA synthesis, currently
   limited to `io_stream` and the 2D layers.
+- **`AvgPool2d`**: hexagonal average pooling over the same window as
+  `MaxPool2d` (upstream HexagDLy only provides max pooling).
+- **Keras-compatible arguments**: `Conv2d` accepts `padding` and `activation`,
+  and the pooling layers accept `pool_size`, so the hex layers can be built from
+  the same keyword arguments as `keras.layers.Conv2D`, `MaxPool2D` and
+  `AveragePooling2D`:
+
+  ```python
+  conv_cls, pool_cls = (hgly.Conv2d, hgly.MaxPool2d) if hexagonal else (
+      keras.layers.Conv2D, keras.layers.MaxPool2D)
+  x = conv_cls(filters=32, kernel_size=1, padding="same", activation="relu")(x)
+  x = pool_cls(pool_size=1, strides=2)(x)
+  ```
+
+  `padding` only accepts `"same"`: the hex grid is always padded, so the output
+  size depends only on the stride. `kernel_size` is still accepted on the
+  pooling layers as an alias of `pool_size`. The pooling layers also take
+  their arguments in the Keras positional order; for `Conv2d`, pass anything
+  after `strides` by keyword (its fourth positional argument is `use_bias`,
+  and a Keras-style positional `padding` there raises an error).
 
 Weights trained with [pytorch-hexagdly](https://github.com/YugnatD/pytorch-hexagdly)
 can be loaded into these layers -- see
@@ -169,12 +189,18 @@ RTL co-simulation.
 |---|---|---|
 | `Conv2d`, `MaxPool2d` | **supported** | not supported |
 | `Conv3d`, `MaxPool3d` | not supported | not supported |
+| `AvgPool2d` | not supported | not supported |
 
 The unsupported paths are not silently wrong -- they raise. `patch_model_for_hls`
 raises `NotImplementedError` on a 3D layer, and `check_hls_config` raises on
 `io_type="io_parallel"`. Both accept `allow_unvalidated=True` if you want to
 experiment with them anyway, but nothing about their numerics or resource usage
-is guaranteed.
+is guaranteed. `AvgPool2d` has no export path at all yet, so
+`patch_model_for_hls` refuses it unconditionally.
+
+A `Conv2d` built with `activation=` keeps it in the exported model: the
+activation is re-applied as a separate `keras.layers.Activation` after the
+layer's replacement.
 
 `hex_reuse_config` matters more than it looks: hls4ml's
 `config_from_keras_model(granularity="name")` writes `ReuseFactor=1` into every

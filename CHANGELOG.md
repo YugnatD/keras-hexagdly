@@ -3,6 +3,64 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.5.0] - 2026-10-04
+
+### Added
+
+- **Keras-compatible arguments, so the hex layers can be swapped for the
+  Keras ones from a single set of keyword arguments.** Asked for in the
+  CTLearn integration, which picks `hgly.Conv2d` or `keras.layers.Conv2D`
+  with a config option and should not need a wrapper around either.
+  - `Conv2d(..., activation=None)` and `Conv3d(..., activation=None)`: same
+    values as `keras.layers.Conv2D`, applied to the layer output and kept in
+    `get_config()`, so a saved model still applies it after reloading.
+    `patch_model_for_hls` keeps it too: its replacements are rebuilt from the
+    layer's weights and geometry only, so the activation is re-applied as a
+    separate `keras.layers.Activation` after each replaced layer.
+  - `Conv2d(..., padding="same")`: the hex grid is always padded so the
+    output size depends only on the stride, so only `"same"` is accepted;
+    anything else raises a `ValueError` instead of being ignored. Not added
+    to `Conv3d`, where `depth_padding` already covers the depth axis.
+  - `MaxPool2d`/`MaxPool3d` take the window size as `pool_size`, the Keras
+    name. `kernel_size` is still accepted as an alias, so existing code and
+    saved 0.4.x models keep working; passing both raises. `get_config()` now
+    writes `pool_size`. `MaxPool2d` also accepts `padding="same"`, and its
+    arguments follow the `keras.layers.MaxPool2D` order -- `pool_size,
+    strides, padding, name` -- so positional calls mean the same thing too.
+- **`AvgPool2d`**: hexagonal average pooling over the same window as
+  `MaxPool2d`. Each output cell is the mean of the window's cells that lie
+  inside the grid: positions past the grid border count in neither the sum
+  nor the divisor, like `keras.layers.AveragePooling2D(padding="same")`,
+  while empty cells inside the grid count as zeros, as they do for `Conv2d`
+  and `MaxPool2d`. It has no hls4ml export path yet: `patch_model_for_hls`
+  raises `NotImplementedError` on it rather than letting it reach hls4ml as
+  an unknown layer.
+
+### Changed
+
+- **`MaxPool2d`'s third positional argument is now `padding`, not `name`.**
+  A 0.4.x call passing the name positionally, such as
+  `MaxPool2d(2, 2, "pool1")`, now raises a `ValueError` instead of naming the
+  layer. Pass `name=` as a keyword.
+- **`Conv2d`/`Conv3d` require `use_bias` and `debug` to be booleans** (a
+  numpy bool is fine) and raise a `TypeError` otherwise. `use_bias` sits in
+  the fourth positional slot, where `keras.layers.Conv2D` takes `padding`, so
+  a Keras-style `Conv2d(8, 1, 1, "same")` used to mean `use_bias="same"`,
+  i.e. `True`, without any error.
+
+### Fixed
+
+- **A convolution with a stride at least as large as the grid width
+  crashed** on the TensorFlow and torch backends -- a stride-2 `Conv2d` on a
+  grid only 1 or 2 columns wide, or a stride-1 `Conv2d`/`Conv3d` on a single
+  column (where a ResNet block lands right after a stride-2 layer). Upstream
+  HexagDLy fails the same way. The even columns of such an output are empty,
+  but were computed anyway from a zero-width input; they are now skipped.
+  This shows up at the end of deep networks: five or six stride-2
+  downsamplings take a 39-55-column camera image to 2 or 1 columns. Every
+  other configuration computes exactly as before. The jax backend already
+  handled these cases, and its results are unchanged.
+
 ## [0.4.2] - 2026-08-28
 
 ### Fixed

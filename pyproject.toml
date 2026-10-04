@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "keras-hexagdly"
-version = "0.4.2"
+version = "0.5.0"
 description = "Hexagonal convolution and pooling layers for Keras 3 (TensorFlow / JAX / PyTorch) — a HexagDLy port"
 readme = "README.md"
 license = { file = "LICENSE" }

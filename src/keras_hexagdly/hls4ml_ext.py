@@ -532,9 +532,19 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
         NotImplementedError: for 3D layers unless allow_unvalidated=True.
         ValueError:          if ``strategy`` is not a recognised value.
         NotImplementedError: for MaxPool3d layers, or Conv3d with depth_stride > 1.
+        NotImplementedError: for AvgPool2d layers.
+
+    A Conv2d/Conv3d ``activation`` is kept: it is re-applied as a separate
+    ``keras.layers.Activation`` after the layer's replacement.
     """
     if not isinstance(model, keras.Model):
         raise TypeError(f"Expected a keras.Model, got {type(model).__name__}.")
+
+    # No replacement exists for these, so left alone they would reach hls4ml as
+    # an unknown custom layer and fail there with an unrelated error.
+    unsupported = [l.name for l in model.layers if isinstance(l, hgly.AvgPool2d)]
+    if unsupported:
+        raise NotImplementedError(f"AvgPool2d layers {unsupported} have no hls4ml export path yet.")
 
     if not allow_unvalidated:
         volumetric = [l.name for l in model.layers if isinstance(l, (hgly.Conv3d, hgly.MaxPool3d))]
@@ -571,6 +581,12 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
         fn = replacements.get(type(layer))
         if fn is not None:
             y = fn(layer, x)
+            # Replacements are rebuilt from the layer's weights and geometry
+            # only, so a fused activation has to be put back explicitly or it
+            # would silently vanish from the exported model.
+            activation = getattr(layer, "activation", None)
+            if activation is not None and activation is not keras.activations.linear:
+                y = keras.layers.Activation(activation, name=f"{layer.name}_activation")(y)
         else:
             y = layer(x) if not isinstance(x, list) else layer(x)
 
