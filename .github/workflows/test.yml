@@ -67,8 +67,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # Pinned: an unpinned ruff picks up new default rules on every release
+      # and can turn this job red without any change here. Bump deliberately.
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.16.5
       - name: Ruff check
         run: ruff check src/ tests/
       - name: Ruff format check

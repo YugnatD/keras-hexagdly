@@ -36,10 +36,24 @@ import keras_hexagdly as hgly
 EXPECTED_RATIO = np.sqrt(2.0)
 RATIO_TOLERANCE = 0.25
 
+# One weight draw gives one sample of the ratio. With few independent
+# weights -- share_neighbors="ring" at kernel_size=1 has only two rings --
+# that sample scatters enough to leave the band in roughly 2% of unseeded
+# draws, which made CI fail at random. Seeding makes every run identical, and
+# averaging several draws keeps the value well inside the band, so a change
+# of random stream between Keras versions cannot tip it over either.
+N_DRAWS = 8
 
-def _output_input_std_ratio(layer, x):
-    y = keras.ops.convert_to_numpy(layer(keras.ops.convert_to_tensor(x)))
-    return float(y.std() / x.std())
+
+def _output_input_std_ratio(make_layer, x):
+    """Mean output/input std ratio over N_DRAWS seeded weight draws."""
+    x_t = keras.ops.convert_to_tensor(x)
+    ratios = []
+    for seed in range(N_DRAWS):
+        keras.utils.set_random_seed(seed)
+        y = keras.ops.convert_to_numpy(make_layer()(x_t))
+        ratios.append(float(y.std() / x.std()))
+    return float(np.mean(ratios))
 
 
 @pytest.fixture
@@ -55,8 +69,9 @@ def test_conv2d_output_scale_independent_of_kernel_size(x, kernel_size):
     """The core regression check: the std ratio must stay near sqrt(2)
     regardless of kernel_size (i.e. regardless of how many sub-kernels the
     layer is internally split across)."""
-    layer = hgly.Conv2d(16, kernel_size=kernel_size, use_bias=False)
-    ratio = _output_input_std_ratio(layer, x)
+    ratio = _output_input_std_ratio(
+        lambda: hgly.Conv2d(16, kernel_size=kernel_size, use_bias=False), x
+    )
     assert abs(ratio - EXPECTED_RATIO) < RATIO_TOLERANCE, (
         f"kernel_size={kernel_size}: output/input std ratio {ratio:.3f} is far "
         f"from the He-init target {EXPECTED_RATIO:.3f} -- looks like the "
@@ -68,8 +83,10 @@ def test_conv2d_output_scale_independent_of_kernel_size(x, kernel_size):
 def test_conv2d_share_neighbors_output_scale_independent_of_kernel_size(x, kernel_size):
     """Same property must hold for the share_neighbors=ring weight path,
     which uses a separate init call (ring_weights) from the non-shared path."""
-    layer = hgly.Conv2d(16, kernel_size=kernel_size, use_bias=False, share_neighbors=True)
-    ratio = _output_input_std_ratio(layer, x)
+    ratio = _output_input_std_ratio(
+        lambda: hgly.Conv2d(16, kernel_size=kernel_size, use_bias=False, share_neighbors=True),
+        x,
+    )
     assert abs(ratio - EXPECTED_RATIO) < RATIO_TOLERANCE, (
         f"kernel_size={kernel_size} share_neighbors=ring: ratio {ratio:.3f} is "
         f"far from {EXPECTED_RATIO:.3f}."
@@ -81,10 +98,10 @@ def test_conv2d_ratio_does_not_grow_with_kernel_size(x):
     ratio grew roughly as sqrt(number of sub-kernels) = sqrt(kernel_size+1).
     Build kernel_size=1 (2 sub-kernels) and kernel_size=3 (4 sub-kernels)
     and confirm they land close together, not ~sqrt(2) apart."""
-    ratios = []
-    for kernel_size in (1, 3):
-        layer = hgly.Conv2d(16, kernel_size=kernel_size, use_bias=False)
-        ratios.append(_output_input_std_ratio(layer, x))
+    ratios = [
+        _output_input_std_ratio(lambda k=k: hgly.Conv2d(16, kernel_size=k, use_bias=False), x)
+        for k in (1, 3)
+    ]
     assert abs(ratios[0] - ratios[1]) < RATIO_TOLERANCE, (
         f"kernel_size=1 ratio={ratios[0]:.3f} vs kernel_size=3 ratio={ratios[1]:.3f} "
         "-- growing with kernel_size is exactly the pre-fix bug symptom."
@@ -97,8 +114,7 @@ def test_conv3d_output_scale_matches_conv2d_target():
     independently rather than assuming Conv2d's fix covers it."""
     rng = np.random.default_rng(1)
     x = rng.standard_normal((32, 3, 9, 9, 4)).astype("float32")
-    layer = hgly.Conv3d(16, kernel_size=1, use_bias=False)
-    ratio = _output_input_std_ratio(layer, x)
+    ratio = _output_input_std_ratio(lambda: hgly.Conv3d(16, kernel_size=1, use_bias=False), x)
     assert abs(ratio - EXPECTED_RATIO) < RATIO_TOLERANCE, (
         f"Conv3d kernel_size=1: ratio {ratio:.3f} far from {EXPECTED_RATIO:.3f}."
     )
