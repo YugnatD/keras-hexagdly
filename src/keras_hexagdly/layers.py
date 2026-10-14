@@ -111,6 +111,76 @@ def _require_positive_int_or_pair(name, value):
     _require_positive_int(f"{name}[1]", b)
 
 
+def _require_nonnegative_int(name, value):
+    """Like _require_positive_int, but also accepts 0.
+
+    kernel_size/pool_size=0 is the pointwise case: a plain per-cell channel
+    projection, no neighbours at all (0 hexagonal rings). strides must stay
+    strictly positive, so this is only used for kernel_size/pool_size.
+    """
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}.")
+
+
+_KERNEL_SIZE_UNITS = ("rings", "pixels")
+
+
+def _require_kernel_size_unit(value):
+    """Validate ``kernel_size_unit`` and return it.
+
+    "rings" (default): kernel_size already is the hexagonal ring count --
+    the number of hexagonal rings of neighbours around the centre cell, this
+    port's and upstream HexagDLy's long-standing convention.
+
+    "pixels": kernel_size is read as a square-kernel width instead, as in
+    indexedconv's MaskedConv2d, so the same value means a comparable extent
+    on both grids. See _hex_radius for the conversion.
+    """
+    if value not in _KERNEL_SIZE_UNITS:
+        raise ValueError(f"kernel_size_unit must be one of {_KERNEL_SIZE_UNITS}, got {value!r}.")
+    return value
+
+
+def _hex_radius(kernel_size, kernel_size_unit):
+    """Convert a user-facing kernel_size to the ring count (hexbase_size)
+    the hex machinery uses internally.
+
+    unit="rings": kernel_size already is the ring count, unchanged.
+    unit="pixels": kernel_size is a square-kernel width, radius = size // 2 --
+    so 1 is pointwise (0 rings, a plain per-cell projection), 3 is the 7-cell
+    hexagon (1 ring), 5 the 19-cell one (2 rings), matching a 3x3/5x5 square
+    kernel's extent. Even widths have no exact hex equivalent; they still
+    resolve (floored), matching e.g. a default pool_size=2 to 1 ring rather
+    than rejecting it.
+    """
+    return kernel_size if kernel_size_unit == "rings" else kernel_size // 2
+
+
+def _require_depth_hex_kernel_size(name, value):
+    """Validate the Conv3d/MaxPool3d ``kernel_size`` convention and return
+    ``(depth, hex)``.
+
+    A bare int sets both axes to the same value and must stay positive --
+    there is no way to decouple them, and a 0-depth kernel is degenerate (no
+    time frames at all), so a bare 0 is rejected even though 0 rings is
+    otherwise valid. A 2-tuple sets the axes independently: the depth element
+    must still be positive, but the hex element can be 0 (pointwise, e.g.
+    ``(3, 0)``), using _hex_radius like the 2D layers.
+    """
+    if isinstance(value, int):
+        _require_positive_int(name, value)
+        return value, value
+    try:
+        depth, hexp = value
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{name} must be a positive integer or a 2-tuple of (depth, hex), got {value!r}."
+        )
+    _require_positive_int(f"{name}[0]", depth)
+    _require_nonnegative_int(f"{name}[1]", hexp)
+    return depth, hexp
+
+
 def _require_same_padding(padding):
     """Validate ``padding`` for the 2D hex layers.
 
@@ -500,6 +570,13 @@ class HexBase:
             stride=(1, 1) if self.dimensions == 2 else (self.depth_stride, 1, 1),
             **self.kwargs,
         )
+        # hexbase_size=0 (pointwise, no neighbours at all) has no kernel1+, so
+        # kernel0 alone -- already a full-resolution per-cell op, no odd/even
+        # column split needed -- is the entire output. Returning early avoids
+        # falling into the concatenation below with the odd_kernels_* lists
+        # still empty.
+        if self.hexbase_size == 0:
+            return even_kernels_all_columns
         if self.hexbase_size >= 1:
             odd_kernels_odd_columns = self.process(
                 self.get_padded_input(
@@ -914,6 +991,11 @@ class Conv2d(HexBase, keras.layers.Layer):
     keyword arguments. ``activation`` takes the same values; ``padding`` only
     accepts ``"same"``, since the hex grid is always padded and the output
     size depends only on the stride.
+
+    ``kernel_size`` counts hexagonal rings by default (``kernel_size_unit=
+    "rings"``): ``0`` is a plain per-cell projection (no neighbours), ``1``
+    the 7-cell hexagon, and so on. ``kernel_size_unit="pixels"`` reads it as
+    a square-kernel width instead -- see :func:`_hex_radius`.
     """
 
     def __init__(
@@ -927,19 +1009,21 @@ class Conv2d(HexBase, keras.layers.Layer):
         name=None,
         padding="same",
         activation=None,
+        kernel_size_unit="rings",
         **kwargs,
     ):
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
-        _require_positive_int("kernel_size", kernel_size)
+        _require_nonnegative_int("kernel_size", kernel_size)
         _require_positive_int("strides", strides)
         self.in_channels = None
         self.filters = filters
         self.kernel_size = kernel_size
+        self.kernel_size_unit = _require_kernel_size_unit(kernel_size_unit)
         self.strides = strides
         self.padding = _require_same_padding(padding)
         self.activation = keras.activations.get(activation)
-        self.hexbase_size = kernel_size
+        self.hexbase_size = _hex_radius(kernel_size, self.kernel_size_unit)
         self.hexbase_stride = strides
         self.debug = _require_bool("debug", debug)
         self.use_bias = _require_bool("use_bias", use_bias)
@@ -1067,6 +1151,7 @@ class Conv2d(HexBase, keras.layers.Layer):
                 "use_bias": self.use_bias,
                 "debug": self.debug,
                 "share_neighbors": self.share_neighbors,
+                "kernel_size_unit": self.kernel_size_unit,
             }
         )
         return config
@@ -1088,6 +1173,10 @@ class Conv3d(HexBase, keras.layers.Layer):
     ``activation`` takes the same values as in ``keras.layers.Conv3D``. Border
     handling stays split as before: the hex plane is always padded, and the
     depth axis is controlled by ``depth_padding``.
+
+    ``kernel_size``'s hex element follows ``kernel_size_unit`` like
+    :class:`Conv2d` -- the depth element is never a hex radius, so it always
+    stays the literal value regardless of the unit. See :func:`_hex_radius`.
     """
 
     def __init__(
@@ -1101,24 +1190,21 @@ class Conv3d(HexBase, keras.layers.Layer):
         depth_padding="valid",
         name=None,
         activation=None,
+        kernel_size_unit="rings",
         **kwargs,
     ):
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
-        _require_positive_int_or_pair("kernel_size", kernel_size)
+        depth_size, hex_kernel_size = _require_depth_hex_kernel_size("kernel_size", kernel_size)
         _require_positive_int_or_pair("strides", strides)
         self.in_channels = None
         self.filters = filters
         self.kernel_size = kernel_size
+        self.kernel_size_unit = _require_kernel_size_unit(kernel_size_unit)
         self.strides = strides
         self.activation = keras.activations.get(activation)
-        if isinstance(kernel_size, int):
-            self.hexbase_size = kernel_size
-            self.depth_size = kernel_size
-        else:
-            assert len(kernel_size) == 2, "Need a tuple of two ints to set kernel size"
-            self.hexbase_size = kernel_size[1]
-            self.depth_size = kernel_size[0]
+        self.depth_size = depth_size
+        self.hexbase_size = _hex_radius(hex_kernel_size, self.kernel_size_unit)
         if isinstance(strides, int):
             self.hexbase_stride = strides
             self.depth_stride = strides
@@ -1260,6 +1346,7 @@ class Conv3d(HexBase, keras.layers.Layer):
                 "debug": self.debug,
                 "share_neighbors": self.share_neighbors,
                 "depth_padding": self.depth_padding,
+                "kernel_size_unit": self.kernel_size_unit,
             }
         )
         return config
@@ -1497,21 +1584,31 @@ class MaxPool2d(HexBase, keras.layers.Layer):
     ``"same"``, as in :class:`Conv2d`. The arguments come in the
     keras.layers.MaxPool2D order -- ``pool_size, strides, padding, name`` --
     so Keras-style positional calls mean the same thing here.
+
+    ``pool_size`` follows ``kernel_size_unit`` like :class:`Conv2d`.
     """
 
     def __init__(
-        self, pool_size=None, strides=1, padding="same", name=None, kernel_size=None, **kwargs
+        self,
+        pool_size=None,
+        strides=1,
+        padding="same",
+        name=None,
+        kernel_size=None,
+        kernel_size_unit="rings",
+        **kwargs,
     ):
         pool_size = _resolve_pool_size(pool_size, kernel_size)
-        _require_positive_int("pool_size", pool_size)
+        _require_nonnegative_int("pool_size", pool_size)
         _require_positive_int("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
         self.pool_size = pool_size
         self.kernel_size = pool_size
+        self.kernel_size_unit = _require_kernel_size_unit(kernel_size_unit)
         self.strides = strides
         self.padding = _require_same_padding(padding)
-        self.hexbase_size = pool_size
+        self.hexbase_size = _hex_radius(pool_size, self.kernel_size_unit)
         self.hexbase_stride = strides
         self.dimensions = 2
         self.process = _MaxPoolProcess(2)
@@ -1527,7 +1624,12 @@ class MaxPool2d(HexBase, keras.layers.Layer):
     def get_config(self):
         config = super().get_config()
         config.update(
-            {"pool_size": self.pool_size, "strides": self.strides, "padding": self.padding}
+            {
+                "pool_size": self.pool_size,
+                "strides": self.strides,
+                "padding": self.padding,
+                "kernel_size_unit": self.kernel_size_unit,
+            }
         )
         return config
 
@@ -1546,21 +1648,31 @@ class AvgPool2d(HexBase, keras.layers.Layer):
 
     Arguments match :class:`MaxPool2d`. Not exportable to hls4ml yet:
     ``patch_model_for_hls`` raises on it.
+
+    ``pool_size`` follows ``kernel_size_unit`` like :class:`Conv2d`.
     """
 
     def __init__(
-        self, pool_size=None, strides=1, padding="same", name=None, kernel_size=None, **kwargs
+        self,
+        pool_size=None,
+        strides=1,
+        padding="same",
+        name=None,
+        kernel_size=None,
+        kernel_size_unit="rings",
+        **kwargs,
     ):
         pool_size = _resolve_pool_size(pool_size, kernel_size)
-        _require_positive_int("pool_size", pool_size)
+        _require_nonnegative_int("pool_size", pool_size)
         _require_positive_int("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
         self.pool_size = pool_size
         self.kernel_size = pool_size
+        self.kernel_size_unit = _require_kernel_size_unit(kernel_size_unit)
         self.strides = strides
         self.padding = _require_same_padding(padding)
-        self.hexbase_size = pool_size
+        self.hexbase_size = _hex_radius(pool_size, self.kernel_size_unit)
         self.hexbase_stride = strides
         self.dimensions = 2
         self.process = _SumPoolProcess(2)
@@ -1584,7 +1696,12 @@ class AvgPool2d(HexBase, keras.layers.Layer):
     def get_config(self):
         config = super().get_config()
         config.update(
-            {"pool_size": self.pool_size, "strides": self.strides, "padding": self.padding}
+            {
+                "pool_size": self.pool_size,
+                "strides": self.strides,
+                "padding": self.padding,
+                "kernel_size_unit": self.kernel_size_unit,
+            }
         )
         return config
 
@@ -1598,24 +1715,31 @@ class MaxPool3d(HexBase, keras.layers.Layer):
     ints.
 
     The window size can be passed as ``pool_size`` (the Keras name) or
-    ``kernel_size`` (the HexagDLy name).
+    ``kernel_size`` (the HexagDLy name). Its hex element follows
+    ``kernel_size_unit`` like :class:`Conv3d` -- the depth element always
+    stays the literal value.
     """
 
-    def __init__(self, pool_size=None, strides=1, name=None, kernel_size=None, **kwargs):
+    def __init__(
+        self,
+        pool_size=None,
+        strides=1,
+        name=None,
+        kernel_size=None,
+        kernel_size_unit="rings",
+        **kwargs,
+    ):
         kernel_size = _resolve_pool_size(pool_size, kernel_size)
-        _require_positive_int_or_pair("pool_size", kernel_size)
+        depth_size, hex_kernel_size = _require_depth_hex_kernel_size("pool_size", kernel_size)
         _require_positive_int_or_pair("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
         self.pool_size = kernel_size
         self.kernel_size = kernel_size
+        self.kernel_size_unit = _require_kernel_size_unit(kernel_size_unit)
         self.strides = strides
-        if isinstance(kernel_size, int):
-            self.hexbase_size = kernel_size
-            self.depth_size = kernel_size
-        else:
-            self.hexbase_size = kernel_size[1]
-            self.depth_size = kernel_size[0]
+        self.depth_size = depth_size
+        self.hexbase_size = _hex_radius(hex_kernel_size, self.kernel_size_unit)
         if isinstance(strides, int):
             self.hexbase_stride = strides
             self.depth_stride = strides
@@ -1639,5 +1763,11 @@ class MaxPool3d(HexBase, keras.layers.Layer):
 
     def get_config(self):
         config = super().get_config()
-        config.update({"pool_size": self.pool_size, "strides": self.strides})
+        config.update(
+            {
+                "pool_size": self.pool_size,
+                "strides": self.strides,
+                "kernel_size_unit": self.kernel_size_unit,
+            }
+        )
         return config

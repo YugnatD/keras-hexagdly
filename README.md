@@ -27,6 +27,9 @@ It also adds functionality that does not exist in upstream HexagDLy:
   limited to `io_stream` and the 2D layers.
 - **`AvgPool2d`**: hexagonal average pooling over the same window as
   `MaxPool2d` (upstream HexagDLy only provides max pooling).
+- **`kernel_size_unit="pixels"`** and `kernel_size`/`pool_size=0`: an
+  alternative kernel-size convention and the true 1x1 it needs, [described
+  below](#new-kernel_size_unit----reading-kernel_size-as-a-square-kernel-width).
 - **Keras-compatible arguments**: `Conv2d` accepts `padding` and `activation`,
   and the pooling layers accept `pool_size`, so the hex layers can be built from
   the same keyword arguments as `keras.layers.Conv2D`, `MaxPool2D` and
@@ -130,6 +133,32 @@ hexconv = hgly.Conv2d(filters=3, kernel_size=2, share_neighbors="ring")
 ```
 
 `share_neighbors=True` is accepted as an alias for `"ring"`.
+
+### New: `kernel_size_unit` -- reading `kernel_size` as a square-kernel width
+
+`kernel_size` counts hexagonal rings by default (`kernel_size_unit="rings"`):
+`kernel_size=1` is the 7-cell hexagon (a cell and its six neighbours),
+`kernel_size=2` the 19-cell one. The same number therefore means a much
+larger kernel than on a square grid, where `kernel_size=3` is 9 cells.
+
+`kernel_size_unit="pixels"` reads `kernel_size` as a square-kernel width
+instead -- radius = `kernel_size // 2` -- so the same architecture means a
+comparable receptive field on both grids, as in
+[indexedconv](https://github.com/IndexedConv/IndexedConv)'s `MaskedConv2d`:
+
+```python
+hgly.Conv2d(filters=32, kernel_size=3, kernel_size_unit="pixels")  # the 7-cell hexagon
+hgly.Conv2d(filters=32, kernel_size=1, kernel_size_unit="pixels")  # a plain 1x1, no neighbours
+```
+
+`kernel_size=0` (0 rings, a plain per-cell channel projection with no
+neighbours) is what `kernel_size_unit="pixels"` needs to express a true 1x1,
+and is accepted directly in `"rings"` mode too. Even widths have no exact
+hex equivalent and floor to the ring count of the odd width below them
+(`kernel_size=2` in `"pixels"` mode resolves like `1`), rather than being
+rejected. Applies to `MaxPool2d`/`AvgPool2d` (via `pool_size`) the same way;
+on `Conv3d`/`MaxPool3d`, only the hex element of the `(depth, hex)` size
+follows the unit, since depth is never a hex radius.
 
 ### New: same-padded temporal convolution (Conv3d)
 

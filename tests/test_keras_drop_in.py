@@ -338,3 +338,182 @@ def test_hls_export_refuses_avgpool():
     model = keras.Model(inp, hgly.AvgPool2d(1)(inp))
     with pytest.raises(NotImplementedError, match="AvgPool2d"):
         patch_model_for_hls(model)
+
+
+# ---- pointwise (kernel_size=0) -------------------------------------------------
+#
+# 0 rings is a plain per-cell channel projection: no neighbours at all. See
+# CHANGELOG.md [0.6.0] and https://github.com/ctlearn-project/ctlearn/issues/302.
+
+
+def test_conv2d_pointwise_matches_a_plain_dense_projection(x):
+    """No neighbour mixing at all, independent of debug mode: every output
+    cell is exactly that same cell's input vector times the (1x1) kernel,
+    plus bias -- a manual per-pixel matmul, not run through the hex
+    machinery at all."""
+    layer = hgly.Conv2d(5, kernel_size=0)
+    out = _numpy(layer(x))
+    weight = _numpy(layer.kernel0)[0, 0]  # (in, out), squeezed from (1, 1, in, out)
+    bias = _numpy(layer.bias_tensor)
+    expected = x @ weight + bias
+    np.testing.assert_allclose(out, expected, atol=1e-5)
+
+
+def test_conv2d_pointwise_has_no_border_effect():
+    """Unlike kernel_size>=1, a pointwise conv pads nothing, so debug weights
+    (all 1s) give the exact channel sum at every cell, borders included --
+    kernel_size>=1 would undercount at the border, where some neighbours
+    fall outside the grid."""
+    image = RNG.standard_normal((1, H, W, C)).astype("float32")
+    out = _numpy(hgly.Conv2d(1, kernel_size=0, debug=True)(image))[..., 0]
+    np.testing.assert_allclose(out, image.sum(axis=-1) + 1.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("strides", [1, 2, 3])
+def test_conv2d_pointwise_strided_output_is_a_subset_of_the_input(strides):
+    """A strided pointwise conv only ever subsamples: debug weights (all 1s,
+    no bias) make every output value the channel sum of some single input
+    cell, never a combination of several -- which a non-pointwise kernel, or
+    a genuine spatial mixing bug, would produce instead."""
+    image = RNG.standard_normal((1, H, W, C)).astype("float32")
+    out = _numpy(hgly.Conv2d(1, kernel_size=0, strides=strides, use_bias=False, debug=True)(image))
+    possible_sums = image.sum(axis=-1)
+    for value in out.ravel():
+        assert np.any(np.isclose(possible_sums, value, atol=1e-5))
+
+
+def test_maxpool2d_pool_size_zero_is_the_identity_at_stride_one(x):
+    """A single-cell window: the max of one element is that element."""
+    np.testing.assert_allclose(_numpy(hgly.MaxPool2d(0)(x)), x)
+
+
+@pytest.mark.parametrize("strides", [1, 2, 3])
+def test_avgpool2d_pool_size_zero_is_the_identity(x, strides):
+    """A single-cell window: the mean of one element is that element,
+    whatever the stride (narrow-grid cases included, see
+    test_avgpool_on_a_narrow_grid_with_a_large_stride)."""
+    out = _numpy(hgly.AvgPool2d(0, strides=strides)(x))
+    sampled = _numpy(hgly.MaxPool2d(0, strides=strides)(x))  # same window walk, exact subsample
+    np.testing.assert_allclose(out, sampled, atol=1e-5)
+
+
+def test_conv3d_pointwise_hex_element_only_affects_the_hex_plane():
+    """kernel_size=(depth, 0): the hex plane is pointwise (no neighbour
+    mixing), but the depth/time axis is untouched -- it still convolves
+    across its 5 frames exactly as it would with a non-zero hex radius."""
+    x3 = RNG.standard_normal((1, 5, H, W, C)).astype("float32")
+    layer = hgly.Conv3d(4, kernel_size=(5, 0))
+    out = _numpy(layer(x3))
+    assert out.shape == (1, 1, H, W, 4)  # depth_padding="valid": 5 - 5 + 1 = 1
+    assert np.all(np.isfinite(out))
+
+
+# ---- kernel_size_unit="pixels" --------------------------------------------------
+#
+# "pixels" reads kernel_size as a square-kernel width (radius = size // 2),
+# so the same architecture means a comparable receptive field on both grids.
+# "rings" (the default) is unchanged: kernel_size already is the ring count.
+
+
+def test_kernel_size_unit_defaults_to_rings():
+    assert hgly.Conv2d(4, kernel_size=1).kernel_size_unit == "rings"
+    assert hgly.MaxPool2d(1).kernel_size_unit == "rings"
+
+
+def test_kernel_size_unit_rejects_an_unknown_value():
+    with pytest.raises(ValueError, match="kernel_size_unit"):
+        hgly.Conv2d(4, kernel_size=1, kernel_size_unit="bogus")
+
+
+@pytest.mark.parametrize(
+    "layer_cls, build",
+    [
+        (hgly.Conv2d, lambda cls, k, unit: cls(4, kernel_size=k, kernel_size_unit=unit)),
+        (hgly.MaxPool2d, lambda cls, k, unit: cls(k, kernel_size_unit=unit)),
+        (hgly.AvgPool2d, lambda cls, k, unit: cls(k, kernel_size_unit=unit)),
+    ],
+    ids=["conv2d", "maxpool2d", "avgpool2d"],
+)
+@pytest.mark.parametrize("pixels, rings", [(1, 0), (3, 1), (5, 2), (7, 3)])
+def test_pixels_unit_resolves_to_the_matching_ring_count(layer_cls, build, pixels, rings):
+    px = build(layer_cls, pixels, "pixels")
+    assert px.hexbase_size == rings
+
+
+@pytest.mark.parametrize("pixels", [2, 3])
+def test_pixels_unit_even_width_floors_like_the_odd_width_below_it(x, pixels):
+    """pool_size=2 is CTLearn's default; there is no exact hex equivalent for
+    an even width, so it floors to the same ring count as 2 - 1 = 1, rather
+    than being rejected."""
+    a = hgly.Conv2d(4, kernel_size=1)  # 1 ring directly
+    b = hgly.Conv2d(4, kernel_size=pixels, kernel_size_unit="pixels")  # floors to 1 ring too
+    # Weights are drawn lazily, on the first call (build()) -- the seed has
+    # to be reset right before each call, not before construction.
+    keras.utils.set_random_seed(0)
+    out_a = _numpy(a(x))
+    keras.utils.set_random_seed(0)
+    out_b = _numpy(b(x))
+    np.testing.assert_allclose(out_a, out_b, atol=1e-6)
+
+
+def test_pixels_unit_gives_bit_identical_output_to_the_matching_rings_call(x):
+    """The whole point of the option: build the SAME layer either way, with
+    identical weight initialization (same seed) and identical output -- not
+    just a matching hexbase_size."""
+    for size in (1, 2, 3):
+        rings = hgly.Conv2d(4, kernel_size=size)
+        pixels = hgly.Conv2d(4, kernel_size=2 * size + 1, kernel_size_unit="pixels")
+        # Weights are drawn lazily, on the first call -- reset the seed right
+        # before each call, not before construction.
+        keras.utils.set_random_seed(1)
+        out_rings = _numpy(rings(x))
+        keras.utils.set_random_seed(1)
+        out_pixels = _numpy(pixels(x))
+        np.testing.assert_allclose(out_rings, out_pixels, atol=1e-6)
+
+
+def test_conv3d_kernel_size_unit_leaves_the_depth_element_alone():
+    """Only the hex element follows kernel_size_unit; depth is never a hex
+    radius, so it always stays the literal value."""
+    layer = hgly.Conv3d(4, kernel_size=(5, 3), kernel_size_unit="pixels")
+    assert layer.depth_size == 5  # unaffected by the unit
+    assert layer.hexbase_size == 1  # 3 pixels -> 1 ring
+
+
+def test_conv3d_pixels_unit_gives_bit_identical_output_to_the_matching_rings_call():
+    """Same idea as test_pixels_unit_gives_bit_identical_output_to_the_matching_
+    rings_call, but for Conv3d, where the hex element shares the tuple with a
+    non-trivial depth -- the equivalence has to hold with depth left alone."""
+    x3 = RNG.standard_normal((2, 5, H, W, C)).astype("float32")
+    keras.utils.set_random_seed(8)
+    rings = hgly.Conv3d(4, kernel_size=(3, 1))
+    out_rings = _numpy(rings(x3))
+    keras.utils.set_random_seed(8)
+    pixels = hgly.Conv3d(4, kernel_size=(3, 3), kernel_size_unit="pixels")  # 3 pixels -> 1 ring
+    out_pixels = _numpy(pixels(x3))
+    np.testing.assert_allclose(out_rings, out_pixels, atol=1e-6)
+
+
+def test_maxpool3d_pixels_unit_matches_the_matching_rings_call():
+    """MaxPool3d has no weights, so this is an output-only equivalence (no
+    seeding needed), but it is the only check that the pixels-unit hex
+    radius is actually threaded through MaxPool3d's own window geometry."""
+    x3 = RNG.standard_normal((2, 5, H, W, C)).astype("float32")
+    rings = hgly.MaxPool3d(pool_size=(3, 1))
+    pixels = hgly.MaxPool3d(pool_size=(3, 3), kernel_size_unit="pixels")
+    np.testing.assert_allclose(_numpy(rings(x3)), _numpy(pixels(x3)), atol=1e-6)
+
+
+def test_kernel_size_unit_survives_save_load(x, tmp_path):
+    keras.utils.set_random_seed(2)
+    model = keras.Sequential([hgly.Conv2d(4, kernel_size=3, kernel_size_unit="pixels")])
+    model.build((None, H, W, C))
+    ref = _numpy(model(x))
+
+    path = tmp_path / "model.keras"
+    model.save(path)
+    restored = keras.saving.load_model(path)
+
+    assert restored.layers[0].kernel_size_unit == "pixels"
+    assert restored.layers[0].hexbase_size == 1
+    np.testing.assert_allclose(_numpy(restored(x)), ref, atol=1e-6)

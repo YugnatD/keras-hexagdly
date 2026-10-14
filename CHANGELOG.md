@@ -3,6 +3,48 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.6.0] - 2026-10-14
+
+### Added
+
+- **`kernel_size_unit` on `Conv2d`, `Conv3d`, `MaxPool2d`, `AvgPool2d` and
+  `MaxPool3d`.** `"rings"` (default, unchanged) reads `kernel_size`/
+  `pool_size` as the hexagonal ring count, as always. `"pixels"` reads it as
+  a square-kernel width instead -- radius = `size // 2` -- so the same value
+  means a comparable extent on a square and a hex grid: `1` is a plain
+  per-cell projection (0 rings), `3` the 7-cell hexagon (1 ring), `5` the
+  19-cell one (2 rings), as in indexedconv's `MaskedConv2d`. Even widths have
+  no exact hex equivalent and floor instead of raising, so a default
+  `pool_size=2` resolves rather than being rejected. On `Conv3d`/`MaxPool3d`,
+  only the hex element of the `(depth, hex)` kernel_size follows the unit --
+  depth is never a hex radius. Serialized in `get_config()`, so a saved
+  model keeps the unit it was built with. Prompted by
+  https://github.com/ctlearn-project/ctlearn/issues/302: a config written
+  for the square backend now means the same thing for the hex one.
+- **`kernel_size`/`pool_size=0`** (0 hexagonal rings: a plain per-cell
+  channel projection, no neighbours at all) is now accepted everywhere it
+  used to be rejected -- it was a missing capability, not a deliberate
+  restriction, and `kernel_size_unit="pixels"` needs it to express a true
+  1x1. On `Conv3d`/`MaxPool3d`, only the hex element can be 0; a bare int
+  kernel_size still has to be positive, since it also sets the depth axis,
+  and a 0-depth kernel is degenerate.
+
+### Fixed
+
+- `HexBase.operation_with_single_hexbase_stride` (the ``stride == 1`` path
+  shared by every layer) crashed with `hexbase_size=0`: with no kernel1+,
+  the odd/even-column lists it concatenates at the end stayed empty.
+  `kernel0` alone, at full resolution, already *is* the complete pointwise
+  output, so it is returned directly instead.
+- `keras_hexagdly.indexed.build_neighbor_table`/`get_cell_weights` (used by
+  the hls4ml export) read `layer.kernel_size` -- the raw, unit-dependent
+  constructor argument -- instead of `layer.hexbase_size`, the resolved
+  ring count the neighbour-table geometry is actually defined in terms of.
+  The two were always equal before `kernel_size_unit` existed, so this
+  never surfaced; with `kernel_size_unit="pixels"` they genuinely differ,
+  and `patch_model_for_hls` crashed with an `IndexError` on any such layer.
+  The 3D versions of these functions already used `hexbase_size` correctly.
+
 ## [0.5.0] - 2026-10-04
 
 ### Added

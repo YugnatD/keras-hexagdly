@@ -101,7 +101,11 @@ def build_neighbor_table(layer, H, W):
                        sub-kernel cell for slot k.
         out_shape:     (H_out, W_out) tuple.
     """
-    kernel_size = layer.kernel_size
+    # hexbase_size, not kernel_size: with kernel_size_unit="pixels" the two
+    # differ (kernel_size is the raw, unit-dependent constructor argument),
+    # and the ring geometry below (_cell_list, _probe_layer) is defined in
+    # terms of the ring count hexbase_size always is.
+    kernel_size = layer.hexbase_size
     stride = layer.hexbase_stride
     cells = _cell_list(kernel_size)
     K = len(cells)
@@ -249,7 +253,9 @@ def get_cell_weights(layer, cells):
     Returns:
         W:  float32 ndarray (K, Cin, Cout).
     """
-    n = layer.kernel_size
+    # hexbase_size, not kernel_size -- see the matching note in
+    # build_neighbor_table; weight_maps_2d needs the ring count.
+    n = layer.hexbase_size
 
     if layer.share_neighbors:
         ring_maps, _ = weight_maps_2d(n, layer.share_neighbors)
