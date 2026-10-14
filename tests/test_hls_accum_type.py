@@ -1,4 +1,5 @@
 """The accumulator of an hls4ml hex convolution must hold weight * input sums, not weight sums."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -60,5 +61,6 @@ def test_finer_input_fraction_is_kept():
 def test_wide_bias_widens_the_integer_part():
     # products need 3 + 2 + 3 = 8 integer bits, the bias 12: the accumulator is seeded with it
     wide_bias = node(
-        FixedPrecisionType(16, 3), FixedPrecisionType(4, 2), FixedPrecisionType(24, 12))
+        FixedPrecisionType(16, 3), FixedPrecisionType(4, 2), FixedPrecisionType(24, 12)
+    )
     assert _accum_type_str(wide_bias, 7) == "ap_fixed<25, 12>"
