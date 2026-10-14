@@ -196,13 +196,43 @@ def _strategy_enum(node):
     return "latency" if strategy == "latency" else "resource"
 
 
+def _input_precision(node):
+    """(integer, fractional) bits of the layer's input type, or (0, 0) if it is not fixed point."""
+    try:
+        prec = node.get_input_variable().type.precision
+    except Exception:  # not a node with an input variable (e.g. a stand-alone call)
+        return 0, 0
+    width, integer = getattr(prec, "width", None), getattr(prec, "integer", None)
+    if width is None or integer is None:
+        return 0, 0
+    return int(integer), int(width) - int(integer)
+
+
+def _bias_integer_bits(node):
+    """Integer bits of the layer's bias type, or 0 if it is not fixed point."""
+    try:
+        prec = node.get_weights("mac_bias").type.precision
+    except Exception:
+        return 0
+    integer = getattr(prec, "integer", None)
+    return int(integer) if integer is not None else 0
+
+
 def _accum_type_str(node, n_terms):
     """Return an ap_fixed<> string for the ring-MAC accumulator.
 
-    The accumulator sums ``n_terms`` products; to hold that sum without overflow
-    it needs ceil(log2(n_terms)) extra integer bits over the weight type. We grow
-    both the total width and the integer part by the same amount, matching the
-    bit-growth idiom hls4ml uses for its dense/conv accumulators.
+    The accumulator is seeded with the bias and sums ``n_terms`` products ``weight * input``:
+
+    * integer bits: those of the weights, plus those of the input (a product of a weight below 4
+      and an activation up to 800 reaches 3200, whatever the weight type says), plus
+      ceil(log2(n_terms)) for the sum -- or those of the bias if it is wider than that;
+    * fractional bits: the finer of the weights and the input, since the kernel casts the data
+      into the accumulator before multiplying and would otherwise drop its fine bits.
+
+    Until 0.6.0 the accumulator was sized from the weight type alone. It overflowed silently as soon
+    as the activations were larger than about 1 (the accumulator wraps around, C simulation
+    included), dropped the fractional bits of an input finer than the weights, and wrapped a bias
+    wider than the sum of the products.
 
     Falls back to the plain weight-type name if the precision can't be read
     (e.g. a non-FixedPrecision type), which preserves the old behavior.
@@ -215,9 +245,12 @@ def _accum_type_str(node, n_terms):
     signed = getattr(prec, "signed", True)
     if width is None or integer is None:
         return node.get_weights("mac_weights").type.name
-    scale = int(math.ceil(math.log2(max(1, n_terms))))
+    input_integer, input_fraction = _input_precision(node)
+    growth = int(math.ceil(math.log2(max(1, n_terms))))
+    accum_integer = max(integer + input_integer + growth, _bias_integer_bits(node))
+    accum_fraction = max(width - integer, input_fraction)
     u = "" if signed else "u"
-    return f"ap_{u}fixed<{width + scale}, {integer + scale}>"
+    return f"ap_{u}fixed<{accum_integer + accum_fraction}, {accum_integer}>"
 
 
 # ---------------------------------------------------------------------------

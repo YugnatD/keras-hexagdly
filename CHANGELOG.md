@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The accumulator of an hls4ml-exported hex convolution was sized from the weight type alone**,
+  which was wrong in three ways, each reproduced by a C-simulation test
+  (`tests/test_hls_accum_csim.py`) that fails on the previous code:
+  - it overflowed whenever the input was larger than about 1: a layer summing 112 products of
+    activations up to ~50 with weights below 4 got a +-512 accumulator for sums reaching ~800 and
+    wrapped around, silently. It now adds the integer bits of the layer's input type;
+  - it kept only the fractional bits of the weights, so an input finer than the weights was
+    truncated when cast into the accumulator (error ~10 % in the test). It now keeps the finer of
+    the two;
+  - it wrapped a bias wider than the sum of the products (a bias of 1000 into a +-128 accumulator
+    came out off by 1024). It now has at least the integer bits of the bias.
+
+  The accumulators of exported models are wider as a result, so resource counts measured with
+  earlier versions are slightly off.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added
