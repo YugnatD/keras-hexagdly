@@ -229,8 +229,8 @@ def _accum_type_str(node, n_terms):
     * fractional bits: the finer of the weights and the input, since the kernel casts the data
       into the accumulator before multiplying and would otherwise drop its fine bits.
 
-    Until 0.6.0 the accumulator was sized from the weight type alone. It overflowed silently as soon
-    as the activations were larger than about 1 (the accumulator wraps around, C simulation
+    Before 0.6.0 the accumulator was sized from the weight type alone. It overflowed silently as
+    soon as the activations were larger than about 1 (the accumulator wraps around, C simulation
     included), dropped the fractional bits of an input finer than the weights, and wrapped a bias
     wider than the sum of the products.
 
