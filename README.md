@@ -208,6 +208,28 @@ hls_model = hls4ml.converters.convert_from_keras_model(
 )
 ```
 
+### Dataflow mode: lower latency, more LUT
+
+By default each hex convolution is one fused loop: a pixel waits for the previous
+pixel's multiply, so the latency is dominated by the layer, whatever the reuse
+factor. Set `Dataflow` on a hex layer to run its line buffer and its MAC as two
+concurrent processes instead (`io_stream`, 2D only):
+
+```python
+for layer in ("spatial_shared_linebuffer", "spatial_trigger_linebuffer"):
+    config["LayerName"][layer]["Dataflow"] = True      # default False
+```
+
+On a 19x14 board grid with two hex layers this took a whole CNN from 6083 to 824
+cycles (x7.4) for about +60 % LUT and +5 % FF (Vitis HLS 2024.2, VC707); it pays
+when latency is the constraint and the LUT are available. The key is read per
+layer (a layer with a `LayerName` entry does not fall back to the `Model`
+section) and ignored with a warning under `io_parallel`. It is validated in C
+simulation, bit for bit against the fused kernel (`tests/test_hls_dataflow_csim.py`), and in
+RTL co-simulation on a small network, with and without `share_neighbors="ring"`, where it matches the
+C result like the fused kernel does (`tests/smoke_cosim_dataflow.py`, needs Vitis HLS). A C simulation
+only predicts the RTL while no type overflows: keep the types wide enough.
+
 ### Supported scope
 
 **Only `io_stream` and the 2D layers (`Conv2d`, `MaxPool2d`) are supported for

@@ -7,6 +7,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Dataflow kernel for the hls4ml hex convolution (io_stream, 2D), selectable per layer.** Set
+  `config["LayerName"]["<layer>_linebuffer"]["Dataflow"] = True` (default `False`; a layer that has a
+  `LayerName` entry does not fall back to the `Model` section, like every other per-layer key).
+  The fused kernel stays the default and is unchanged. With the flag, the line buffer and the MAC run
+  as two concurrent dataflow processes joined by a FIFO of tap packs, so a pixel no longer waits for
+  the previous one's multiply. Measured on a 19x14 board grid (a whole CNN with two hex layers, Vitis
+  HLS 2024.2, VC707): latency 6083 -> 824 cycles (x7.4) for about +60 % LUT and +5 % FF (the first hex
+  layer's reuse factor was 1 for the fused kernel and 2 for the dataflow one). Layers that are not
+  hex convolutions are untouched.
+  The flag is ignored with a warning under io_parallel; the 3D kernel has no dataflow variant.
+  Checked in C simulation (`tests/test_hls_dataflow_csim.py` compiles both kernels on several kernel
+  sizes, strides, reuse factors and `ring` sharing and requires bit-identical results, and agreement
+  with Keras) and in RTL co-simulation (`tests/smoke_cosim_dataflow.py`, needs Vitis HLS): a small
+  network with the structure of a real one, fused and dataflow kernel, with and without
+  `share_neighbors="ring"`, reuse factors (1, 1) and (1, 2): in all six cases the C and the RTL results
+  are identical. The traversal is duplicated between the two kernels (the C test guards against drift).
+  Co-simulation caveat: once a type overflows, C simulation and RTL do not wrap alike, so a mismatch
+  can come from the types of the network under test rather than from a kernel (the smoke test uses
+  wide types for that reason).
+
 - **`kernel_size_unit` on `Conv2d`, `Conv3d`, `MaxPool2d`, `AvgPool2d` and
   `MaxPool3d`.** `"rings"` (default, unchanged) reads `kernel_size`/
   `pool_size` as the hexagonal ring count, as always. `"pixels"` reads it as

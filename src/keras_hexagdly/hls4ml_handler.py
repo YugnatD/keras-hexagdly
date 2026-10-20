@@ -277,6 +277,30 @@ def _is_stream(node):
     return node.model.config.get_config_value("IOType") == "io_stream"
 
 
+def _dataflow(node):
+    """True when the layer's hls4ml config asks for the dataflow kernel (key ``Dataflow``).
+
+    Read per layer, from ``config["LayerName"][<layer name>]["Dataflow"]`` (or a ``LayerType``
+    entry); a layer that has a ``LayerName`` entry does not fall back to the ``Model`` section,
+    like every other per-layer key. The dataflow kernel splits the line buffer and the MAC into
+    two concurrent processes: much lower latency, more LUT. It exists for io_stream only, so
+    the flag is ignored (with a warning) under io_parallel.
+    """
+    value = node.model.config.get_layer_config_value(node, "Dataflow", False)
+    if isinstance(value, str):
+        value = value.strip().lower() in ("1", "true", "yes", "on")
+    if value and not _is_stream(node):
+        import warnings
+
+        warnings.warn(
+            f'layer "{node.name}": Dataflow only exists for io_stream and is ignored under '
+            "io_parallel.",
+            stacklevel=2,
+        )
+        return False
+    return bool(value)
+
+
 # ---------------------------------------------------------------------------
 # Line-buffer strategy — fused HexConvLineBuffer (Conv2d, stride 1)
 #
@@ -389,6 +413,7 @@ struct config{index} : nnet::hex_conv_linebuffer_config {{
     static const unsigned col_span     = {col_span};
     static const int      dc_max       = {dc_max};
     static const unsigned strategy     = nnet::{strategy};
+    static const bool     dataflow     = {dataflow};
     static const unsigned n_pixels     = {n_pixels};
     static const unsigned n_partitions = {n_partitions};
     static const unsigned reuse_factor = {reuse};
@@ -460,6 +485,7 @@ class HexConvLineBufferConfigTemplate(LayerConfigTemplate):
         params["col_span"] = _col_span(off_even, off_odd)
         params["dc_max"] = _dc_max(off_even, off_odd)
         params["strategy"] = _strategy_enum(node)
+        params["dataflow"] = "true" if _dataflow(node) else "false"
         if _is_stream(node):
             _warn_reuse_factor(
                 node,

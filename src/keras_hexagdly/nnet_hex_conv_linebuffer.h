@@ -58,6 +58,11 @@ struct hex_conv_linebuffer_config {
     // reuse-folded (resource). Ignored by the io_parallel kernel below.
     static const unsigned strategy = nnet::latency;
 
+    // io_stream only: run the line buffer and the MAC as two concurrent dataflow
+    // processes (hex_conv_linebuffer_stream_dataflow) instead of one fused loop.
+    // Set per layer by the handler from the hls4ml config key "Dataflow".
+    static const bool dataflow = false;
+
     // Slot -> weight row map (ring index when sharing, identity otherwise).
     static const unsigned row_map[k];
     // Flat neighbor index table (N_out*K), -1 = border -> zero (parallel gather).
