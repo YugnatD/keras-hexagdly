@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.6.1] - 2026-10-22
+
+### Added
+
+- **A `UserWarning` for even sizes with `kernel_size_unit="pixels"`.** A hexagonal window is centred on
+  a cell, so it only exists for odd widths. An even width has always been rounded up to the next odd
+  one (2 -> 3, the 7-cell window; 4 -> 5, the 19-cell one); the layers now say so, with the warning
+  pointing at the line that built the layer. `"rings"` mode and the depth element of the
+  `Conv3d`/`MaxPool3d` size are not concerned. Behaviour is unchanged: only the warning is new.
+
+### Fixed
+
+- The 0.6.0 README and docstrings said an even width "floors to the odd width below it" (so that
+  `kernel_size=2` would resolve like `1`). That was wrong: it is rounded **up** (2 -> 3). Wording
+  corrected; the computation never changed.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added

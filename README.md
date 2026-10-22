@@ -153,10 +153,11 @@ hgly.Conv2d(filters=32, kernel_size=1, kernel_size_unit="pixels")  # a plain 1x1
 
 `kernel_size=0` (0 rings, a plain per-cell channel projection with no
 neighbours) is what `kernel_size_unit="pixels"` needs to express a true 1x1,
-and is accepted directly in `"rings"` mode too. Even widths have no exact
-hex equivalent and floor to the ring count of the odd width below them
-(`kernel_size=2` in `"pixels"` mode resolves like `1`), rather than being
-rejected. Applies to `MaxPool2d`/`AvgPool2d` (via `pool_size`) the same way;
+and is accepted directly in `"rings"` mode too. A hexagonal window is centred on a
+cell, so it only exists for odd widths. An even width is rounded **up** to the next odd
+one (`kernel_size=2` in `"pixels"` mode gives the 7-cell window of `3`, not the single
+cell of `1`, and `4` gives that of `5`), and a `UserWarning` says so; use an odd width
+to silence it. Applies to `MaxPool2d`/`AvgPool2d` (via `pool_size`) the same way;
 on `Conv3d`/`MaxPool3d`, only the hex element of the `(depth, hex)` size
 follows the unit, since depth is never a hex radius.
 

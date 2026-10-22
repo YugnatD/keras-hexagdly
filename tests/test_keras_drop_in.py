@@ -6,6 +6,8 @@ MaxPool2d/AvgPool2d accept ``pool_size`` like ``keras.layers.MaxPool2D`` /
 them from one set of keyword arguments. See CHANGELOG.md [0.5.0].
 """
 
+import warnings
+
 import keras
 import numpy as np
 import pytest
@@ -441,12 +443,14 @@ def test_pixels_unit_resolves_to_the_matching_ring_count(layer_cls, build, pixel
 
 
 @pytest.mark.parametrize("pixels", [2, 3])
-def test_pixels_unit_even_width_floors_like_the_odd_width_below_it(x, pixels):
-    """pool_size=2 is CTLearn's default; there is no exact hex equivalent for
-    an even width, so it floors to the same ring count as 2 - 1 = 1, rather
-    than being rejected."""
+def test_pixels_unit_even_width_is_the_window_of_the_next_odd_width(x, pixels):
+    """pool_size=2 is CTLearn's default; a hexagonal window has no even size, so
+    2 is rounded up to the 7-cell window of 3 (1 ring), not down to the single
+    cell of 1."""
     a = hgly.Conv2d(4, kernel_size=1)  # 1 ring directly
-    b = hgly.Conv2d(4, kernel_size=pixels, kernel_size_unit="pixels")  # floors to 1 ring too
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the warning is tested below
+        b = hgly.Conv2d(4, kernel_size=pixels, kernel_size_unit="pixels")  # 1 ring too
     # Weights are drawn lazily, on the first call (build()) -- the seed has
     # to be reset right before each call, not before construction.
     keras.utils.set_random_seed(0)
@@ -470,6 +474,74 @@ def test_pixels_unit_gives_bit_identical_output_to_the_matching_rings_call(x):
         keras.utils.set_random_seed(1)
         out_pixels = _numpy(pixels(x))
         np.testing.assert_allclose(out_rings, out_pixels, atol=1e-6)
+
+
+# ---- even sizes warn -----------------------------------------------------------
+#
+# A hexagonal window is centred on a cell, so it only exists for odd sizes. In
+# "pixels" mode an even size is rounded up to the next odd one (2 -> 3, 4 -> 5)
+# and a UserWarning says so; "rings" counts rings, which are never even or odd.
+
+EVEN_LAYERS = [
+    pytest.param(lambda k: hgly.Conv2d(4, kernel_size=k, kernel_size_unit="pixels"), id="Conv2d"),
+    pytest.param(lambda k: hgly.MaxPool2d(k, kernel_size_unit="pixels"), id="MaxPool2d"),
+    pytest.param(lambda k: hgly.AvgPool2d(k, kernel_size_unit="pixels"), id="AvgPool2d"),
+    pytest.param(
+        lambda k: hgly.Conv3d(4, kernel_size=(3, k), kernel_size_unit="pixels"), id="Conv3d"
+    ),
+    pytest.param(lambda k: hgly.MaxPool3d((3, k), kernel_size_unit="pixels"), id="MaxPool3d"),
+]
+
+
+@pytest.mark.parametrize("build", EVEN_LAYERS)
+@pytest.mark.parametrize("size, rounded, cells", [(2, 3, 7), (4, 5, 19), (6, 7, 37)])
+def test_even_size_in_pixels_mode_warns_with_the_rounded_size(build, size, rounded, cells):
+    with pytest.warns(UserWarning, match="no even size") as record:
+        build(size)
+    (message,) = [str(w.message) for w in record]
+    assert f"the size {size} is rounded up to {rounded}" in message
+    assert f"{cells} cells" in message
+
+
+@pytest.mark.parametrize("build", EVEN_LAYERS)
+@pytest.mark.parametrize("size", [1, 3, 5, 7])
+def test_odd_size_in_pixels_mode_does_not_warn(build, size):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        build(size)
+
+
+def test_pixels_zero_is_the_pointwise_case_not_a_rounding():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        hgly.Conv2d(4, kernel_size=0, kernel_size_unit="pixels")
+        hgly.MaxPool2d(0, kernel_size_unit="pixels")
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 3, 4])
+def test_rings_mode_never_warns(size):
+    """In "rings" mode the size counts rings, so 2 is the 19-cell window: nothing
+    is rounded."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        hgly.Conv2d(4, kernel_size=size)
+        hgly.MaxPool2d(size)
+        hgly.AvgPool2d(size)
+
+
+def test_the_warning_points_at_the_line_that_built_the_layer():
+    with pytest.warns(UserWarning) as record:
+        hgly.Conv2d(4, kernel_size=2, kernel_size_unit="pixels")
+    assert record[0].filename == __file__
+
+
+def test_conv3d_only_warns_about_the_hex_element():
+    """The depth element is a number of frames, never a hexagonal window."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        hgly.Conv3d(4, kernel_size=(2, 3), kernel_size_unit="pixels")  # even depth: fine
+    with pytest.warns(UserWarning, match="rounded up to 3"):
+        hgly.Conv3d(4, kernel_size=(3, 2), kernel_size_unit="pixels")
 
 
 def test_conv3d_kernel_size_unit_leaves_the_depth_element_alone():

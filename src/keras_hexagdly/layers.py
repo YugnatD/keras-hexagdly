@@ -36,6 +36,7 @@ _MaxPoolProcess).
 """
 
 import operator
+import warnings
 
 import keras
 import numpy as np
@@ -149,11 +150,25 @@ def _hex_radius(kernel_size, kernel_size_unit):
     unit="pixels": kernel_size is a square-kernel width, radius = size // 2 --
     so 1 is pointwise (0 rings, a plain per-cell projection), 3 is the 7-cell
     hexagon (1 ring), 5 the 19-cell one (2 rings), matching a 3x3/5x5 square
-    kernel's extent. Even widths have no exact hex equivalent; they still
-    resolve (floored), matching e.g. a default pool_size=2 to 1 ring rather
-    than rejecting it.
+    kernel's extent.
+
+    A hexagonal window is centred on a cell, so it only exists for odd widths.
+    An even width is rounded UP to the next odd one (2 gives the window of 3, 4
+    that of 5; the identity is 1, not 2) rather than rejected, which keeps e.g. a
+    default pool_size=2 usable, and a warning says so.
     """
-    return kernel_size if kernel_size_unit == "rings" else kernel_size // 2
+    if kernel_size_unit == "rings":
+        return kernel_size
+    radius = kernel_size // 2
+    if kernel_size > 0 and kernel_size % 2 == 0:
+        warnings.warn(
+            f"kernel_size_unit='pixels': a hexagonal window is centred on a cell, so it has "
+            f"no even size; the size {kernel_size} is rounded up to {kernel_size + 1} (a window "
+            f"of {1 + 3 * radius * (radius + 1)} cells). Use an odd size to silence this warning.",
+            UserWarning,
+            stacklevel=3,  # _hex_radius <- the layer's __init__ <- the caller's line
+        )
+    return radius
 
 
 def _require_depth_hex_kernel_size(name, value):
