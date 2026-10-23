@@ -44,7 +44,7 @@ jobs:
       - name: Install keras-hexagdly + dev/test deps
         run: |
           pip install -e .
-          pip install pytest hexagdly hls4ml numpy
+          pip install pytest hexagdly hls4ml hgq2 numpy
           # torch is also the cross-check oracle dependency, regardless of backend
           if [ "${{ matrix.backend }}" != "torch" ]; then
             pip install torch --index-url https://download.pytorch.org/whl/cpu

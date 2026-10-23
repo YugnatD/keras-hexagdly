@@ -22,6 +22,19 @@ import keras
 import numpy as np
 
 
+def _opt_out_of_automatic_xla(layer):
+    """Keep Keras from compiling a model that contains ``layer`` with XLA by itself.
+
+    The gather table of these layers is an int32 weight. TensorFlow keeps int32 variables on the
+    CPU, and the XLA compilation Keras turns on automatically on a GPU cannot read them from there
+    ("resource located in device CPU from device GPU"): ``predict()`` / ``fit()`` of an exported
+    model failed on a GPU. ``supports_jit = False`` is the opt-out Keras provides for this. It
+    switches the automatic compilation of the whole model off, so it is only done on TensorFlow:
+    JAX keeps its jit (turning it off made ``predict`` about 4x slower there)."""
+    if keras.backend.backend() == "tensorflow":
+        layer.supports_jit = False
+
+
 @keras.saving.register_keras_serializable(package="hexagdly_tf")
 class HexConvLineBuffer(keras.layers.Layer):
     """Fused hex neighbor gather + ring-MAC on the 2D grid.
@@ -55,6 +68,7 @@ class HexConvLineBuffer(keras.layers.Layer):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        _opt_out_of_automatic_xla(self)
         self._neighbor_idx_init = np.asarray(neighbor_idx, dtype=np.int32)
         self.N_out, self.K = self._neighbor_idx_init.shape
         self.H = int(H)  # input grid height
@@ -185,6 +199,7 @@ class HexConvLineBuffer3D(keras.layers.Layer):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        _opt_out_of_automatic_xla(self)
         self._neighbor_idx_init = np.asarray(neighbor_idx, dtype=np.int32)
         self.N_out, self.K = self._neighbor_idx_init.shape
         self.H = int(H)
@@ -331,6 +346,7 @@ class HexPoolLineBuffer(keras.layers.Layer):
 
     def __init__(self, neighbor_idx, H, W, stride=1, H_out=None, W_out=None, **kwargs):
         super().__init__(**kwargs)
+        _opt_out_of_automatic_xla(self)
         self._neighbor_idx_init = np.asarray(neighbor_idx, dtype=np.int32)
         self.N_out, self.K = self._neighbor_idx_init.shape
         self.H = int(H)
@@ -404,6 +420,7 @@ class HexPoolLineBuffer3D(keras.layers.Layer):
 
     def __init__(self, neighbor_idx, H, W, depth_size, depth_stride=1, **kwargs):
         super().__init__(**kwargs)
+        _opt_out_of_automatic_xla(self)
         self._neighbor_idx_init = np.asarray(neighbor_idx, dtype=np.int32)
         self.N_out, self.K = self._neighbor_idx_init.shape
         self.H = int(H)

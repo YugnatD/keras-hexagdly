@@ -36,6 +36,7 @@ _MaxPoolProcess).
 """
 
 import operator
+import sys
 import warnings
 
 import keras
@@ -142,6 +143,42 @@ def _require_kernel_size_unit(value):
     return value
 
 
+def _mapped_inputs(layer, tensor_map):
+    """The input tensor(s) of ``layer`` looked up in ``tensor_map`` (tensor id -> its replacement).
+
+    ``layer.input`` is the input of the layer's FIRST graph node. A layer instance that already
+    belongs to another model (or is called more than once) points into that other graph: say so,
+    instead of a
+    bare KeyError. Used by the graph rewrites (``patch_model_for_hls``, ``freeze``)."""
+    raw_in = layer.input
+    try:
+        if isinstance(raw_in, (list, tuple)):
+            return [tensor_map[id(t)] for t in raw_in]
+        return tensor_map[id(raw_in)]
+    except KeyError:
+        raise ValueError(
+            f"Layer {layer.name!r} is not wired to this model's graph: its input is not one of "
+            "this model's tensors. Either the layer was already used in another model, or it (or "
+            "a layer upstream of it) is a layer that is called more than once, such as a shared "
+            "layer. Build the model from fresh layers (for example "
+            "layer.__class__.from_config(layer.get_config()) and set_weights, or "
+            "keras.models.clone_model) and use that."
+        ) from None
+
+
+def _stacklevel_outside_package():
+    """``stacklevel`` of the first caller that is not inside keras_hexagdly (the user's line).
+
+    A fixed level breaks as soon as a layer subclasses another one (``QConv2d`` -> ``Conv2d``),
+    since every ``__init__`` in the chain adds a frame."""
+    level, frame = 2, sys._getframe(2)  # level 2 = the caller of _hex_radius
+    while (
+        frame is not None and frame.f_globals.get("__name__", "").split(".")[0] == "keras_hexagdly"
+    ):
+        frame, level = frame.f_back, level + 1
+    return level
+
+
 def _hex_radius(kernel_size, kernel_size_unit):
     """Convert a user-facing kernel_size to the ring count (hexbase_size)
     the hex machinery uses internally.
@@ -166,7 +203,7 @@ def _hex_radius(kernel_size, kernel_size_unit):
             f"no even size; the size {kernel_size} is rounded up to {kernel_size + 1} (a window "
             f"of {1 + 3 * radius * (radius + 1)} cells). Use an odd size to silence this warning.",
             UserWarning,
-            stacklevel=3,  # _hex_radius <- the layer's __init__ <- the caller's line
+            stacklevel=_stacklevel_outside_package(),  # the line that built the layer
         )
     return radius
 

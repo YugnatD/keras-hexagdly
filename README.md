@@ -161,6 +161,112 @@ to silence it. Applies to `MaxPool2d`/`AvgPool2d` (via `pool_size`) the same way
 on `Conv3d`/`MaxPool3d`, only the hex element of the `(depth, hex)` size
 follows the unit, since depth is never a hex radius.
 
+### New: quantization-aware training with HGQ2 (`QConv2d` and friends)
+
+Optional: `pip install keras-hexagdly[qat]` (needs Python >= 3.10 and HGQ2 >= 0.1.6, tested up to
+0.2.0). Each hexagonal layer has a quantized
+version that puts [HGQ2](https://github.com/calad0i/HGQ2) quantizers on what you ask for, so the
+network trains with the rounding it will have in fixed point:
+
+| quantized layer | hexagonal layer | quantizers |
+|---|---|---|
+| `QConv2d`, `QConv3d` | `Conv2d`, `Conv3d` | kernel, bias, input, output |
+| `QConv2d_CustomKernel`, `QConv3d_CustomKernel` | `Conv2d_CustomKernel`, `Conv3d_CustomKernel` | same; the kernels are only trained with `trainable=True` |
+| `QMaxPool2d`, `QMaxPool3d`, `QAvgPool2d` | `MaxPool2d`, `MaxPool3d`, `AvgPool2d` | input, output (no weights) |
+
+`kq_conf` (kernel; HGQ2's default weight config if omitted), `bq_conf` (bias), `iq_conf` (input of the
+layer) and `oq_conf` (output, after the activation) take an HGQ2 `QuantizerConfig`; all but `kq_conf` are
+off unless given. Every sub-kernel of the hexagonal decomposition has its own quantizer (with
+`share_neighbors` the shared weights are quantized, in every mode, then spread over their cells).
+
+```python
+import keras
+import keras_hexagdly as hgly
+from hgq.quantizer import QuantizerConfig
+from hgq.regularizers import MonoL1
+
+# start at 8 bits per weight; the bit widths are learned, the L1 term pushes them down
+weights = QuantizerConfig("kbi", "weight", k0=1, b0=8, i0=2, br=MonoL1(1e-5))
+
+inp = keras.Input((24, 24, 8))
+x = keras.layers.ReLU()(hgly.QConv2d(16, kernel_size=1, kq_conf=weights, name="hex0")(inp))
+x = keras.layers.ReLU()(hgly.QConv2d(32, kernel_size=1, strides=2, kq_conf=weights, name="hex1")(x))
+model = keras.Model(inp, keras.layers.Dense(1)(keras.layers.GlobalAveragePooling2D()(x)))
+
+model.compile("adam", "binary_crossentropy")
+model.fit(...)                                   # a normal fit; the bit regulariser is in the loss
+
+frozen, types = hgly.freeze(model)               # plain layers holding the quantized values
+print(types["hex0"])                             # e.g. {'weight': 'ap_fixed<6,4>'}
+```
+
+With `trainable=False` in a `QuantizerConfig` the bit widths stay fixed (plain fixed-point QAT); with a
+regulariser they are learned, and a weight that reaches 0 bit is removed. `model.save()` and
+`load_model()` keep the quantizers and their configs. `freeze` returns a new model in which every
+quantized layer is back to its plain hexagonal layer, with the same outputs (its default
+`activation_quantizers="keep"` leaves the activation quantizers in the model as standalone layers; see the
+export below for `"types"`), and, for each quantized layer, the `ap_fixed` types to give hls4ml: `weight`, `bias`, `input`, `result` (for what was quantized) and
+`accum`. `patch_model_for_hls` refuses a model that still has quantized layers.
+
+**Exporting to hls4ml (`io_stream`).** hls4ml only handles per-element activation quantizers in
+`io_parallel`, so for the export give `iq_conf` / `oq_conf` one bit width per layer
+(`homogeneous_axis=(0, 1, 2, 3)`), freeze with `activation_quantizers="types"` (the activation
+quantizers are dropped and their precision is in `types`), and put the types in the hls4ml config:
+
+```python
+def per_layer(ints, fracs, k=1):   # one bit width for the whole layer
+    return QuantizerConfig("kif", "datalane", k0=k, i0=ints, f0=fracs, overflow_mode="SAT",
+                           homogeneous_axis=(0, 1, 2, 3), trainable=False)
+
+inp = keras.Input((13, 11, 2), name="x")
+model = keras.Model(inp, hgly.QConv2d(
+    4, kernel_size=1, activation="relu", name="hex0",
+    kq_conf=weights, bq_conf=weights, iq_conf=per_layer(2, 3), oq_conf=per_layer(3, 2, k=0))(inp))
+
+frozen, types = hgly.freeze(model, activation_quantizers="types")
+t = types["hex0"]    # weight, bias, input, result, accum
+patched = patch_model_for_hls(frozen)
+config = hls4ml.utils.config_from_keras_model(patched, granularity="name")
+config["LayerName"]["x"]["Precision"] = {"result": t["input"]}            # the input quantizer
+config["LayerName"]["hex0_linebuffer"]["Precision"] = {
+    "result": "ap_fixed<32,12>", "mac_weights": t["weight"], "mac_bias": t["bias"]}
+config["Model"]["ExactAccumulator"] = True                                # see below
+config["LayerName"]["hex0_activation"]["Precision"] = {"result": t["result"]}  # after the ReLU
+```
+
+`hex0_activation` exists because the layer has a fused `activation`; the output quantizer is applied
+after it, so its type goes there (without an activation it goes on `hex0_linebuffer`).
+
+With these types the C simulation gives, bit for bit, what the Keras model gives
+(`tests/test_quantized_csim.py`). The one thing that is not a type of your model is the width of the
+accumulator of an exported hex convolution. By default it keeps only the fractional bits of the finer of
+the weights and the input, so with narrow quantized inputs each product loses its low bits and the
+simulation differs from Keras by a few steps. Two settings (both off by default, so existing exports do
+not change) make it exact:
+
+* `config["Model"]["ExactAccumulator"] = True`: every accumulator keeps all the fractional bits of the
+  product (`f_weight + f_input`, or those of the bias if finer) and one integer bit for the carry of the
+  bias addition. It can also be set on one layer (`config["LayerName"][name]
+  ["ExactAccumulator"]`), which then wins over the model. The accumulator is wider, so it costs logic:
+  see the measurement in the FPGA section below.
+* `config["LayerName"][name]["AccumPrecision"] = "ap_fixed<W,I>"`: the type itself. `types[...]
+  ["accum"]` (also `layer.accum_type()`) is the exact one for a layer; it needs the type of the input,
+  i.e. an `iq_conf`, or the `result` type of the previous layer passed to `accum_type(input_type)`.
+  `AccumPrecision` wins over `ExactAccumulator`. `AccumPrecision` is read per layer only (it does not fall
+  back to the `Model` section); `ExactAccumulator` does. The typedef hls4ml generates equals
+  `types[...]["accum"]` when the layer has a bias type (`bq_conf`); without one hls4ml's default bias
+  type enters the computation and the typedef can differ.
+
+The weight and bias types in `types` are derived from the quantized values themselves (the smallest
+signed `ap_fixed` that holds them exactly, negative integer bits included), the activation types from
+the quantizer parameters. `freeze` also works on models that contain nested models, and the quantized
+layers are saved/cloned (`clone_model`, `.h5`) with their quantizers. `QAvgPool2d` and the 3D layers
+have no hls4ml export. On the TensorFlow backend, mixed precision is not supported by HGQ2; on JAX the
+exported layers are used as is.
+
+Only what you give a quantizer is quantized: the other layers of a model, the activations without an
+`oq_conf`, and the bias without a `bq_conf` stay in float. The 3D layers have no hls4ml export yet.
+
 ### New: same-padded temporal convolution (Conv3d)
 
 ```python
@@ -259,6 +365,34 @@ layer's replacement.
 layer entry it recognises, which overrides the model-level value -- but custom
 layers get no entry and inherit the model-level one instead. Without an explicit
 per-layer setting, a single model ends up mixing two different reuse factors.
+
+### Accumulator width: `ExactAccumulator`
+
+> The table below was measured before the exact accumulator got its extra carry bit and the bias
+> fractional bits (about +1 bit of width per accumulator); it has not been re-measured.
+
+The accumulator of an exported hex convolution keeps, by default, the fractional bits of the finer of the
+weights and the input; `config["Model"]["ExactAccumulator"] = True` keeps all the bits of each product
+instead (`f_weight + f_input`), so the C simulation of a quantized model equals its Keras model bit for
+bit. It makes the accumulator wider, and that costs logic. Vitis HLS 2024.2 estimates for one 12x12
+hex convolution (8 channels to 16, 7-cell hexagon, the same on-grid random weights in both runs,
+`io_stream`, Latency, reuse factor 1, `xc7vx485tffg1927-2`, 5 ns):
+
+| types (input / weight) | accumulator | LUT | FF | DSP | latency (cycles) |
+|---|---|---|---|---|---|
+| `<6,3>` / `<7,2>` | default `<16,11>` | 39 710 | 40 178 | 0 | 376 |
+| | exact `<19,11>` | 38 873 | 47 497 | 130 | 376 |
+| `<10,4>` / `<9,3>` | default `<19,13>` | 55 075 | 53 145 | 0 | 376 |
+| | exact `<25,13>` | 47 138 | 74 756 | 272 | 376 |
+| `<16,6>` / `<16,6>` | default `<28,18>` | 39 258 | 126 547 | 755 | 377 |
+| | exact `<38,18>` | 117 381 | 238 231 | 925 | 380 |
+
+With narrow types the exact accumulator mostly moves work from LUTs to DSPs and flip-flops; with wide
+types it triples the LUTs. The latency and the clock are about the same. These are synthesis estimates,
+not results after place and route, for dense weights: pruned weights (a weight at 0 bit is a
+multiplication that is not built) should lower the difference, which was not measured. It is therefore
+off by default and meant for checking that the firmware does what the trained model does; the
+`AccumPrecision` of a single layer is available when only some layers need it.
 
 ## Testing
 

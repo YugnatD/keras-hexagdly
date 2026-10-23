@@ -218,6 +218,46 @@ def _bias_integer_bits(node):
     return int(integer) if integer is not None else 0
 
 
+def _bias_fraction_bits(node):
+    """Fractional bits of the layer's bias type, or 0 if it is not fixed point."""
+    try:
+        prec = node.get_weights("mac_bias").type.precision
+        return int(prec.width) - int(prec.integer)
+    except Exception:
+        return 0
+
+
+def _accum_override(node):
+    """The accumulator type the user set in the layer config (``AccumPrecision``), or None.
+
+    Read like ``Dataflow`` and ``ParallelizationFactor``: ``config["LayerName"][name]
+    ["AccumPrecision"] = "ap_fixed<W,I>"``. Nodes without a model (stand-alone calls) have none.
+    """
+    model = getattr(node, "model", None)
+    if model is None:
+        return None
+    value = model.config.get_layer_config_value(node, "AccumPrecision", None)
+    return str(value) if value else None
+
+
+def _exact_accumulator(node):
+    """Whether the accumulator must keep every bit of each product (``ExactAccumulator``).
+
+    ``config["Model"]["ExactAccumulator"] = True`` turns it on for the whole model, and a layer
+    can set it itself (``config["LayerName"][name]["ExactAccumulator"]``), which then wins. Both are
+    read here because a layer that has a ``LayerName`` entry does not fall back to the ``Model``
+    section for the keys read through ``get_layer_config_value``.
+    """
+    model = getattr(node, "model", None)
+    if model is None:
+        return False
+    value = model.config.get_layer_config_value(node, "ExactAccumulator", None)
+    if value is None:
+        section = (model.config.get_config_value("HLSConfig", None) or {}).get("Model", {})
+        value = section.get("ExactAccumulator", False)
+    return bool(value)
+
+
 def _accum_type_str(node, n_terms):
     """Return an ap_fixed<> string for the ring-MAC accumulator.
 
@@ -236,9 +276,23 @@ def _accum_type_str(node, n_terms):
 
     Falls back to the plain weight-type name if the precision can't be read
     (e.g. a non-FixedPrecision type), which preserves the old behavior.
+
+    The fractional bits stay those of the finer operand, so the low bits of each product are
+    dropped; with narrow quantized inputs that is a visible difference from the exact Keras
+    computation. Two settings change that, neither on by default:
+
+    * ``ExactAccumulator`` (``config["Model"]`` for the whole model, or one layer): the fractional
+      bits are those of the exact product, ``f_weight + f_input`` (or the bias's, if finer), so
+      nothing is dropped, and the integer bits get the carry of the bias addition. It costs
+      accumulator width, hence logic;
+    * ``AccumPrecision`` (a layer): the type itself, which replaces all of this (see
+      ``QConv2d.accum_type`` for the exact one).
     """
     import math
 
+    override = _accum_override(node)
+    if override:
+        return override
     prec = node.get_weights("mac_weights").type.precision
     width = getattr(prec, "width", None)
     integer = getattr(prec, "integer", None)
@@ -247,8 +301,14 @@ def _accum_type_str(node, n_terms):
         return node.get_weights("mac_weights").type.name
     input_integer, input_fraction = _input_precision(node)
     growth = int(math.ceil(math.log2(max(1, n_terms))))
-    accum_integer = max(integer + input_integer + growth, _bias_integer_bits(node))
-    accum_fraction = max(width - integer, input_fraction)
+    products_integer = integer + input_integer + growth
+    if _exact_accumulator(node):
+        # every bit of the products and of the bias is kept, and the bias addition has a carry
+        accum_integer = max(products_integer, _bias_integer_bits(node)) + 1
+        accum_fraction = max((width - integer) + input_fraction, _bias_fraction_bits(node))
+    else:
+        accum_integer = max(products_integer, _bias_integer_bits(node))
+        accum_fraction = max(width - integer, input_fraction)
     u = "" if signed else "u"
     return f"ap_{u}fixed<{accum_integer + accum_fraction}, {accum_integer}>"
 

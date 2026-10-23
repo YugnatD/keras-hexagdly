@@ -101,6 +101,7 @@ from keras_hexagdly.indexed import (
     get_cell_weights,
     get_cell_weights_3d,
 )
+from keras_hexagdly.layers import _mapped_inputs
 
 # ---------------------------------------------------------------------------
 # Folded builders (strategy="folded")
@@ -487,6 +488,14 @@ _REPLACEMENTS_FOLDED = {
 }
 
 
+def _all_layers(model):
+    """The layers of ``model`` and, recursively, those of the models nested in it."""
+    for layer in model.layers:
+        yield layer
+        if isinstance(layer, keras.Model):
+            yield from _all_layers(layer)
+
+
 def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
     """Return a new Keras functional model with hex layers replaced by hls4ml-native ops.
 
@@ -540,6 +549,15 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
     if not isinstance(model, keras.Model):
         raise TypeError(f"Expected a keras.Model, got {type(model).__name__}.")
 
+    unfrozen = [
+        layer.name for layer in _all_layers(model) if getattr(layer, "_hexagdly_qat", False)
+    ]
+    if unfrozen:
+        raise ValueError(
+            f"The quantization-aware layers {unfrozen} would be left untouched in the exported "
+            "model. Call keras_hexagdly.freeze(model) first and patch the frozen model it returns."
+        )
+
     # No replacement exists for these, so left alone they would reach hls4ml as
     # an unknown custom layer and fail there with an unrelated error.
     unsupported = [l.name for l in model.layers if isinstance(l, hgly.AvgPool2d)]
@@ -571,11 +589,7 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
             continue
 
         # Resolve this layer's input tensor(s) through the map.
-        raw_in = layer.input
-        if isinstance(raw_in, (list, tuple)):
-            x = [tensor_map[id(t)] for t in raw_in]
-        else:
-            x = tensor_map[id(raw_in)]
+        x = _mapped_inputs(layer, tensor_map)
 
         # Apply replacement or pass-through.
         fn = replacements.get(type(layer))

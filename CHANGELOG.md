@@ -3,6 +3,62 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.0] - 2026-10-23
+
+### Added
+
+- **Quantization-aware training of the hexagonal layers with HGQ2** (optional: `pip install
+  keras-hexagdly[qat]`, needs Python >= 3.10 and HGQ2 >= 0.1.6; tested with 0.1.6 to 0.2.0). `QConv2d`, `QConv3d`, `QConv2d_CustomKernel`,
+  `QConv3d_CustomKernel`, `QMaxPool2d`, `QMaxPool3d` and `QAvgPool2d` are the hexagonal layers with HGQ2
+  quantizers on the kernel (`kq_conf`, HGQ2's weight config by default), the bias (`bq_conf`), the input
+  (`iq_conf`) and the output after the activation (`oq_conf`); all but the kernel are off unless
+  given. The pooling layers have no weights, so only their input and output can be quantized; the
+  custom-kernel layers train their kernels only with `trainable=True`. The bit widths are fixed or
+  learned under a regulariser that pushes them down (a weight that reaches 0 bit is removed). Every
+  sub-kernel of the hexagonal decomposition has its own quantizer; with `share_neighbors` (any mode)
+  the shared weights are quantized. The quantizer variables and configs are saved with the model
+  (`model.save()` / `load_model()`). `import keras_hexagdly` still works without hgq2: the quantized
+  layers and `freeze` are loaded on first use.
+- **`keras_hexagdly.freeze(model, activation_quantizers="keep")`** returns `(frozen_model, types)`: the
+  quantized layers become plain layers holding the quantized values, with the same outputs (checked),
+  and `types` gives, per layer, the `ap_fixed` type of the `weight`, `bias`, `input`, `result` (the
+  input / output quantizer, with its rounding and overflow modes) and `accum`. `"keep"` leaves the
+  activation quantizers in the frozen model as standalone HGQ2 layers (to check the quantization in
+  Keras); `"types"` drops them, their precision being in `types`, for hls4ml `io_stream` (per-layer
+  activation quantizers only: hls4ml handles per-element ones in `io_parallel` only). Per-layer methods:
+  `weight_type()`, `bias_type()`, `input_type()`, `result_type()`, `accum_type()`.
+- **`ExactAccumulator` and `AccumPrecision`**, two hls4ml config keys for the accumulator of an exported
+  hex convolution, both off by default (existing exports do not change). The default accumulator keeps
+  the fractional bits of the finer of the weights and the input, which drops the low bits of each
+  product (visible with narrow quantized inputs: the C simulation differed from Keras by a few steps).
+  `config["Model"]["ExactAccumulator"] = True` (or on one layer, which wins) keeps all the bits of the
+  product, `f_weight + f_input`; `config["LayerName"][name]["AccumPrecision"] = "ap_fixed<W,I>"` sets the
+  type itself (`types[...]["accum"]` is the exact one) and wins over `ExactAccumulator`. With either, the
+  C simulation of a layer with a quantized input, weights, bias and output equals the Keras model bit
+  for bit (`tests/test_quantized_csim.py`). The wider accumulator costs logic: measured with Vitis HLS
+  on one hex convolution, from +18 % flip-flops and 130 DSPs with narrow types to 3x the LUTs with
+  16-bit types (README, "Accumulator width"; measured before the carry bit below was added), which is
+  why it is opt-in. The exact accumulator also has one extra integer bit (the carry of the bias addition)
+  and keeps the fractional bits of a finer bias. `AccumPrecision` is read per layer only.
+
+### Fixed
+
+- Weight and bias `ap_fixed` types of quantized layers are derived from the quantized values (they used to
+  be computed from the quantizer parameters, which was wrong for negative integer bits); `freeze` handles
+  nested models and `get_config` / `from_config` round-trip the quantizers.
+- `patch_model_for_hls` failed with a bare `KeyError` on a model that reuses a layer object that already
+  belongs to another model (or is called twice): `layer.input` is the input of the layer's first graph
+  node. It now raises a `ValueError` that names the layer and says to rebuild it (`freeze` gives the
+  same error). It also refuses a model that still contains quantized layers (they would have been
+  exported as unquantized float layers) and asks for `freeze(model)` first.
+- The exported hex layers (`HexConvLineBuffer`, `HexPoolLineBuffer` and their 3D versions) now opt out
+  of the XLA compilation Keras turns on by itself on a GPU: their int32 gather table lives on the CPU
+  and XLA could not read it (`predict()` of a patched model failed on a TensorFlow GPU with "resource
+  located in device CPU from device GPU").
+- The even-size warning of 0.6.1 used a fixed stack level, so it would have pointed inside the
+  library for a layer that subclasses another one (such as `QConv2d`); it now always points at the
+  line that built the layer.
+
 ## [0.6.1] - 2026-10-22
 
 ### Added
