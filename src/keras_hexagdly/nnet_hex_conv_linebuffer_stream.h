@@ -312,8 +312,6 @@ void hex_conv_linebuffer_stream_fused(
     // trigger -- see file header. The output COLUMN is derived from the read
     // column instead of being counted, because the window fixes the lag at
     // exactly DCMAX columns.
-    int cur_emit_oh  = -1;
-    int cur_emit_col = 0;
 
     // The row loop runs R_TOTAL >= H iterations: real input rows (r < H, one
     // input.read() per column) plus, if needed, a handful of *virtual* trailing
@@ -395,26 +393,21 @@ ReadRows:
             // 3. Emit the output pixel whose taps the window now holds. The
             //    read head is DCMAX columns past it, so its output column is
             //    (c - DCMAX)/stride -- only every stride-th iteration emits.
-            //    cur_emit_col also acts as the "already emitted" guard: with
-            //    stride > 1 the trigger below leaves cur_emit_oh unchanged for
-            //    S consecutive input rows, so without a counter that saturates
-            //    at out_width the same output row would be emitted S times.
+            //    The output row is armed by the previous input row and emitted during
+            //    that one row only (with stride > 1 an output row is unlocked every S
+            //    input rows, so the (rr % S) == 0 test below is what stops it from
+            //    being emitted S times).
             const int ce = c - DCMAX;
-            if (cur_emit_oh >= 0 && ce >= 0 && (ce % S) == 0 && cur_emit_col < W_OUT) {
+            // The pixel emitted at (r, c) is a pure function of the loop indices: output row
+            // (r - 1 - DRMAX) / S, armed at the end of the previous input row, output column ce / S.
+            // No state is carried between iterations (a counter tested and incremented in the same
+            // iteration is a loop-carried recurrence that held the pipeline at II=2).
+            const int rr = r - 1 - DRMAX;
+            if (rr >= 0 && (rr % S) == 0 && (rr / S) < OH && ce >= 0 && (ce % S) == 0 &&
+                (ce / S) < W_OUT) {
                 hex_lb_emit_pixel<res_T, w_T, b_T, CONFIG_T, dval>(
-                    win, cur_emit_oh, cur_emit_col, weights, bias, output);
-                cur_emit_col++;
+                    win, rr / S, ce / S, weights, bias, output);
             }
-        }
-        // Row r unlocks output row oh_ready(r) = floor((r - DRMAX) / S) (an `if`
-        // on a pure function of the static loop index r -- see file header for
-        // why this, not a `while`, is what lets Vitis resolve a fixed latency/II).
-        // This formula is agnostic to whether row r was real or virtual.
-        const int oh_cur  = (r     >= DRMAX) ? (r     - DRMAX) / S : -1;
-        const int oh_prev = (r - 1 >= DRMAX) ? (r - 1 - DRMAX) / S : -1;
-        if (oh_cur != oh_prev && oh_cur >= 0 && oh_cur < OH) {
-            cur_emit_oh  = oh_cur;
-            cur_emit_col = 0;
         }
     }
 }
@@ -591,7 +584,16 @@ void hex_lb_mac_stream(
     // Measured on a 19x16x32 layer at RF=16: DSP stayed at its 608 cap while
     // Expression LUT reached 265134 -- the adders, not the multipliers, were
     // 80% of a 212%-of-device LUT figure.
-    #pragma HLS ALLOCATION operation instances=add limit=MAC_BLOCK
+    // At reuse_factor 1 nothing is shared across cycles, and a cap equal to the number of products
+    // is below what the MAC needs: constant-coefficient multiplications become shift-and-add
+    // networks (the add_ln73/sub_ln73 operations of nnet_mult.h), on top of the accumulation tree and
+    // the loop counter. With the cap at MAC_BLOCK Vitis shared adders and MacPixels fell to II=2
+    // (measured: 299 cycles instead of 194 on a 12x12 layer). Removing the cap altogether made
+    // Vitis allocate ~49 GB while scheduling, so it is raised, not removed: 4x was enough for
+    // 6/7-bit, 9/10-bit and 16-bit weights, with the same LUT/FF as 2x. With reuse_factor > 1 the cap
+    // is what it was.
+    constexpr unsigned ADD_LIMIT = (CONFIG_T::reuse_factor == 1) ? 4 * MAC_BLOCK : MAC_BLOCK;
+    #pragma HLS ALLOCATION operation instances=add limit=ADD_LIMIT
 
     if (CONFIG_T::reuse_factor == 1) {
         #pragma HLS ARRAY_PARTITION variable=weights complete
@@ -698,13 +700,6 @@ void hex_lb_window_stream(
     dval win[NR][CSPAN][Cin];
     #pragma HLS ARRAY_PARTITION variable=win complete dim=0
 
-    // The output row currently being emitted, lagging one input row behind its
-    // trigger -- see file header. The output COLUMN is derived from the read
-    // column instead of being counted, because the window fixes the lag at
-    // exactly DCMAX columns.
-    int cur_emit_oh  = -1;
-    int cur_emit_col = 0;
-
     // The row loop runs R_TOTAL >= H iterations: real input rows (r < H, one
     // input.read() per column) plus, if needed, a handful of *virtual* trailing
     // rows (r >= H, no read -- taps referencing them are already 0 via the
@@ -785,16 +780,21 @@ ReadRows:
             // 3. Emit the output pixel whose taps the window now holds. The
             //    read head is DCMAX columns past it, so its output column is
             //    (c - DCMAX)/stride -- only every stride-th iteration emits.
-            //    cur_emit_col also acts as the "already emitted" guard: with
-            //    stride > 1 the trigger below leaves cur_emit_oh unchanged for
-            //    S consecutive input rows, so without a counter that saturates
-            //    at out_width the same output row would be emitted S times.
+            //    The output row is armed by the previous input row and emitted during
+            //    that one row only (with stride > 1 an output row is unlocked every S
+            //    input rows, so the (rr % S) == 0 test below is what stops it from
+            //    being emitted S times).
             const int ce = c - DCMAX;
-            if (cur_emit_oh >= 0 && ce >= 0 && (ce % S) == 0 && cur_emit_col < W_OUT) {
+            // Pure function of the loop indices, as in the fused kernel: output row
+            // (r - 1 - DRMAX) / S, output column ce / S, no state carried between iterations
+            // (the counters this replaces held the loop at II=2).
+            const int rr = r - 1 - DRMAX;
+            if (rr >= 0 && (rr % S) == 0 && (rr / S) < OH && ce >= 0 && (ce % S) == 0 &&
+                (ce / S) < W_OUT) {
                 dval taps_out[CONFIG_T::k * Cin];
                 #pragma HLS ARRAY_PARTITION variable=taps_out complete
                 hex_lb_gather_taps<CONFIG_T, dval>(
-                    win, cur_emit_oh, cur_emit_col, taps_out);
+                    win, rr / S, ce / S, taps_out);
                 typedef hex_tap_beats<CONFIG_T, dval> TB;
                 for (unsigned b = 0; b < TB::COUNT; b++) {
                     #pragma HLS UNROLL
@@ -806,18 +806,7 @@ ReadRows:
                     }
                     taps.write(beat);
                 }
-                cur_emit_col++;
             }
-        }
-        // Row r unlocks output row oh_ready(r) = floor((r - DRMAX) / S) (an `if`
-        // on a pure function of the static loop index r -- see file header for
-        // why this, not a `while`, is what lets Vitis resolve a fixed latency/II).
-        // This formula is agnostic to whether row r was real or virtual.
-        const int oh_cur  = (r     >= DRMAX) ? (r     - DRMAX) / S : -1;
-        const int oh_prev = (r - 1 >= DRMAX) ? (r - 1 - DRMAX) / S : -1;
-        if (oh_cur != oh_prev && oh_cur >= 0 && oh_cur < OH) {
-            cur_emit_oh  = oh_cur;
-            cur_emit_col = 0;
         }
     }
 }

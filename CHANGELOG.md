@@ -57,6 +57,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Hex convolution kernels in `io_stream`: half the latency.** The fused line-buffer kernel and the window
+  process of its `Dataflow` version carried two counters (`cur_emit_oh`, `cur_emit_col`) from one iteration
+  to the next, tested and incremented in the same iteration. Vitis could not pipeline that loop below II=2
+  (`Unable to enforce a carried dependence constraint`), so every layer took twice the cycles: 376 instead of
+  195 for a 12x12 image with 8 to 16 channels. The row and column of the pixel to emit are functions of the
+  loop indices, so the kernels now compute them and carry nothing: II=1, and the C-simulation outputs are
+  unchanged (compared with the previous kernel on 62 convolution configurations: strides 1 to 3, kernel sizes
+  0 to 2, even and odd grids, with and without ring sharing; new tests in `tests/test_hex_linebuffer_csim.py`).
+  Synthesis, `xc7vx485tffg1927-2`, 5 ns, one layer: latency 376 -> 195, LUT -1.8 %, FF -0.4 %, DSP and BRAM
+  unchanged. The `Dataflow` version had the same defect in its window process and a second cause in its MAC process
+  (`MacPixels`): the cap `ALLOCATION operation instances=add limit=MAC_BLOCK` is below what the MAC needs at
+  `reuse_factor=1` (constant multiplications become shift-and-add networks, plus the accumulation tree and the
+  loop counter), so Vitis shared adders and the loop fell to II=2. The cap is now 4x `MAC_BLOCK` when the reuse
+  factor is 1 and unchanged otherwise. Same layer: 375 -> 194 cycles, LUT -3.8 %, FF -6.4 % (narrow types); with
+  the 9/10-bit and 16-bit types of the README table it also reaches 194 cycles at II=1. Removing the cap
+  altogether is not an option: Vitis then used about 49 GB of memory while scheduling. The max pooling kernel was already at II=1 and is unchanged; the 3D
+  kernels (a different structure, export not validated) were not looked at.
 - `freeze` follows the graph of the model instead of walking `model.layers`: raw operations
   (`+`, `keras.ops.*`, residual connections), a layer called more than once, a layer reused by another
   model and nested Functional models used to give a bare `KeyError` or a "not wired" error.

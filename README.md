@@ -306,6 +306,10 @@ hgq2 `hasattr(keras_hexagdly, "QConv2d")` is simply False.
 
 Only what you give a quantizer is quantized: the other layers of a model, the activations without an
 `oq_conf`, and the bias without a `bq_conf` stay in float. The 3D layers have no hls4ml export yet.
+A model that also contains HGQ2's own layers (`QDense`, ...) trains fine and counts them in the EBOPs, but it
+cannot be exported to hls4ml yet (see `ROADMAP.md`): the hls4ml path for HGQ2 layers needs a precision
+function that the exported hex layers do not have, and the conversion stops with `No implementation of
+produce_kif`.
 
 ### New: same-padded temporal convolution (Conv3d)
 
@@ -413,24 +417,41 @@ layer entry it recognises, which overrides the model-level value -- but custom
 layers get no entry and inherit the model-level one instead. Without an explicit
 per-layer setting, a single model ends up mixing two different reuse factors.
 
-### Accumulator width: `ExactAccumulator`
+### Accumulator width: `ExactAccumulator`, and the cost against a square layer
 
 The accumulator of an exported hex convolution keeps, by default, the fractional bits of the finer of the
 weights and the input; `config["Model"]["ExactAccumulator"] = True` keeps all the bits of each product
 instead (`f_weight + f_input`), so the C simulation of a quantized model equals its Keras model bit for
-bit. It makes the accumulator wider, and that costs logic. Vitis HLS 2024.2 estimates for one 12x12
-hex convolution (8 channels to 16, 7-cell hexagon, the same on-grid random weights in both runs,
-`io_stream`, Latency, reuse factor 1, `xc7vx485tffg1927-2`, 5 ns; measured again with the final
-accumulator, whose carry bit adds one bit to the exact types and left every figure below unchanged):
+bit. It makes the accumulator wider, and that costs logic.
 
-| types (input / weight) | accumulator | LUT | FF | DSP | latency (cycles) |
-|---|---|---|---|---|---|
-| `<6,3>` / `<7,2>` | default `<16,11>` | 39 710 | 40 178 | 0 | 376 |
-| | exact `<20,12>` | 38 873 | 47 497 | 130 | 376 |
-| `<10,4>` / `<9,3>` | default `<19,13>` | 55 075 | 53 145 | 0 | 376 |
-| | exact `<26,14>` | 47 138 | 74 756 | 272 | 376 |
-| `<16,6>` / `<16,6>` | default `<28,18>` | 39 258 | 126 547 | 755 | 377 |
-| | exact `<39,19>` | 117 381 | 238 231 | 925 | 380 |
+Vitis HLS 2024.2 estimates for one 12x12 convolution, 8 channels to 16, the same on-grid random weights in
+every run, `io_stream`, `Strategy='Latency'`, reuse factor 1, `xc7vx485tffg1927-2` (XC7VX485T-2FFG1927C),
+5 ns. The square row is hls4ml's own `Conv2D` 3x3 (`padding="same"`, 9 taps instead of the hexagon's 7),
+given the same accumulator type as the hex layer's default one, so that only the geometry and the kernel
+differ:
+
+| types (input / weight) | layer | accumulator | LUT | FF | DSP | BRAM_18K | latency (cycles) |
+|---|---|---|---|---|---|---|---|
+| `<6,3>` / `<7,2>` | hex, default | `<16,11>` | 38 989 | 40 018 | 0 | 14 | 195 |
+| | hex, `Dataflow` | `<16,11>` | 40 151 | 39 060 | 0 | 33 | 194 |
+| | hex, exact | `<20,12>` | 38 152 | 47 338 | 130 | 14 | 195 |
+| | square 3x3 | `<16,11>` | 43 589 | 40 291 | 0 | 17 | 207 |
+| `<10,4>` / `<9,3>` | hex, default | `<19,13>` | 54 354 | 53 049 | 0 | 19 | 195 |
+| | hex, `Dataflow` | `<19,13>` | 55 230 | 52 156 | 0 | 51 | 194 |
+| | hex, exact | `<26,14>` | 46 417 | 74 660 | 272 | 19 | 195 |
+| | square 3x3 | `<19,13>` | 66 600 | 56 085 | 0 | 24 | 207 |
+| `<16,6>` / `<16,6>` | hex, default | `<28,18>` | 38 584 | 126 550 | 755 | 28 | 196 |
+| | hex, `Dataflow` | `<28,18>` | 39 193 | 123 690 | 755 | 78 | 194 |
+| | hex, exact | `<39,19>` | 116 642 | 238 235 | 925 | 28 | 199 |
+| | square 3x3 | `<28,18>` | 46 107 | 144 452 | 971 | 36 | 207 |
+
+Against the square layer the hex layer has the cost its 7 taps promise: **755 DSPs against 971 (0.78 =
+7/9)** with the wide types, 11 to 18 % fewer LUTs, 1 to 12 % fewer flip-flops and 18 to 22 % fewer BRAMs,
+and a latency of 195 cycles (14 x 13 pixel iterations: the 12x12 image plus the rows and columns that flush
+the pipeline) against 207. The `Dataflow` kernel reaches the same latency
+as the default one on this layer for 2 to 3 times the BRAM (the stream between its two processes), so the
+default is the one to use here; `Dataflow` was designed for larger layers and was not measured with a reuse
+factor above 1.
 
 With narrow types the exact accumulator mostly moves work from LUTs to DSPs and flip-flops; with wide
 types it triples the LUTs. The latency and the clock are about the same. These are synthesis estimates,
@@ -473,9 +494,9 @@ Verified to pass on all three Keras 3 backends (set `KERAS_BACKEND=tensorflow|to
 before importing keras; tensorflow is the default if unset):
 
 ```
-KERAS_BACKEND=tensorflow   # 1108 passed, 14 skipped
-KERAS_BACKEND=torch        # 1100 passed, 22 skipped
-KERAS_BACKEND=jax          # 983 passed, 139 skipped (slower: per-shape JIT compile)
+KERAS_BACKEND=tensorflow   # 1142 passed, 16 skipped
+KERAS_BACKEND=torch        # 1134 passed, 24 skipped
+KERAS_BACKEND=jax          # 983 passed, 175 skipped (slower: per-shape JIT compile)
 ```
 
 A GitHub Actions workflow ([.github/workflows/test.yml](.github/workflows/test.yml))
