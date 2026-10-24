@@ -57,6 +57,10 @@ Issues = "https://github.com/YugnatD/keras-hexagdly/issues"
 Changelog = "https://github.com/YugnatD/keras-hexagdly/blob/main/CHANGELOG.md"
 "Original (HexagDLy)" = "https://github.com/ai4iacts/hexagdly"
 
+[tool.hatch.build.targets.sdist]
+# an explicit list: untracked work directories (docs/, benchmarks/) must never end up in an sdist
+include = ["/src", "/tests", "/conftest.py", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE.md", "/pyproject.toml"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/keras_hexagdly"]
 

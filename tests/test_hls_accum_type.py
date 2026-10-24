@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 pytest.importorskip("hls4ml")
@@ -10,13 +11,17 @@ from hls4ml.model.types import FixedPrecisionType, IntegerPrecisionType
 from keras_hexagdly.hls4ml_handler import _accum_type_str
 
 
-def node(weight_precision, input_precision=None, bias_precision=None, *, model=None, layer=None):
+def node(
+    weight_precision, input_precision=None, bias_precision=None, *, model=None, layer=None, bias=1.0
+):
     """What _accum_type_str reads: the weight, bias and input variable types, and the config.
 
     ``model`` / ``layer`` are the ``Model`` section and the layer's own ``LayerName`` entry of the
     hls4ml config; None means no hls4ml model at all (a stand-alone call)."""
     weights = SimpleNamespace(type=SimpleNamespace(precision=weight_precision, name="weight_t"))
-    bias = SimpleNamespace(type=SimpleNamespace(precision=bias_precision or weight_precision))
+    bias = SimpleNamespace(
+        type=SimpleNamespace(precision=bias_precision or weight_precision), data=np.full(3, bias)
+    )
     variable = SimpleNamespace(type=SimpleNamespace(precision=input_precision))
     config = None
     if model is not None or layer is not None:
@@ -130,3 +135,31 @@ def test_the_default_accumulator_has_no_carry_bit():
     assert _accum_type_str(node(WEIGHTS, INPUT, model={"ExactAccumulator": False}), 56) == (
         "ap_fixed<24, 11>"
     )
+
+
+def test_a_bias_of_zeros_does_not_widen_the_exact_accumulator():
+    # use_bias=False still gives hls4ml a zero bias array, typed with the (wide) default precision
+    wide_default = FixedPrecisionType(32, 12)
+    model = {"ExactAccumulator": True}
+    no_bias = node(
+        FixedPrecisionType(7, 2), FixedPrecisionType(6, 3), wide_default, model=model, bias=0.0
+    )
+    with_bias = node(FixedPrecisionType(7, 2), FixedPrecisionType(6, 3), wide_default, model=model)
+    assert _accum_type_str(no_bias, 7) == "ap_fixed<17, 9>"
+    assert _accum_type_str(with_bias, 7) == "ap_fixed<33, 13>"
+
+
+@pytest.mark.parametrize("text", ["False", "false", "0", "no", "off"])
+def test_a_text_config_value_of_false_does_not_switch_the_exact_accumulator_on(text):
+    for where in ({"model": {"ExactAccumulator": text}}, {"layer": {"ExactAccumulator": text}}):
+        n = node(FixedPrecisionType(7, 2), FixedPrecisionType(6, 3), **where)
+        default = node(FixedPrecisionType(7, 2), FixedPrecisionType(6, 3))
+        assert _accum_type_str(n, 7) == _accum_type_str(default, 7)
+
+
+def test_a_text_config_value_of_true_switches_it_on():
+    n = node(FixedPrecisionType(7, 2), FixedPrecisionType(6, 3), model={"ExactAccumulator": "True"})
+    exact = node(
+        FixedPrecisionType(7, 2), FixedPrecisionType(6, 3), model={"ExactAccumulator": True}
+    )
+    assert _accum_type_str(n, 7) == _accum_type_str(exact, 7)

@@ -208,11 +208,23 @@ def _input_precision(node):
     return int(integer), int(width) - int(integer)
 
 
+def _bias_precision(node):
+    """The fixed-point precision of the layer's bias, or None when there is nothing to hold: the
+    type cannot be read, or the bias is all zeros (``use_bias=False`` still gives hls4ml a zero
+    bias array, typed with the model default precision, which must not widen the accumulator)."""
+    try:
+        bias = node.get_weights("mac_bias")
+        if not np.any(bias.data):
+            return None
+        return bias.type.precision
+    except Exception:
+        return None
+
+
 def _bias_integer_bits(node):
     """Integer bits of the layer's bias type, or 0 if it is not fixed point."""
-    try:
-        prec = node.get_weights("mac_bias").type.precision
-    except Exception:
+    prec = _bias_precision(node)
+    if prec is None:
         return 0
     integer = getattr(prec, "integer", None)
     return int(integer) if integer is not None else 0
@@ -220,8 +232,8 @@ def _bias_integer_bits(node):
 
 def _bias_fraction_bits(node):
     """Fractional bits of the layer's bias type, or 0 if it is not fixed point."""
+    prec = _bias_precision(node)
     try:
-        prec = node.get_weights("mac_bias").type.precision
         return int(prec.width) - int(prec.integer)
     except Exception:
         return 0
@@ -255,6 +267,8 @@ def _exact_accumulator(node):
     if value is None:
         section = (model.config.get_config_value("HLSConfig", None) or {}).get("Model", {})
         value = section.get("ExactAccumulator", False)
+    if isinstance(value, str):  # a config read from text: "False" must not switch it on
+        return value.strip().lower() in ("true", "1", "yes", "on")
     return bool(value)
 
 

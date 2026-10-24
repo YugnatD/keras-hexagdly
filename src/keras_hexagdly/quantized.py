@@ -1,7 +1,10 @@
 """Quantization-aware training (QAT) of the hexagonal layers, with HGQ2 quantizers.
 
-Optional: needs ``hgq2`` (``pip install keras-hexagdly[qat]``). ``import keras_hexagdly`` never
-imports this module; the names below are loaded from the package on first use.
+Optional: needs ``hgq2`` (``pip install keras-hexagdly[qat]``). ``import keras_hexagdly`` imports
+this module when hgq2 is installed (so that saved models load), and works without it.
+
+Convolutions with an input quantizer also count EBOPs (HGQ2's cost measure, see ``_compute_ebops``)
+and add ``beta * EBOPs`` to the loss while training, so HGQ2's FreeEBOPs / BetaPID callbacks work.
 
 Every quantized layer is the hexagonal layer it is named after, plus HGQ2 quantizers that you switch
 on one by one with a ``QuantizerConfig``:
@@ -58,12 +61,18 @@ from .layers import (
     Conv3d_CustomKernel,
     MaxPool2d,
     MaxPool3d,
-    _mapped_inputs,
+    _require_static_spatial,
 )
 
 try:
+    from hgq.config.layer import global_config
+    from hgq.layers.core.base import QLayerBase
     from hgq.quantizer import Quantizer, QuantizerConfig
 except ImportError as exc:  # pragma: no cover - exercised through the package __getattr__
+    import importlib.util
+
+    if importlib.util.find_spec("hgq") is not None:
+        raise ImportError(f"hgq2 is installed but cannot be imported ({exc})") from exc
     raise ImportError(
         "keras_hexagdly quantized layers need the optional dependency hgq2 (Python >= 3.10): "
         "pip install 'keras-hexagdly[qat]'"
@@ -81,6 +90,7 @@ __all__ = [
 ]
 
 _QUANTIZER_ARGS = ("kq_conf", "bq_conf", "iq_conf", "oq_conf")
+_EBOPS_ARGS = ("enable_ebops", "beta0", "ebops_factor")
 _PRUNED = "ap_fixed<2,1>"  # what is left to represent when every value was pruned away
 # HGQ2 mode names that exist as AP_<name> in ap_types. The stochastic roundings (S_RND, S_RND_CONV)
 # are for training only and have no hardware equivalent.
@@ -140,6 +150,14 @@ def _activation_type(quantizer):
             f"A type can only be deduced from a fixed-point quantizer (kbi or kif), "
             f"not {type(inner).__name__}."
         )
+    if (
+        getattr(quantizer, "scaler", None) is not None
+        or getattr(quantizer, "affine", None) is not None
+    ):
+        raise ValueError(
+            "This quantizer has a scaler or an affine transform, which moves its output off the "
+            "grid its bit widths describe: no ap_fixed type can be deduced from it."
+        )
     k, i, f = (np.round(_to_numpy(v)) for v in inner.kif)
     shape = np.broadcast_shapes(k.shape, i.shape, f.shape)
     k, i, f = (np.broadcast_to(v, shape) for v in (k, i, f))
@@ -172,8 +190,36 @@ class _Quantized:
     _plain_class = None
     _has_weights = True
 
-    def __init__(self, *args, kq_conf=None, bq_conf=None, iq_conf=None, oq_conf=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        kq_conf=None,
+        bq_conf=None,
+        iq_conf=None,
+        oq_conf=None,
+        enable_ebops=None,
+        beta0=None,
+        ebops_factor=1.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
+        for label, conf in (
+            ("kq_conf", kq_conf),
+            ("bq_conf", bq_conf),
+            ("iq_conf", iq_conf),
+            ("oq_conf", oq_conf),
+        ):
+            if conf is not None and not isinstance(conf, QuantizerConfig):
+                raise TypeError(
+                    f"{label} must be an HGQ2 QuantizerConfig (or None), got {type(conf).__name__}."
+                )
+        if keras.backend.backend() == "tensorflow" and self.compute_dtype != "float32":
+            raise ValueError(
+                "HGQ2 quantizers do not support half precision (mixed_float16 / mixed_bfloat16) "
+                "on the TensorFlow backend: use the torch or JAX backend, or float32."
+            )
+        if beta0 is not None and float(beta0) < 0:
+            raise ValueError(f"beta0 must be >= 0, got {beta0}.")
         if not self._has_weights and (kq_conf is not None or bq_conf is not None):
             raise ValueError(
                 f"{type(self).__name__} has no weights: only iq_conf and oq_conf apply to it."
@@ -188,6 +234,21 @@ class _Quantized:
         self.bq_conf, self.iq_conf, self.oq_conf = bq_conf, iq_conf, oq_conf
         # the quantizers themselves exist once the layer is built
         self._kqs, self._bq, self._iq, self._oq = [], None, None, None
+        # EBOPs (HGQ2's cost measure, read by its FreeEBOPs / BetaPID callbacks): need the bit
+        # widths of the input, hence an input quantizer
+        if enable_ebops is None:
+            enable_ebops = global_config["enable_ebops"] and iq_conf is not None
+            enable_ebops = enable_ebops and self._has_weights
+        elif enable_ebops and not (self._has_weights and iq_conf is not None):
+            raise ValueError(
+                "enable_ebops needs a layer with weights and an input quantizer (iq_conf): the "
+                "EBOPs are the bit widths of the weights times those of the input."
+            )
+        self.enable_ebops = bool(enable_ebops)
+        self._beta0 = float(global_config["beta0"] if beta0 is None else beta0)
+        self.ebops_factor = float(ebops_factor)
+        self._beta = self._ebops = None
+        self._ebops_pass = False  # True while the bit widths, not the values, go through the layer
 
     # -- the tensors that are quantized ---------------------------------------------------------
     def _kernel_sources(self):
@@ -200,7 +261,10 @@ class _Quantized:
         return 0
 
     def _quantize(self, quantizer, variable):
-        """The quantized variable, in the compute dtype of the layer (mixed precision)."""
+        """The quantized variable, in the compute dtype of the layer (mixed precision). During the
+        EBOPs pass, the bit widths of the quantizer for that variable."""
+        if self._ebops_pass:  # float32: a half precision sum of bits overflows at 65504
+            return keras.ops.cast(quantizer.bits_(keras.ops.shape(variable)), "float32")
         return keras.ops.cast(quantizer(variable), self.compute_dtype)
 
     def _materialize_kernels(self):
@@ -215,11 +279,15 @@ class _Quantized:
                 setattr(
                     self, "kernel" + str(i), self._quantize(self._kqs[i], self._base_kernels[i])
                 )
-        if self._bq is not None:
+        if self._ebops_pass:
+            self.kwargs = {"bias": None}  # the bias is counted apart
+        elif self._bq is not None:
             self.kwargs = {"bias": self._quantize(self._bq, self.bias_tensor)}
 
     # -- build / call -----------------------------------------------------------------------------
     def build(self, input_shape):
+        if self.iq_conf is not None or self.oq_conf is not None:
+            _require_static_spatial(input_shape, self.dimensions)  # the pools do not check
         super().build(input_shape)
         sources = self._kernel_sources()
         self._kqs = [
@@ -239,6 +307,20 @@ class _Quantized:
         if self.oq_conf is not None:
             self._oq = Quantizer(self.oq_conf, name=f"{self.name}_oq")
             self._oq.build(self._output_shape(input_shape))
+        if self.enable_ebops:
+            self._beta = self.add_weight(
+                name="beta",
+                shape=(),
+                initializer=keras.initializers.Constant(self._beta0),
+                trainable=False,
+            )
+            self._ebops = self.add_weight(
+                name="ebops",
+                shape=(),
+                initializer=keras.initializers.Constant(0.0),
+                trainable=False,
+                dtype="uint32",
+            )
 
     def _output_shape(self, input_shape):
         """The shape of the layer output (batch left open), found by running a one-sample probe."""
@@ -247,22 +329,75 @@ class _Quantized:
         out = super().call(probe)
         return (None,) + tuple(out.shape[1:])
 
-    def call(self, input):
+    def call(self, input, training=None):
+        shape = input.shape
+        # HGQ2 quantizers return float32: back to the compute dtype (mixed precision)
         if self._iq is not None:
-            input = self._iq(input)
+            input = keras.ops.cast(self._iq(input), self.compute_dtype)
         out = super().call(input)
         if self._oq is not None:
-            out = self._oq(out)
+            out = keras.ops.cast(self._oq(out), self.compute_dtype)
+        if (training or training == "tracing") and self.enable_ebops:
+            ebops = self._compute_ebops(shape) * self.ebops_factor
+            # the variable is a uint32: a larger count saturates instead of wrapping around
+            clipped = keras.ops.minimum(keras.ops.cast(ebops, "float32"), 4294967040.0)
+            self._ebops.assign(keras.ops.cast(clipped, self._ebops.dtype))
+            self.add_loss(ebops * self.beta)  # what HGQ2's own layers do: beta * EBOPs
         return out
 
+    def _compute_ebops(self, shape):
+        """The EBOPs of the layer for one sample: the bit widths of the input, convolved with those
+        of the kernels the way the values are (so a pruned weight, at 0 bit, costs nothing and the
+        zero padding of the border does not count), plus the bits of the bias for each output."""
+        shape = (1,) + tuple(shape[1:])
+        bits = keras.ops.cast(self._iq.bits_(shape), "float32")
+        activation, kwargs = getattr(self, "activation", None), self.kwargs
+        if activation is not None:  # the custom-kernel layers have none
+            self.activation = keras.activations.linear
+        self._ebops_pass = True
+        try:
+            self._materialize_kernels()  # the bit widths, for the layers whose call does not
+            out = super().call(bits)
+        finally:
+            if activation is not None:
+                self.activation = activation
+            self.kwargs, self._ebops_pass = kwargs, False
+        ebops = keras.ops.sum(out)
+        if self._bq is not None:
+            bias_bits = self._bq.bits_(keras.ops.shape(self.bias_tensor))
+            ebops = ebops + keras.ops.mean(keras.ops.cast(bias_bits, ebops.dtype)) * float(
+                np.prod(out.shape)
+            )
+        return ebops
+
+    @property
+    def ebops(self):
+        """EBOPs of the last training step (0 until one ran), as HGQ2's layers report it."""
+        if self._ebops is None:
+            return keras.ops.cast(0, "uint32")
+        return keras.ops.cast(self._ebops, self._ebops.dtype)
+
+    @property
+    def beta(self):
+        """The weight of the EBOPs in the loss (set by HGQ2's BetaScheduler / BetaPID)."""
+        if self._beta is None:
+            return keras.ops.cast(0, "float32")
+        return keras.ops.cast(self._beta, self._beta.dtype)
+
     # -- the numbers a deployment needs ---------------------------------------------------
+    def _require_built(self, what):
+        if not self.built:
+            raise ValueError(f"{what}() needs a built layer: call it on a tensor first.")
+
     def quantized_weights(self):
         """The quantized kernel values, as numpy arrays: one per sub-kernel (or the ring
         weights)."""
+        self._require_built("quantized_weights")
         return [_to_numpy(q(w)) for q, w in zip(self._kqs, self._kernel_sources())]
 
     def quantized_bias(self):
         """The quantized bias as a numpy array (the float bias when ``bq_conf`` is not set)."""
+        self._require_built("quantized_bias")
         if not self._has_weights or not self.use_bias:
             return None
         bias = self.bias_tensor
@@ -278,13 +413,15 @@ class _Quantized:
         """
         if not self._has_weights:
             return None
+        self._require_built("weight_type")
         return _exact_fixed_type(self.quantized_weights()) or _PRUNED
 
     def bias_type(self):
         """The ``ap_fixed<W,I>`` type that holds the quantized bias exactly, or ``None`` without
         ``bq_conf``."""
-        if self._bq is None:
+        if self.bq_conf is None:
             return None
+        self._require_built("bias_type")
         return _exact_fixed_type([self.quantized_bias()]) or _PRUNED
 
     def accum_type(self, input_type=None):
@@ -305,8 +442,7 @@ class _Quantized:
         """
         if not self._has_weights:
             return None
-        if not self.built:
-            raise ValueError("accum_type() needs a built layer: call it on a tensor first.")
+        self._require_built("accum_type")
         input_type = input_type or self.input_type()
         if input_type is None:
             raise ValueError(
@@ -329,10 +465,16 @@ class _Quantized:
 
     def input_type(self):
         """The ``ap_fixed<W,I,round,overflow>`` type of the input quantizer, or ``None``."""
+        if self.iq_conf is None:
+            return None
+        self._require_built("input_type")
         return self._activation_type_of(self._iq)
 
     def result_type(self):
         """The ``ap_fixed<W,I,round,overflow>`` type of the output quantizer, or ``None``."""
+        if self.oq_conf is None:
+            return None
+        self._require_built("result_type")
         return self._activation_type_of(self._oq)
 
     @staticmethod
@@ -348,13 +490,24 @@ class _Quantized:
             conf = getattr(self, name)
             # serialized: JSON for h5, and from_config(get_config()) / clone_model work
             config[name] = None if conf is None else keras.saving.serialize_keras_object(conf)
+        config.update(
+            enable_ebops=self.enable_ebops, beta0=self._beta0, ebops_factor=self.ebops_factor
+        )
         return config
 
     @classmethod
     def from_config(cls, config):
+        # a model saved before the EBOPs existed has none of their variables: they stay off
+        config = {"enable_ebops": False, **config}
         # the quantizer configs are stored serialized: turn them back into HGQ2 QuantizerConfig
         # objects, as HGQ2's own layers do
         return super().from_config(keras.saving.deserialize_keras_object(config))
+
+
+# HGQ2 finds the layers that count in the EBOPs with isinstance(layer, QLayerBase), as it does for
+# its own layers that do not derive from it (QGRU): these ones follow the same protocol
+# (enable_ebops, _ebops, _beta)
+QLayerBase.register(_Quantized)
 
 
 @keras.saving.register_keras_serializable(package="hexagdly_tf")
@@ -398,9 +551,9 @@ class _QuantizedCustomKernel(_Quantized):
             delattr(self, f"kernel{i}")  # this also untracks the variable...
         self._base_kernels = kernels  # ...so it is tracked again here, once the names are free
 
-    def call(self, input):
+    def call(self, input, training=None):
         self._materialize_kernels()
-        return super().call(input)
+        return super().call(input, training=training)
 
 
 @keras.saving.register_keras_serializable(package="hexagdly_tf")
@@ -438,7 +591,7 @@ class _QuantizedPool(_Quantized):
 class QMaxPool2d(_QuantizedPool, MaxPool2d):
     """:class:`~keras_hexagdly.MaxPool2d` with quantizers on its input and output (``iq_conf``,
     ``oq_conf``). A max of quantized values is already on their grid: ``oq_conf`` only changes
-    something when the input is not quantized."""
+    something when the input is not quantized or when its grid is coarser than the input's."""
 
     _plain_class = MaxPool2d
 
@@ -462,7 +615,14 @@ class QAvgPool2d(_QuantizedPool, AvgPool2d):
 def _copy_layer(layer):
     """A new layer of the same class and config (through Keras serialization, which also handles
     HGQ2's own layers, whose ``get_config`` holds objects)."""
-    return keras.saving.deserialize_keras_object(keras.saving.serialize_keras_object(layer))
+    try:
+        return keras.saving.deserialize_keras_object(keras.saving.serialize_keras_object(layer))
+    except (ValueError, TypeError):
+        if layer.weights:
+            raise
+        # a layer without weights that cannot be rebuilt from its config (a Lambda: the
+        # deserialization refuses Python functions): nothing to copy, the layer is reused
+        return layer
 
 
 def _frozen_quantizer(quantizer, name):
@@ -498,9 +658,12 @@ def freeze(model, activation_quantizers="keep"):
       to be set in the hls4ml config. The frozen model is then the float-activation model, and
       equals ``model`` only where the activations are already on their grid.
 
-    Works on built Functional and Sequential models (nested ones included) whose layers are each
-    called once; the structure of the outputs (a dict, for instance) is kept.
+    Works on built Functional and Sequential models: nested ones, layers called more than once and
+    raw operations (``+``, ``keras.ops.*``) between layers are followed through the graph, and the
+    structure of the inputs and outputs (a dict, for instance) is kept.
     """
+    if not isinstance(model, keras.Model):
+        raise TypeError(f"freeze expects a Keras model, got {type(model).__name__}.")
     if activation_quantizers not in ("keep", "types"):
         raise ValueError("activation_quantizers must be 'keep' or 'types'.")
     return _freeze(model, activation_quantizers == "keep", "_frozen")
@@ -512,69 +675,109 @@ def _freeze(model, keep, suffix):
             f"freeze needs a built Functional or Sequential model ({model.name!r} has no inputs "
             "yet: give it an Input or call it once)."
         )
-    types, tensor_map = {}, {id(t): t for t in model.inputs}
-
-    for layer in model.layers:
-        if isinstance(layer, keras.layers.InputLayer):
-            continue
-        x = _mapped_inputs(layer, tensor_map)
-        if isinstance(layer, keras.Model):  # a nested model: freeze what it contains
-            new, inner = _freeze(layer, keep, "")
-            types.update({f"{layer.name}/{name}": entry for name, entry in inner.items()})
-            y = new(x)
-        elif not isinstance(layer, _Quantized):
-            new = _copy_layer(layer)
-            y = new(x)
-            new.set_weights(layer.get_weights())
-        else:
-            if keep and layer._iq is not None:
-                iq = _frozen_quantizer(layer._iq, f"{layer.name}_iq")
-                x = iq(x)
-                iq.set_weights(layer._iq.get_weights())
-            config = layer.get_config()
-            for name in _QUANTIZER_ARGS:
-                config.pop(name)
-            new = layer._plain_class.from_config(config)
-            y = new(x)
-            _copy_quantized_values(layer, new)
-            new.trainable = False  # its weights are on the quantized grid: training would leave it
-            if keep and layer._oq is not None:
-                oq = _frozen_quantizer(layer._oq, f"{layer.name}_oq")
-                y = oq(y)
-                oq.set_weights(layer._oq.get_weights())
-            entry = {
-                "weight": layer.weight_type(),
-                "bias": layer.bias_type(),
-                "input": layer.input_type(),
-                "result": layer.result_type(),
-                "accum": layer.accum_type()
-                if layer._has_weights and layer._iq is not None
-                else None,
-            }
-            types[layer.name] = {k: v for k, v in entry.items() if v is not None}
-        raw_out = layer.output
-        if isinstance(raw_out, (list, tuple)):
-            for orig, new_t in zip(raw_out, y if isinstance(y, (list, tuple)) else [y]):
-                tensor_map[id(orig)] = new_t
-        else:
-            tensor_map[id(raw_out)] = y
-    inputs, outputs = _graph_structure(model)
-    outputs = keras.tree.map_structure(lambda t: tensor_map[id(t)], outputs)
-    return keras.Model(inputs, outputs, name=model.name + suffix), types
-
-
-def _graph_structure(model):
-    """The inputs and outputs of the model's own graph, with the structure the user gave them.
-
-    A Sequential that was called as a layer of another model reports, in ``.input`` / ``.output``,
-    the tensors of that call, not those of the graph its layers live in: ``.inputs`` / ``.outputs``
-    are the ones to read there."""
     if isinstance(model, keras.Sequential):
-        inputs, outputs = model.inputs, model.outputs
-        return inputs[0] if len(inputs) == 1 else inputs, outputs[0] if len(
-            outputs
-        ) == 1 else outputs
-    return model.input, model.output
+        # the graph of its layers: .inputs / .outputs, not the tensors of an outer call
+        model = keras.Model(model.inputs, model.outputs, name=model.name)
+    types, frozen = {}, {}  # frozen: id of an original layer -> (what replaces it)
+
+    def frozen_call(operation):
+        """What the new graph calls where the old one called ``operation``: a Keras operation
+        (``+``, ``keras.ops.*``) is kept; a layer, a nested model or a quantized layer is replaced
+        once, and reused when the old graph calls it again."""
+        if not isinstance(operation, keras.layers.Layer):
+            return operation
+        if id(operation) not in frozen:
+            frozen[id(operation)] = _FrozenLayer(operation, keep, types)
+        return frozen[id(operation)]
+
+    inputs = [
+        keras.Input(
+            batch_shape=tuple(t.shape),
+            dtype=t.dtype,
+            sparse=getattr(t, "sparse", False),
+            ragged=getattr(t, "ragged", False),
+            name=t._keras_history.operation.name,
+        )
+        for t in model.inputs
+    ]
+    outputs = model._run_through_graph(inputs, frozen_call)
+    structure = keras.tree.pack_sequence_as(model.input, inputs)
+    return keras.Model(structure, outputs, name=model.name + suffix), types
+
+
+class _FrozenLayer:
+    """The replacement of one layer of the graph in ``freeze``: built on its first call, since the
+    quantized values can only be copied into a layer that has weights."""
+
+    def __init__(self, layer, keep, types):
+        self.layer, self.keep, self.types = layer, keep, types
+        self.new = self.iq = self.oq = None
+
+    def __call__(self, *args, **kwargs):
+        layer = self.layer
+        if self.new is not None:
+            x = args[0]
+            if self.iq is not None:
+                x = self._to_compute_dtype(self.iq(x))
+            y = self.new(x, *args[1:], **kwargs)
+            return self._to_compute_dtype(self.oq(y)) if self.oq is not None else y
+        if isinstance(layer, keras.Model):  # a nested model: freeze what it contains
+            self.new, inner = _freeze(layer, self.keep, "")
+            self.types.update({f"{layer.name}/{name}": entry for name, entry in inner.items()})
+            return self.new(*args, **kwargs)
+        if not isinstance(layer, _Quantized):
+            self.new = _copy_layer(layer)
+            y = self.new(*args, **kwargs)
+            self.new.set_weights(layer.get_weights())
+            return y
+        x = args[0]
+        if self.keep and layer._iq is not None:
+            self.iq = _frozen_quantizer(layer._iq, f"{layer.name}_iq")
+            x = self._to_compute_dtype(self.iq(x))
+            self.iq.set_weights(layer._iq.get_weights())
+        config = layer.get_config()
+        for name in _QUANTIZER_ARGS + _EBOPS_ARGS:
+            config.pop(name)
+        self.new = layer._plain_class.from_config(config)
+        y = self.new(x, *args[1:], **kwargs)
+        _copy_quantized_values(layer, self.new)
+        self.new.trainable = False  # its weights are on the quantized grid: training would leave it
+        if self.keep and layer._oq is not None:
+            self.oq = _frozen_quantizer(layer._oq, f"{layer.name}_oq")
+            y = self._to_compute_dtype(self.oq(y))
+            self.oq.set_weights(layer._oq.get_weights())
+        self.types[layer.name] = self._types()
+        return y
+
+    def _to_compute_dtype(self, tensor):
+        """HGQ2 quantizers return float32; the layer they came from computed in its compute dtype
+        (mixed precision), and so must the frozen model."""
+        dtype = self.layer.compute_dtype
+        return tensor if dtype == "float32" else keras.ops.cast(tensor, dtype)
+
+    def _types(self):
+        """The hls4ml types of the quantized layer. The activation types are left out, with the
+        quantizers kept in the model, when they cannot be deduced (a scaler, say); they are
+        required when the quantizers are dropped."""
+        layer = self.layer
+
+        def activation(getter):
+            try:
+                return getter()
+            except ValueError:
+                if not self.keep:
+                    raise
+                return None
+
+        entry = {
+            "weight": layer.weight_type(),
+            "bias": layer.bias_type(),
+            "input": activation(layer.input_type),
+            "result": activation(layer.result_type),
+        }
+        if layer._has_weights and layer._iq is not None and entry["input"] is not None:
+            entry["accum"] = layer.accum_type()
+        return {k: v for k, v in entry.items() if v is not None}
 
 
 def _copy_quantized_values(quantized, plain):

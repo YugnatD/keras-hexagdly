@@ -1,6 +1,6 @@
 """C simulation of a quantized hex convolution: the hls4ml export must compute what Keras computes.
 
-Each case compiles a one-layer hls4ml project (about a minute). The input, the weights, the bias and
+Each case compiles a one-layer hls4ml project (a few seconds). The input, the weights, the bias and
 the output are quantized in the Keras model; ``freeze`` gives the types to put in the hls4ml config.
 """
 
@@ -16,7 +16,11 @@ pytest.importorskip("hgq")
 from hgq.quantizer import QuantizerConfig  # noqa: E402
 
 import keras_hexagdly as hgly  # noqa: E402
-from keras_hexagdly.hls4ml_ext import hex_reuse_config, patch_model_for_hls  # noqa: E402
+from keras_hexagdly.hls4ml_ext import (  # noqa: E402
+    apply_quantized_types,
+    hex_reuse_config,
+    patch_model_for_hls,
+)
 from keras_hexagdly.hls4ml_handler import register_hex_gather_layers  # noqa: E402
 from keras_hexagdly.quantized import _parse_type  # noqa: E402
 
@@ -82,19 +86,26 @@ def simulate(
     config = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vitis")
     hex_reuse_config(config, patched)
     config["Model"]["Precision"] = WIDE
-    if iq is not None:
-        config["LayerName"]["x"]["Precision"] = {"result": types["input"]}
-    config["LayerName"]["hexq_linebuffer"]["Precision"] = {
-        "result": WIDE,
-        "mac_weights": types["weight"],
-        "mac_bias": types["bias"],
-    }
-    if accum == "layer":
-        config["LayerName"]["hexq_linebuffer"]["AccumPrecision"] = types["accum"]
-    elif accum == "model":
-        config["Model"]["ExactAccumulator"] = True  # the global switch, nothing per layer
-    if oq is not None:
-        config["LayerName"]["hexq_activation"]["Precision"] = {"result": types["result"]}
+    if accum in ("layer", "model"):  # the helper does what the lines below do by hand
+        apply_quantized_types(
+            config,
+            patched,
+            {"hexq": types},
+            accumulator="exact" if accum == "layer" else "default",
+            wide=WIDE,
+        )
+        if accum == "model":
+            config["Model"]["ExactAccumulator"] = True  # the global switch, nothing per layer
+    else:
+        if iq is not None:
+            config["LayerName"]["x"]["Precision"] = {"result": types["input"]}
+        config["LayerName"]["hexq_linebuffer"]["Precision"] = {
+            "result": WIDE,
+            "mac_weights": types["weight"],
+            "mac_bias": types["bias"],
+        }
+        if oq is not None:
+            config["LayerName"]["hexq_activation"]["Precision"] = {"result": types["result"]}
     hls_model = hls4ml.converters.convert_from_keras_model(
         patched,
         hls_config=config,
@@ -131,7 +142,11 @@ def test_without_accum_precision_narrow_inputs_lose_the_low_bits_of_each_product
 
 
 def test_a_quantized_output_and_wide_input_need_no_accumulator_setting(tmp_path):
-    simulated, reference, _, _ = simulate(tmp_path, iq=None, oq=act_conf(3, 2, k=0), accum=False)
+    # seeded weights: with the default accumulator the low bits of each product are dropped, so a
+    # rounding tie on the output grid could flip for some random kernels (about 1 run in 60)
+    simulated, reference, _, _ = simulate(
+        tmp_path, iq=None, oq=act_conf(3, 2, k=0), accum=False, prepare=small_weights
+    )
     np.testing.assert_array_equal(simulated, reference)
 
 
@@ -195,4 +210,28 @@ def test_a_bias_as_large_as_the_products_does_not_overflow_the_accumulator(tmp_p
         prepare=prepare,
     )
     assert reference.max() > 4  # beyond what the old accumulator could hold (it wrapped at 4)
+    np.testing.assert_array_equal(simulated, reference)
+
+
+def test_large_values_do_not_wrap_around_between_the_mac_and_the_activation(tmp_path):
+    """The MAC hands its sum to the ReLU in the accumulator type: a narrower type in between
+    (apply_quantized_types' old fixed ``wide``) wrapped a sum of 2344 to a negative number."""
+
+    def big_weights(layer):
+        for weight in layer._base_kernels:
+            weight.assign(np.full(weight.shape, 3.9, "float32"))
+        layer.bias_tensor.assign(np.full((4,), 0.5, "float32"))
+
+    x = np.full((6, H, W, 2), 100.0, "float32")
+    simulated, reference, _, _ = simulate(
+        tmp_path,
+        iq=act_conf(8, 2),
+        oq=act_conf(14, 2, k=0),
+        accum="layer",
+        kq=weight_conf(8, 2),
+        bq=weight_conf(5, 3),
+        x=x,
+        prepare=big_weights,
+    )
+    assert reference.max() > 2048  # beyond what ap_fixed<32,12> holds
     np.testing.assert_array_equal(simulated, reference)

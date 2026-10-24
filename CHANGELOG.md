@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - **Quantization-aware training of the hexagonal layers with HGQ2** (optional: `pip install
-  keras-hexagdly[qat]`, needs Python >= 3.10 and HGQ2 >= 0.1.6; tested with 0.1.6 to 0.2.0). `QConv2d`, `QConv3d`, `QConv2d_CustomKernel`,
+  keras-hexagdly[qat]`, needs Python >= 3.10 and HGQ2 >= 0.1.6; tested with 0.1.6 to 0.2.0, the latter needs Python >= 3.11). `QConv2d`, `QConv3d`, `QConv2d_CustomKernel`,
   `QConv3d_CustomKernel`, `QMaxPool2d`, `QMaxPool3d` and `QAvgPool2d` are the hexagonal layers with HGQ2
   quantizers on the kernel (`kq_conf`, HGQ2's weight config by default), the bias (`bq_conf`), the input
   (`iq_conf`) and the output after the activation (`oq_conf`); all but the kernel are off unless
@@ -17,8 +17,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   learned under a regulariser that pushes them down (a weight that reaches 0 bit is removed). Every
   sub-kernel of the hexagonal decomposition has its own quantizer; with `share_neighbors` (any mode)
   the shared weights are quantized. The quantizer variables and configs are saved with the model
-  (`model.save()` / `load_model()`). `import keras_hexagdly` still works without hgq2: the quantized
-  layers and `freeze` are loaded on first use.
+  (`model.save()` / `load_model()`, also in a fresh process that only imports `keras_hexagdly`:
+  the package imports the quantized layers when hgq2 is installed). `import keras_hexagdly` still
+  works without hgq2, where the quantized names are simply absent (`hasattr` is False).
+- **A notebook** (`notebooks/keras_hexagdly_qat_hgq2_to_hls4ml.ipynb`) taking a hexagonal CNN from
+  data to a Vitis HLS synthesis: float reference, QAT with EBOPs, `freeze`, hls4ml, C simulation, and a
+  resource comparison with a uniform-precision export.
+- **EBOPs for the hexagonal convolutions** (`QConv2d`, `QConv3d`, `QConv2d_CustomKernel`,
+  `QConv3d_CustomKernel` with an `iq_conf`): the same cost measure and the same training term
+  (`beta * EBOPs`) as HGQ2's layers, with `enable_ebops`, `beta0` (default `1e-5`) and
+  `ebops_factor`. HGQ2's `FreeEBOPs`, `BetaPID`, `BetaScheduler`, `PBar`, `ParetoFront`,
+  `EarlyStoppingWithEbopsThres` and `trace_minmax` work on them. The EBOPs were checked against a
+  by-hand count (taps of the hexagon x channels x bits), and shrink as the bit widths do.
+- **`keras_hexagdly.hls4ml_ext.apply_quantized_types(config, patched_model, types)`** puts the
+  `ap_fixed` types `freeze` computed into the hls4ml config (weights, bias, accumulator, the input
+  type on the producing layer, the output type after the fused activation): the recipe was six
+  lines to copy by hand per layer. The C-simulation tests use it.
 - **`keras_hexagdly.freeze(model, activation_quantizers="keep")`** returns `(frozen_model, types)`: the
   quantized layers become plain layers holding the quantized values, with the same outputs (checked),
   and `types` gives, per layer, the `ap_fixed` type of the `weight`, `bias`, `input`, `result` (the
@@ -37,12 +51,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   C simulation of a layer with a quantized input, weights, bias and output equals the Keras model bit
   for bit (`tests/test_quantized_csim.py`). The wider accumulator costs logic: measured with Vitis HLS
   on one hex convolution, from +18 % flip-flops and 130 DSPs with narrow types to 3x the LUTs with
-  16-bit types (README, "Accumulator width"; measured before the carry bit below was added), which is
+  16-bit types (README, "Accumulator width", measured again with the final accumulator), which is
   why it is opt-in. The exact accumulator also has one extra integer bit (the carry of the bias addition)
   and keeps the fractional bits of a finer bias. `AccumPrecision` is read per layer only.
 
 ### Fixed
 
+- `freeze` follows the graph of the model instead of walking `model.layers`: raw operations
+  (`+`, `keras.ops.*`, residual connections), a layer called more than once, a layer reused by another
+  model and nested Functional models used to give a bare `KeyError` or a "not wired" error.
+- The quantizers of `iq_conf` / `oq_conf` return float32; the layers now cast them back to their
+  compute dtype (`dtype="float16"` crashed on torch). A quantizer with a `scaler` or `affine` has no
+  `ap_fixed` type (the type of its bit widths would be too narrow): refused instead of silently wrong.
+- `ExactAccumulator` ignored that a layer without bias still has a zero bias array typed with the
+  model default precision, and made the accumulator wider than `accum_type()`; a text value such as
+  `"False"` for it switched it on.
+- The accessors of an unbuilt quantized layer (`weight_type()`, `quantized_bias()`, `accum_type()`, and
+  `bias_type()` / `input_type()` / `result_type()` when their quantizer is set) say that the layer must be built;
+  a pool with a quantizer on a dynamic spatial shape gives the clear "statically-known" error.
+- `tests/test_quantized.py` is skipped instead of failing at collection without hgq2.
+- `apply_quantized_types`: with a fused activation, the MAC result was cast to a fixed `ap_fixed<32,12>`
+  before the ReLU, so a sum above 2048 wrapped around in the C simulation whatever the accumulator
+  type; it now gets the accumulator type. Two layers that read the same tensor with different input
+  types are refused instead of letting the last one win.
+- Clearer errors: `freeze` of something that is not a model, a quantizer config of the wrong type or a
+  negative `beta0` (refused when the layer is built, not at the first `fit`), half precision on the
+  TensorFlow backend (HGQ2 cannot do it), and `patch_model_for_hls` on a model frozen with the default
+  `activation_quantizers="keep"` (the standalone quantizers cannot be converted by hls4ml: freeze with
+  `"types"`).
+- `patch_model_for_hls` gives a clear error for a model whose output comes from a layer called more
+  than once (a bare `KeyError` before).
+- The sdist lists its files explicitly (`pyproject.toml`): a local `python -m build` used to pick up every
+  untracked directory.
+- `import keras_hexagdly` no longer fails when hgq2 is installed but unusable (wrong version, broken
+  install): the plain layers stay available, the quantized ones are missing and a warning says why.
+- `freeze` keeps the `sparse` / `ragged` flags of the inputs, reuses a weightless layer it cannot copy
+  (a `Lambda`), and keeps the compute dtype of the standalone quantizers (mixed precision).
+- The EBOPs sum is done in float32 (it overflowed in half precision) and saturates in the uint32
+  variable instead of wrapping around.
+- A QAT model saved before the EBOPs existed (an `iq_conf` layer without the `enable_ebops` key)
+  loads with them off, so its weights file still fits.
 - Weight and bias `ap_fixed` types of quantized layers are derived from the quantized values (they used to
   be computed from the quantizer parameters, which was wrong for negative integer bits); `freeze` handles
   nested models and `get_config` / `from_config` round-trip the quantizers.

@@ -35,20 +35,42 @@ _QUANTIZED_NAMES = (
     "freeze",
 )
 
+# The quantized layers need the optional dependency hgq2 (pip install keras-hexagdly[qat]). They
+# are imported here when it is installed, so that their Keras registration exists as soon as the
+# package is imported (load_model() of a saved QAT model needs it), and are absent otherwise. They
+# are not in __all__ either: `from keras_hexagdly import *` must not depend on hgq2.
+try:
+    from .quantized import (  # noqa: F401
+        QAvgPool2d,
+        QConv2d,
+        QConv2d_CustomKernel,
+        QConv3d,
+        QConv3d_CustomKernel,
+        QMaxPool2d,
+        QMaxPool3d,
+        freeze,
+    )
+except Exception as _quantized_failure:  # nothing may break the plain layers
+    _QUANTIZED_ERROR = f"{type(_quantized_failure).__name__}: {_quantized_failure}"
+    import importlib.util
+
+    if importlib.util.find_spec("hgq") is not None:
+        # hgq2 is there but unusable (wrong version, broken install...): say so once
+        import warnings
+
+        warnings.warn(
+            f"keras_hexagdly: the quantized layers are unavailable ({_QUANTIZED_ERROR})",
+            stacklevel=2,
+        )
+else:
+    _QUANTIZED_ERROR = None
+
 
 def __getattr__(name):
-    # The quantized layers and freeze need the optional dependency hgq2 (pip install
-    # keras-hexagdly[qat]), so they are loaded on first access instead of at import time. They are
-    # not in __all__ for the same reason: `from keras_hexagdly import *` must not require hgq2.
-    if name in _QUANTIZED_NAMES:
-        from . import quantized
-
-        return getattr(quantized, name)
+    # only reached for a name that is not defined: hasattr / getattr(default) need an AttributeError
+    if name in _QUANTIZED_NAMES and _QUANTIZED_ERROR is not None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}: {_QUANTIZED_ERROR}")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__():
-    return sorted(set(globals()) | set(_QUANTIZED_NAMES))
 
 
 # Read from the installed package's own metadata (set from pyproject.toml's

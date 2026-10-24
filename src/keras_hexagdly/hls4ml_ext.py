@@ -558,6 +558,20 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
             "model. Call keras_hexagdly.freeze(model) first and patch the frozen model it returns."
         )
 
+    standalone = [
+        layer.name
+        for layer in _all_layers(model)
+        if type(layer).__name__ == "Quantizer" and type(layer).__module__.startswith("hgq")
+    ]
+    if standalone:
+        raise ValueError(
+            f"The HGQ2 quantizer layers {standalone} (kept by freeze(model), the default) "
+            "cannot be "
+            "converted by hls4ml in io_stream. Freeze with activation_quantizers='types' for the "
+            "export: the activation precisions are then in the returned types, "
+            "see apply_quantized_types."
+        )
+
     # No replacement exists for these, so left alone they would reach hls4ml as
     # an unknown custom layer and fail there with an unrelated error.
     unsupported = [l.name for l in model.layers if isinstance(l, hgly.AvgPool2d)]
@@ -614,7 +628,14 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
         else:
             tensor_map[id(raw_out)] = y
 
-    new_outputs = [tensor_map[id(t)] for t in model.outputs]
+    try:
+        new_outputs = [tensor_map[id(t)] for t in model.outputs]
+    except KeyError:
+        raise ValueError(
+            "An output of the model is the result of a layer that is called more than once (a "
+            "shared layer): patch_model_for_hls follows each layer once. Build the model from "
+            "fresh layers, one per call."
+        ) from None
     return keras.Model(model.inputs, new_outputs, name=model.name + "_hls")
 
 
@@ -694,6 +715,94 @@ def hex_reuse_config(config, model, max_mac_block=_MAX_MAC_BLOCK, verbose=True):
             warnings.warn(
                 f"hex_reuse_config: {layer.name} -> ReuseFactor={rf} "
                 f"(MAC_BLOCK={-(-n_in // rf) * n_filt}, n_in={n_in}, n_filt={n_filt})",
+                stacklevel=2,
+            )
+    return config
+
+
+def apply_quantized_types(config, model, types, accumulator="exact", wide="ap_fixed<32,12>"):
+    """Put the ``ap_fixed`` types ``freeze`` computed into an hls4ml config.
+
+    ``model`` is the patched model (``patch_model_for_hls(frozen)``), ``config`` what
+    ``hls4ml.utils.config_from_keras_model(model, granularity="name")`` returned and ``types`` the
+    second value of ``freeze(model, activation_quantizers="types")``. For each quantized layer:
+
+    * ``weight`` / ``bias`` become ``mac_weights`` / ``mac_bias`` of ``<name>_linebuffer``;
+    * ``result`` is the precision of the layer output: ``<name>_activation`` when the layer has a
+      fused activation (the quantizer comes after it), else ``<name>_linebuffer``. What is
+      not quantized, and the output of the MAC when an activation follows, get the ``accum`` type
+      with ``accumulator="exact"`` (so nothing wraps around before the activation), else ``wide``,
+      which must then hold the largest sum of your model;
+    * ``input`` is the result precision of the layer that feeds it (the input layer, or the previous
+      layer when that one has no ``result`` type of its own);
+    * ``accum`` becomes the ``AccumPrecision`` of ``<name>_linebuffer`` when ``accumulator`` is
+      ``"exact"`` (the default); ``"default"`` leaves hls4ml's accumulator alone.
+
+    Mutates and returns ``config``. A layer of ``types`` that the model does not have is an error.
+    """
+    if accumulator not in ("exact", "default"):
+        raise ValueError("accumulator must be 'exact' or 'default'.")
+    import warnings
+
+    layers = {layer.name: layer for layer in model.layers}
+    layer_cfg = config.setdefault("LayerName", {})
+
+    def precision(name):
+        entry = layer_cfg.setdefault(name, {})
+        current = entry.get("Precision")
+        if not isinstance(current, dict):
+            current = {} if current is None else {"result": current}
+        entry["Precision"] = current
+        return current
+
+    inputs, chosen = [], {}  # chosen: layers whose result type a ``result`` of types decided
+    for key, entry in types.items():
+        name = key.rsplit("/", 1)[-1]  # a nested model's layers are flattened by the patch
+        conv = f"{name}_linebuffer"
+        if conv not in layers:
+            raise ValueError(
+                f"The layer {key!r} of types is not in the patched model (looked for {conv!r}): "
+                "pass patch_model_for_hls(frozen) and the types of the same freeze() call."
+            )
+        mac = precision(conv)
+        if "weight" in entry:
+            mac["mac_weights"] = entry["weight"]
+        if "bias" in entry:
+            mac["mac_bias"] = entry["bias"]
+        # what the MAC hands on before the activation (or as the layer output without a quantizer)
+        # must hold the accumulator, else it wraps around before the activation sees it
+        wide_result = entry["accum"] if accumulator == "exact" and "accum" in entry else wide
+        activation = f"{name}_activation"
+        if activation in layers:
+            mac["result"] = wide_result
+            if "result" in entry:
+                precision(activation)["result"] = chosen[activation] = entry["result"]
+        else:
+            mac["result"] = entry.get("result", wide_result)
+            if "result" in entry:
+                chosen[conv] = entry["result"]
+        if accumulator == "exact" and "accum" in entry:
+            layer_cfg[conv]["AccumPrecision"] = entry["accum"]
+        if "input" in entry:
+            inputs.append((conv, entry["input"]))
+
+    # the input type of a layer is the result type of its producer, unless that has its own
+    wanted = {}  # producer -> (input type, the layer that asked for it)
+    for conv, input_type in inputs:
+        producer = layers[conv].input._keras_history.operation.name
+        if producer in wanted and wanted[producer][0] != input_type:
+            raise ValueError(
+                f"{wanted[producer][1]!r} and {conv!r} both read the output of {producer!r} but "
+                f"have different input types ({wanted[producer][0]} and {input_type}): hls4ml has "
+                "one type per tensor. Give their input quantizers (iq_conf) the same configuration."
+            )
+        wanted[producer] = (input_type, conv)
+        if producer not in chosen:
+            precision(producer)["result"] = input_type
+        elif chosen[producer] != input_type:
+            warnings.warn(
+                f"{producer!r} feeds {conv!r}: its result type {chosen[producer]} is kept over the "
+                f"input type {input_type} of the next layer.",
                 stacklevel=2,
             )
     return config

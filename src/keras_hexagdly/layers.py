@@ -148,8 +148,8 @@ def _mapped_inputs(layer, tensor_map):
 
     ``layer.input`` is the input of the layer's FIRST graph node. A layer instance that already
     belongs to another model (or is called more than once) points into that other graph: say so,
-    instead of a
-    bare KeyError. Used by the graph rewrites (``patch_model_for_hls``, ``freeze``)."""
+    instead of a bare KeyError. Used by ``patch_model_for_hls`` (``freeze`` follows the graph
+    itself and has no such limit)."""
     raw_in = layer.input
     try:
         if isinstance(raw_in, (list, tuple)):

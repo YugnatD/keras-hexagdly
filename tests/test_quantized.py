@@ -1,7 +1,9 @@
 """QConv2d / freeze: quantization-aware training of the hex convolution with HGQ2 (optional)."""
 
 import json
+import os
 import re
+import subprocess
 import sys
 
 import keras
@@ -9,11 +11,12 @@ import numpy as np
 import pytest
 
 import keras_hexagdly as hgly
-from keras_hexagdly.quantized import _parse_type
 
 pytest.importorskip("hgq")
 from hgq.quantizer import Quantizer, QuantizerConfig  # noqa: E402
 from hgq.regularizers import MonoL1  # noqa: E402
+
+from keras_hexagdly.quantized import _parse_type  # noqa: E402
 
 H, W, C = 9, 8, 3
 np_ = keras.ops.convert_to_numpy  # any backend, GPU tensors included
@@ -231,15 +234,70 @@ def test_the_even_size_warning_points_at_the_line_that_built_the_layer():
     assert record[0].filename == __file__  # not keras_hexagdly/quantized.py
 
 
-def test_the_package_imports_without_hgq(monkeypatch):
-    monkeypatch.setitem(sys.modules, "hgq", None)
-    # an already imported submodule would shadow the block above
-    monkeypatch.setitem(sys.modules, "hgq.quantizer", None)
-    monkeypatch.delitem(sys.modules, "keras_hexagdly.quantized", raising=False)
-    monkeypatch.delattr(hgly, "quantized", raising=False)
-    assert hgly.Conv2d is not None  # the rest of the package does not need hgq2
-    with pytest.raises(ImportError, match=r"keras-hexagdly\[qat\]"):
-        hgly.QConv2d
+def run_python(code, *, hide_hgq=False):
+    """Run ``code`` in a fresh interpreter (same backend); returns the completed process."""
+    prefix = "import sys; sys.modules['hgq'] = None\n" if hide_hgq else ""
+    # the package under test, not whichever version is installed
+    src = os.path.dirname(os.path.dirname(hgly.__file__))
+    env = {
+        **os.environ,
+        "KERAS_BACKEND": keras.backend.backend(),
+        "PYTHONWARNINGS": "ignore",
+        "PYTHONPATH": os.pathsep.join([src, os.environ.get("PYTHONPATH", "")]),
+    }
+    return subprocess.run(
+        [sys.executable, "-c", prefix + code], capture_output=True, text=True, env=env, timeout=300
+    )
+
+
+def test_the_package_imports_without_hgq_and_says_what_is_missing():
+    code = """
+import keras_hexagdly as h
+assert h.Conv2d is not None  # the rest of the package does not need hgq2
+assert not hasattr(h, 'QConv2d') and getattr(h, 'freeze', None) is None
+assert 'QConv2d' not in dir(h)
+try:
+    h.QConv2d
+except AttributeError as e:
+    assert 'keras-hexagdly[qat]' in str(e), e
+else:
+    raise SystemExit('no error')
+try:
+    import keras_hexagdly.quantized
+except ImportError as e:
+    assert 'keras-hexagdly[qat]' in str(e), e
+else:
+    raise SystemExit('no error from quantized')
+import inspect, pydoc
+inspect.getmembers(h); pydoc.render_doc(h)  # introspection must not raise
+print('ok')
+"""
+    done = run_python(code, hide_hgq=True)
+    assert done.returncode == 0 and done.stdout.strip().endswith("ok"), done.stderr[-2000:]
+
+
+def test_a_saved_qat_model_loads_in_a_fresh_process_that_only_imports_the_package(tmp_path):
+    inp = keras.Input((H, W, C))
+    out = hgly.QMaxPool2d(2, iq_conf=act(2, 3))(
+        hgly.QConv2d(4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3))(inp)
+    )
+    model = keras.Model(inp, out)
+    expected = np_(model(X))
+    for name in ("model.keras", "model.h5"):
+        model.save(tmp_path / name)
+    np.save(tmp_path / "expected.npy", expected)
+    np.save(tmp_path / "x.npy", X)
+    code = f"""
+import keras, numpy as np
+import keras_hexagdly  # nothing else imported
+for name in ('model.keras', 'model.h5'):
+    m = keras.saving.load_model({str(tmp_path)!r} + '/' + name)
+    y = keras.ops.convert_to_numpy(m(np.load({str(tmp_path / "x.npy")!r})))
+    assert np.array_equal(y, np.load({str(tmp_path / "expected.npy")!r})), name
+print('ok')
+"""
+    done = run_python(code)
+    assert done.returncode == 0 and done.stdout.strip().endswith("ok"), done.stderr[-2000:]
 
 
 # ---- bias, input and output quantizers ----
@@ -613,13 +671,14 @@ def test_freeze_can_hand_the_activation_types_to_hls4ml_instead():
         hgly.freeze(with_quantizers_model(), activation_quantizers="drop")
 
 
-def test_freeze_names_the_layer_that_is_not_wired_to_the_model():
+def test_freeze_follows_the_graph_of_the_model_when_the_layer_is_reused_by_another_one():
     layer = hgly.QConv2d(4, kernel_size=1, kq_conf=fixed())
     first = keras.Input((H, W, C))
     keras.Model(first, layer(first))
     second = keras.Input((H, W, C))
-    with pytest.raises(ValueError, match="not wired to this model's graph"):
-        hgly.freeze(keras.Model(second, layer(second)))
+    model = keras.Model(second, layer(second))  # the layer's first graph node is not this one
+    frozen, _ = hgly.freeze(model)
+    assert np.allclose(np_(frozen(X)), np_(model(X)), atol=1e-5)
 
 
 ALL_LAYERS = {
@@ -823,12 +882,13 @@ def test_freeze_explains_that_it_needs_a_built_model():
         hgly.freeze(unbuilt)
 
 
-def test_a_shared_layer_error_says_what_to_do():
+def test_a_plain_layer_called_twice_is_shared_in_the_frozen_model():
     shared = keras.layers.Dense(C)
     inp = keras.Input((H, W, C))
-    model = keras.Model(inp, keras.layers.Add()([shared(inp), shared(inp)]))
-    with pytest.raises(ValueError, match="called more than once"):
-        hgly.freeze(model)
+    model = keras.Model(inp, keras.layers.Add()([shared(inp), shared(inp * 2.0)]))
+    frozen, _ = hgly.freeze(model)
+    assert np.allclose(np_(frozen(X)), np_(model(X)), atol=1e-5)
+    assert len([layer for layer in frozen.layers if isinstance(layer, keras.layers.Dense)]) == 1
 
 
 # ---- the rest of the audit ----
@@ -860,3 +920,764 @@ def test_mixed_precision_runs_on_the_other_backends():
         assert np.all(np.isfinite(np_(out).astype("float32")))
     finally:
         keras.config.set_dtype_policy("float32")
+
+
+# ---- audit round 2: freeze on any graph, scaler / affine, dtype, unbuilt layers ----
+
+
+def test_freeze_keeps_the_operations_between_layers():
+    inp = keras.Input((H, W, C))
+    y = hgly.QConv2d(C, kernel_size=1, kq_conf=fixed(6, 1), oq_conf=act(3, 3))(inp)
+    y = keras.ops.relu(y) + inp  # a residual connection made of raw operations
+    model = keras.Model(inp, y)
+    frozen, types = hgly.freeze(model)
+    assert np.allclose(np_(frozen(X)), np_(model(X)), atol=1e-5)
+    assert set(types) == {model.layers[1].name}
+
+
+def test_freeze_handles_a_layer_called_twice_and_a_nested_functional_model():
+    shared = hgly.QConv2d(C, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3))
+    inp = keras.Input((H, W, C))
+    twice = shared(shared(inp))  # the second call is the model output
+    model = keras.Model(inp, twice)
+    frozen, types = hgly.freeze(model)
+    assert np.allclose(np_(frozen(X)), np_(model(X)), atol=1e-5)
+    assert list(types) == [shared.name]
+
+    inner_in = keras.Input((H, W, C))
+    inner = keras.Model(
+        inner_in, hgly.QConv2d(C, kernel_size=1, kq_conf=fixed(6, 1), name="deep")(inner_in)
+    )
+    outer_in = keras.Input((H, W, C))
+    outer = keras.Model(outer_in, keras.layers.Flatten()(inner(outer_in)))  # built, then called
+    frozen, types = hgly.freeze(outer)
+    assert np.allclose(np_(frozen(X)), np_(outer(X)), atol=1e-5)
+    assert f"{inner.name}/deep" in types
+
+
+def test_freeze_keeps_the_names_of_the_inputs_and_dict_inputs():
+    a, b = keras.Input((H, W, C), name="a"), keras.Input((H, W, C), name="b")
+    conv = hgly.QConv2d(C, kernel_size=1, kq_conf=fixed(6, 1))
+    model = keras.Model({"a": a, "b": b}, conv(a) + keras.layers.Conv2D(C, 1)(b))
+    frozen, _ = hgly.freeze(model)
+    assert [t.name for t in frozen.inputs] == [t.name for t in model.inputs]
+    data = {"a": X, "b": X}
+    assert np.allclose(np_(frozen(data)), np_(model(data)), atol=1e-5)
+
+
+def scaled(**extra):
+    return QuantizerConfig(
+        "kif", "datalane", k0=1, i0=2, f0=2, homogeneous_axis=(0, 1, 2, 3), trainable=False, **extra
+    )
+
+
+@pytest.mark.parametrize("extra", [{"scaler": 4.0}, {"affine": (0.25, 0.5)}])
+def test_a_scaler_or_affine_on_an_activation_quantizer_has_no_ap_fixed_type(extra):
+    layer = hgly.QConv2d(C, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=scaled(**extra))
+    layer(X)
+    with pytest.raises(ValueError, match="scaler or an affine"):
+        layer.input_type()
+    model = keras.Model(inp := keras.Input((H, W, C)), layer(inp))
+    frozen, types = hgly.freeze(model)  # "keep": the quantizer stays, only the type is missing
+    assert "input" not in types[layer.name] and "weight" in types[layer.name]
+    assert np.allclose(np_(frozen(X)), np_(model(X)), atol=1e-5)
+    with pytest.raises(ValueError, match="scaler or an affine"):
+        hgly.freeze(model, activation_quantizers="types")
+
+
+@pytest.mark.skipif(
+    keras.backend.backend() == "tensorflow",
+    reason="HGQ2's own quantizers do not support half precision on TensorFlow",
+)
+def test_quantizer_outputs_are_cast_back_to_the_compute_dtype():
+    layer = hgly.QConv2d(
+        2, kernel_size=1, dtype="float16", iq_conf=act(3, 3), oq_conf=act(3, 3), kq_conf=fixed(6, 1)
+    )
+    out = layer(X)
+    assert keras.backend.standardize_dtype(out.dtype) == "float16"
+    pool = hgly.QMaxPool2d(2, dtype="float16", iq_conf=act(3, 3))
+    assert keras.backend.standardize_dtype(pool(X).dtype) == "float16"
+
+
+def test_the_accessors_of_an_unbuilt_layer_say_so():
+    layer = hgly.QConv2d(
+        2,
+        kernel_size=1,
+        kq_conf=fixed(6, 1),
+        bq_conf=fixed(6, 1),
+        iq_conf=act(2, 2),
+        oq_conf=act(2, 2),
+    )
+    for accessor in (
+        layer.quantized_weights,
+        layer.quantized_bias,
+        layer.weight_type,
+        layer.bias_type,
+        layer.input_type,
+        layer.result_type,
+        layer.accum_type,
+    ):
+        with pytest.raises(ValueError, match="needs a built layer"):
+            accessor()
+
+
+def test_a_pool_with_a_quantizer_needs_static_spatial_dimensions():
+    with pytest.raises(ValueError, match="statically-known"):
+        hgly.QMaxPool2d(2, oq_conf=act(2, 2)).build((None, None, None, C))
+
+
+# ---- EBOPs: the cost measure HGQ2's callbacks read ----
+
+hgq_sugar = pytest.importorskip("hgq.utils.sugar")
+
+
+def valid_taps(height, width, **kwargs):
+    """How many (output cell, input cell) pairs a hexagonal window connects in an H x W image,
+    counted with the plain layer and all-ones kernels (the zero padding of the border is out)."""
+    plain = hgly.Conv2d(1, use_bias=False, activation=None, **kwargs)
+    ones = np.ones((1, height, width, 1), "float32")
+    plain(ones)
+    for variable in plain.trainable_weights:
+        variable.assign(np.ones(variable.shape, "float32"))
+    return float(np_(plain(ones)).sum())
+
+
+def train_one_step(model, x, filters=4):
+    model.compile("sgd", "mse")
+    model.fit(x, np.zeros((len(x), H, W, filters), "float32"), epochs=1, verbose=0)
+
+
+def ebops_of(layer, x=X, filters=4):
+    inp = keras.Input(x.shape[1:])
+    model = keras.Model(inp, layer(inp))
+    train_one_step(model, x, filters)
+    return float(np_(layer.ebops))
+
+
+def test_ebops_are_the_bits_of_the_weights_times_those_of_the_input_over_the_hexagon():
+    layer = hgly.QConv2d(
+        4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3), use_bias=False, name="e"
+    )
+    got = ebops_of(layer)
+    input_bits = np_(layer._iq.bits_((1, H, W, C))).max()
+    kernel_bits = np_(layer._kqs[0].bits_(keras.ops.shape(layer._kernel_sources()[0]))).max()
+    assert input_bits > 0 and kernel_bits > 0
+    assert got == valid_taps(H, W, kernel_size=1) * C * 4 * input_bits * kernel_bits
+
+
+def test_the_bias_adds_its_bits_for_every_output():
+    without = hgly.QConv2d(4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3), use_bias=True)
+    with_bias = hgly.QConv2d(
+        4, kernel_size=1, kq_conf=fixed(6, 1), bq_conf=fixed(5, 1), iq_conf=act(2, 3)
+    )
+    base, plus = ebops_of(without), ebops_of(with_bias)
+    bias_bits = np_(with_bias._bq.bits_((4,))).mean()
+    assert plus - base == bias_bits * H * W * 4
+
+
+def test_ebops_are_tracked_in_training_and_enter_the_loss_with_beta():
+    layer = hgly.QConv2d(4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3), beta0=0.5)
+    layer(X)
+    assert int(np_(layer.ebops)) == 0  # inference does not count
+    assert not layer.losses
+    layer(X, training=True)
+    ebops = float(np_(layer.ebops))
+    assert ebops > 0
+    np.testing.assert_allclose(
+        float(sum(np_(loss) for loss in layer.losses)), 0.5 * ebops, rtol=1e-5
+    )
+
+
+def test_the_hgq2_callbacks_see_the_layers():
+    from hgq.layers import QLayerBase
+
+    first = hgly.QConv2d(C, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3), name="first")
+    second = hgly.QConv2d(2, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3), name="second")
+    inp = keras.Input((H, W, C))
+    model = keras.Model(inp, second(first(inp)))
+    assert isinstance(first, QLayerBase) and first.enable_ebops
+    model.compile("sgd", "mse")
+    free = hgq_sugar.FreeEBOPs()
+    history = model.fit(X, np.zeros((len(X), H, W, 2), "float32"), epochs=1, callbacks=[free])
+    total = int(np_(first.ebops)) + int(np_(second.ebops))
+    assert history.history["ebops"] == [total] and total > 0
+    scheduler = hgq_sugar.BetaScheduler(lambda epoch: 3e-3)
+    scheduler.set_model(model)
+    scheduler.on_epoch_begin(0)
+    assert float(np_(first.beta)) == pytest.approx(3e-3) == float(np_(second.beta))
+
+
+def test_a_beta_term_shrinks_the_bit_widths_and_so_the_ebops():
+    trained = QuantizerConfig("kbi", "weight", k0=1, b0=6, i0=1)  # learned bit widths
+    layer = hgly.QConv2d(
+        4, kernel_size=1, kq_conf=trained, iq_conf=act(2, 3), beta0=1e-2, use_bias=False
+    )
+    inp = keras.Input((H, W, C))
+    model = keras.Model(inp, layer(inp))
+    model.compile(keras.optimizers.Adam(5e-2), "mse")
+    target = np.zeros((len(X), H, W, 4), "float32")
+    free = hgq_sugar.FreeEBOPs()
+    history = model.fit(X, target, epochs=30, batch_size=2, verbose=0, callbacks=[free])
+    ebops = history.history["ebops"]
+    assert ebops[-1] < ebops[0] / 1.5
+
+
+def test_trace_minmax_finds_the_integer_bits_of_a_wrapping_quantizer():
+    from hgq.utils import trace_minmax
+
+    wrapping = QuantizerConfig(
+        "kif", "datalane", k0=1, i0=0, f0=3, overflow_mode="WRAP", homogeneous_axis=(0, 1, 2, 3)
+    )
+    layer = hgly.QConv2d(4, kernel_size=1, kq_conf=fixed(6, 1), oq_conf=wrapping)
+    inp = keras.Input((H, W, C))
+    model = keras.Model(inp, layer(inp))
+    before = _parse_type(layer.result_type())[1]
+    trace_minmax(model, X * 3)
+    assert _parse_type(layer.result_type())[1] > before
+
+
+def test_ebops_need_weights_and_an_input_quantizer():
+    layer = hgly.QConv2d(4, kernel_size=1, kq_conf=fixed(6, 1))
+    assert not layer.enable_ebops  # no input quantizer, no bit widths for the input
+    layer(X)
+    assert not [w for w in layer.non_trainable_weights if w.name in ("beta", "ebops")]
+    assert hgly.QConv2d(4, kernel_size=1, iq_conf=act(2, 3)).enable_ebops
+    assert not hgly.QConv2d(4, kernel_size=1, iq_conf=act(2, 3), enable_ebops=False).enable_ebops
+    with pytest.raises(ValueError, match="enable_ebops"):
+        hgly.QConv2d(4, kernel_size=1, enable_ebops=True)
+    with pytest.raises(ValueError, match="enable_ebops"):
+        hgly.QMaxPool2d(2, iq_conf=act(2, 3), enable_ebops=True)
+    assert not hgly.QMaxPool2d(2, iq_conf=act(2, 3)).enable_ebops
+
+
+@pytest.mark.parametrize(
+    "name", ["QConv2d", "QConv3d", "QConv3d_CustomKernel", "QConv2d_CustomKernel"]
+)
+def test_every_weighted_layer_with_an_input_quantizer_counts_ebops(name):
+    build, x = ALL_LAYERS[name]
+    layer = build()
+    if layer.iq_conf is None:
+        pytest.skip("this variant has no input quantizer")
+    inp = keras.Input(x.shape[1:])
+    model = keras.Model(inp, layer(inp))
+    model.compile("sgd", "mse")
+    model.fit(
+        x, np.zeros((len(x),) + tuple(model.output_shape[1:]), "float32"), epochs=1, verbose=0
+    )
+    ebops = float(np_(layer.ebops))
+    assert layer.enable_ebops and ebops > 0
+    # every kernel and input element has 6 bits here: a multiple of 36, which the stale kernels of
+    # a previous call (random floats) would not give
+    assert ebops % 36 == 0
+
+
+def test_ebops_settings_survive_save_load_and_clone(tmp_path):
+    layer = hgly.QConv2d(
+        4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3), beta0=0.25, ebops_factor=2.0
+    )
+    inp = keras.Input((H, W, C))
+    model = keras.Model(inp, layer(inp))
+    model.save(tmp_path / "m.keras")
+    for other in (
+        keras.saving.load_model(tmp_path / "m.keras"),
+        keras.models.clone_model(model),
+    ):
+        copy = other.layers[1]
+        assert copy.enable_ebops and copy._beta0 == 0.25 and copy.ebops_factor == 2.0
+        assert float(np_(copy._beta)) == 0.25
+
+
+# ---- audit round 3 ----
+
+
+def test_a_model_saved_before_the_ebops_existed_loads_with_them_off():
+    layer = hgly.QConv2d(4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3))
+    layer(X)
+    old = layer.get_config()
+    for key in ("enable_ebops", "beta0", "ebops_factor"):
+        del old[key]  # what a 0.7.0 development version wrote
+    loaded = hgly.QConv2d.from_config(old)
+    loaded(X)
+    assert not loaded.enable_ebops
+    assert not [w for w in loaded.weights if w.name in ("beta", "ebops")]
+    assert len(loaded.weights) == len(layer.weights) - 2  # the weights file of the old model fits
+
+
+def test_freeze_reuses_a_weightless_layer_it_cannot_copy():
+    inp = keras.Input((H, W, C))
+    y = hgly.QConv2d(C, kernel_size=1, kq_conf=fixed(6, 1))(inp)
+    model = keras.Model(
+        inp, keras.layers.Lambda(lambda t: t * 2.0)(y)
+    )  # not rebuildable from config
+    frozen, _ = hgly.freeze(model)
+    assert np.allclose(np_(frozen(X)), np_(model(X)), atol=1e-5)
+
+
+@pytest.mark.skipif(
+    keras.backend.backend() == "tensorflow",
+    reason="HGQ2's own quantizers do not support half precision on TensorFlow",
+)
+def test_the_frozen_standalone_quantizers_keep_the_compute_dtype_and_ebops_stay_finite():
+    keras.config.set_dtype_policy("mixed_float16")
+    try:
+        layer = hgly.QConv2d(
+            16, kernel_size=1, kq_conf=fixed(8, 2), iq_conf=act(3, 3), oq_conf=act(3, 3), beta0=1e-3
+        )
+        inp = keras.Input((H, W, 8))
+        model = keras.Model(inp, layer(inp))
+        x = np.random.default_rng(1).standard_normal((2, H, W, 8)).astype("float32")
+        out = model(x, training=True)
+        assert keras.backend.standardize_dtype(out.dtype) == "float16"
+        ebops = float(np_(layer.ebops))
+        assert np.isfinite(ebops) and ebops > 65504  # above what half precision can hold
+        assert all(np.isfinite(float(np_(loss))) for loss in layer.losses)
+        frozen, _ = hgly.freeze(model)
+        assert keras.backend.standardize_dtype(frozen(x).dtype) == "float16"
+    finally:
+        keras.config.set_dtype_policy("float32")
+
+
+@pytest.mark.parametrize(
+    "failure", ["raise RuntimeError('boom')", "raise ImportError('numpy ABI mismatch')"]
+)
+def test_a_broken_hgq_leaves_the_plain_layers_usable(tmp_path, failure):
+    fake = tmp_path / "hgq"
+    fake.mkdir()
+    (fake / "__init__.py").write_text(failure + "\n")
+    code = f"""
+import sys, warnings
+sys.path.insert(0, {str(tmp_path)!r})
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter('always')
+    import keras_hexagdly as h
+assert h.Conv2d is not None
+assert not hasattr(h, 'QConv2d')
+assert any('quantized layers are unavailable' in str(w.message) for w in caught), caught
+try:
+    h.QConv2d
+except AttributeError as e:
+    assert 'quantized' in str(e) or 'boom' in str(e) or 'ABI' in str(e), e
+print('ok')
+"""
+    done = run_python(code)
+    assert done.returncode == 0 and done.stdout.strip().endswith("ok"), done.stderr[-2000:]
+
+
+# ---- the hls4ml config from freeze's types ----
+
+
+@needs_hls
+def test_apply_quantized_types_fills_the_config_of_a_chain_of_layers():
+    pytest.importorskip("hls4ml")
+    import hls4ml
+
+    from keras_hexagdly.hls4ml_ext import apply_quantized_types, patch_model_for_hls
+    from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+    register_hex_gather_layers("Vitis")
+    inp = keras.Input((H, W, C), name="x")
+    first = hgly.QConv2d(
+        4,
+        kernel_size=1,
+        activation="relu",
+        name="c1",
+        kq_conf=fixed(6, 1),
+        bq_conf=fixed(5, 1),
+        iq_conf=act(2, 3),
+        oq_conf=act(3, 2, k=0),
+    )
+    second = hgly.QConv2d(
+        2, kernel_size=1, name="c2", kq_conf=fixed(6, 1), iq_conf=act(3, 2, k=0), oq_conf=act(3, 3)
+    )
+    model = keras.Model(inp, second(first(inp)))
+    frozen, types = hgly.freeze(model, activation_quantizers="types")
+    patched = patch_model_for_hls(frozen)
+    config = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vitis")
+    assert apply_quantized_types(config, patched, types) is config
+    layer = config["LayerName"]
+    assert layer["x"]["Precision"]["result"] == types["c1"]["input"]
+    assert layer["c1_linebuffer"]["Precision"] == {
+        "result": types["c1"]["accum"],  # the MAC hands its sum on to the ReLU without wrapping it
+        "mac_weights": types["c1"]["weight"],
+        "mac_bias": types["c1"]["bias"],
+    }
+    assert layer["c1_activation"]["Precision"]["result"] == types["c1"]["result"]
+    assert layer["c1_linebuffer"]["AccumPrecision"] == types["c1"]["accum"]
+    # c2 has no activation: its linebuffer holds its result, and its producer holds its input type
+    assert layer["c2_linebuffer"]["Precision"]["result"] == types["c2"]["result"]
+    assert (
+        "AccumPrecision"
+        not in apply_quantized_types({}, patched, types, accumulator="default")["LayerName"][
+            "c1_linebuffer"
+        ]
+    )
+
+
+@needs_hls
+def test_apply_quantized_types_rejects_types_of_another_model():
+    pytest.importorskip("hls4ml")
+    from keras_hexagdly.hls4ml_ext import apply_quantized_types, patch_model_for_hls
+    from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+    register_hex_gather_layers("Vitis")
+    inp = keras.Input((H, W, C), name="x")
+    model = keras.Model(inp, hgly.QConv2d(2, kernel_size=1, name="c", kq_conf=fixed(6, 1))(inp))
+    frozen, types = hgly.freeze(model, activation_quantizers="types")
+    patched = patch_model_for_hls(frozen)
+    with pytest.raises(ValueError, match="not in the patched model"):
+        apply_quantized_types({}, patched, {"other": types["c"]})
+    with pytest.raises(ValueError, match="accumulator must be"):
+        apply_quantized_types({}, patched, types, accumulator="x")
+
+
+# ---- audit round 3: tests for the mutations that survived (accum_type, types, EBOPs, freeze) ----
+
+from keras_hexagdly.quantized import _exact_fixed_type  # noqa: E402
+
+
+def _qb(cls, ks, c_in, *, kq=None, bq=None, iq=None, oq=None, shape=None, **kw):
+    layer = cls(
+        4, kernel_size=ks, kq_conf=kq or fixed(6, 1), bq_conf=bq, iq_conf=iq, oq_conf=oq, **kw
+    )
+    x = np.random.default_rng(1).standard_normal(shape or (2, H, W, c_in)).astype("float32")
+    layer(x)
+    return layer, x
+
+
+def _set_all(layer, value):
+    for v in layer._base_kernels:
+        v.assign(np.full(v.shape, value, "float32"))
+
+
+# ---- accum_type: exact, hand-computed strings -------------------------------------------------
+# terms = (1 + 3 r (r+1)) * channels * depth ; I = Iw + Ii + ceil(log2 terms) (max with Ib) + 1
+# F = max(Fw + Fi, Fb).  weights 0.5 -> ap_fixed<2,1> ; input act(2,3) -> ap_fixed<6,3>
+def test_accum_type_2d_hand_computed():
+    layer, _ = _qb(hgly.QConv2d, 1, 3, iq=act(2, 3))
+    _set_all(layer, 0.5)
+    assert layer.weight_type() == "ap_fixed<2,1>"
+    assert layer.accum_type() == "ap_fixed<14,10>"  # 21 terms -> 5 ; 1+3+5+1 ; F=1+3
+
+
+def test_accum_type_terms_at_a_power_of_two_boundary():
+    layer, _ = _qb(hgly.QConv2d, 1, 10, iq=act(2, 3))
+    _set_all(layer, 0.5)
+    assert layer.accum_type() == "ap_fixed<16,12>"  # 70 terms -> 7 (60 would give 6)
+
+
+def test_accum_type_3d_counts_the_depth():
+    layer, _ = _qb(hgly.QConv3d, (3, 1), 3, iq=act(2, 3), shape=(2, 3, H, W, 3))
+    _set_all(layer, 0.5)
+    assert layer.accum_type() == "ap_fixed<15,11>"  # 63 terms -> 6 ; 1+3+6+1
+
+
+def test_accum_type_bias_wider_than_products_sets_the_integer_part():
+    layer, _ = _qb(hgly.QConv2d, 1, 3, iq=act(2, 3), bq=fixed(14, 12))
+    _set_all(layer, 0.5)
+    layer.bias_tensor.assign(np.full((4,), 1000.25, "float32"))
+    assert layer.bias_type() == "ap_fixed<13,11>"
+    assert layer.accum_type() == "ap_fixed<16,12>"  # max(9, 11) + 1 ; F=max(4, 2)
+
+
+def test_accum_type_finer_bias_sets_the_fractional_part():
+    layer, _ = _qb(hgly.QConv2d, 1, 3, iq=act(2, 3), bq=fixed(10, 2))
+    _set_all(layer, 0.5)
+    layer.bias_tensor.assign(np.full((4,), 1.0078125, "float32"))  # 8 fractional bits
+    assert layer.accum_type() == "ap_fixed<17,10>"  # F = max(4, 7)
+
+
+# ---- _exact_fixed_type boundaries ------------------------------------------------------------
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        ([-1.0], "ap_fixed<1,1>"),  # -2^(I-1) exactly, the lowest value of the type
+        ([0.5], "ap_fixed<2,1>"),  # the highest value of ap_fixed<2,1> is 0.5
+        ([1.0], "ap_fixed<2,2>"),  # 2^(I-1) does not fit in I
+        ([-0.5, 0.25], "ap_fixed<2,0>"),
+    ],
+)
+def test_exact_fixed_type_boundaries(values, expected):
+    assert _exact_fixed_type([np.array(values)]) == expected
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_exact_fixed_type_refuses_non_finite(bad):
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        _exact_fixed_type([np.array([0.5, bad])])
+
+
+# ---- activation types: heterogeneous / non-integer bit widths ---------------------------------
+PER_ELEMENT_KIF = QuantizerConfig("kif", "datalane", k0=1, i0=2, f0=3, trainable=True)
+
+
+def test_activation_type_takes_the_max_over_the_alive_elements_and_rounds_the_bits():
+    layer, _ = _qb(hgly.QConv2d, 1, C, iq=PER_ELEMENT_KIF)
+    q = {v.name: v for v in layer._iq.variables}
+    i = np.full(q["i"].shape, 1.0, "float32")
+    f = np.full(q["f"].shape, 2.0, "float32")
+    i.flat[0], f.flat[1] = 4.0, 6.0  # two different elements are the widest
+    q["i"].assign(i)
+    q["f"].assign(f)
+    assert layer.input_type().startswith("ap_fixed<11,5,")  # I = 4 + sign, F = 6
+    i[:] = 1.6
+    f[:] = 2.4  # trained bit widths are not integers
+    q["i"].assign(i)
+    q["f"].assign(f)
+    assert layer.input_type().startswith(
+        "ap_fixed<5,3,"
+    )  # round(1.6)=2, round(2.4)=2 -> <2+2+1, 3>
+
+
+# ---- freeze copies the *learned* activation quantizers ----------------------------------------
+def test_freeze_keep_copies_the_learned_bit_widths_of_the_activation_quantizers():
+    inp = keras.Input((H, W, C))
+    layer = hgly.QConv2d(
+        4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=PER_ELEMENT_KIF, oq_conf=PER_ELEMENT_KIF
+    )
+    model = keras.Model(inp, layer(inp))
+    for q in (layer._iq, layer._oq):  # as if training had changed them
+        for v in q.variables:
+            if v.name in ("f", "i"):
+                v.assign(np.random.default_rng(3).uniform(0.0, 3.0, v.shape).astype("float32"))
+    frozen, _ = hgly.freeze(model)
+    np.testing.assert_allclose(np_(frozen(X)), np_(model(X)), atol=1e-6)
+    assert not any(l.trainable for l in frozen.layers if "_iq" in l.name or "_oq" in l.name)
+
+
+def test_freeze_keeps_the_dict_structure_of_the_inputs():
+    a, b = keras.Input((H, W, C), name="a"), keras.Input((H, W, C), name="b")
+    model = keras.Model(
+        {"a": a, "b": b}, hgly.QConv2d(C, kernel_size=1, kq_conf=fixed(6, 1))(a) + b
+    )
+    frozen, _ = hgly.freeze(model)
+    assert isinstance(frozen.input, dict) and set(frozen.input) == {"a", "b"}
+
+
+# ---- EBOPs bookkeeping ------------------------------------------------------------------------
+def _fit_one_step(layer, x, **fit):
+    inp = keras.Input(x.shape[1:])
+    model = keras.Model(inp, layer(inp))
+    model.compile("sgd", "mse")
+    model.fit(
+        x, np.zeros((len(x),) + tuple(model.output_shape[1:]), "float32"), epochs=1, verbose=0
+    )
+    return model
+
+
+def test_inference_after_a_training_step_is_unchanged_and_the_layer_state_is_restored():
+    kw = dict(
+        kernel_size=1,
+        kq_conf=fixed(6, 1),
+        bq_conf=fixed(5, 1),
+        iq_conf=act(2, 3),
+        oq_conf=act(3, 3),
+        activation="relu",
+    )
+    layer = hgly.QConv2d(4, **kw)
+    inp = keras.Input(X.shape[1:])
+    model = keras.Model(inp, layer(inp))
+    before = np_(model.predict(X, verbose=0))
+    model.compile(keras.optimizers.SGD(0.0), "mse")  # a training step that changes nothing
+    model.fit(X, np.zeros_like(before), epochs=1, verbose=0)
+    assert float(np_(layer.ebops)) > 0  # the EBOPs pass did run
+    assert layer._ebops_pass is False
+    assert layer.kwargs.get("bias") is not None  # the quantized bias, not the EBOPs pass's None
+    np.testing.assert_allclose(np_(model.predict(X, verbose=0)), before, atol=1e-6)
+    np.testing.assert_allclose(np_(layer(X)), before, atol=1e-6)
+    assert before.min() >= 0 and (before > 0).any()  # the ReLU is still there
+
+
+def test_ebops_factor_scales_the_reported_ebops_and_the_loss():
+    base = dict(kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3))
+    a, b = hgly.QConv2d(4, **base), hgly.QConv2d(4, ebops_factor=3.0, **base)
+    _fit_one_step(a, X)
+    _fit_one_step(b, X)
+    assert float(np_(b.ebops)) == 3.0 * float(np_(a.ebops))
+
+
+def test_enable_ebops_false_survives_get_config_and_clone():
+    layer = hgly.QConv2d(
+        4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3), enable_ebops=False
+    )
+    assert hgly.QConv2d.from_config(layer.get_config()).enable_ebops is False
+    inp = keras.Input((H, W, C))
+    m = keras.Model(inp, layer(inp))
+    assert keras.models.clone_model(m).layers[1].enable_ebops is False
+
+
+def test_global_enable_ebops_false_is_respected():
+    from hgq.config.layer import global_config
+
+    was = global_config["enable_ebops"]
+    try:
+        global_config["enable_ebops"] = False
+        assert hgly.QConv2d(4, kernel_size=1, iq_conf=act(2, 3)).enable_ebops is False
+    finally:
+        global_config["enable_ebops"] = was
+
+
+def test_default_kernel_quantizer_is_hgq2s_weight_config():
+    ref = hgly.QConv2d(4, kernel_size=1, kq_conf=QuantizerConfig("default", "weight"))
+    ref(X)
+    default = hgly.QConv2d(4, kernel_size=1)
+    default(X)
+    q, r = default._kqs[0], ref._kqs[0]
+    shape = keras.ops.shape(default._kernel_sources()[0])
+    assert (type(q.quantizer), q.quantizer.round_mode, q.quantizer.overflow_mode) == (
+        type(r.quantizer),
+        r.quantizer.round_mode,
+        r.quantizer.overflow_mode,
+    )
+    np.testing.assert_array_equal(np_(q.bits_(shape)), np_(r.bits_(shape)))  # the same bit widths
+
+
+def test_quantized_bias_is_none_without_a_bias():
+    layer = hgly.QConv2d(4, kernel_size=1, use_bias=False, kq_conf=fixed(6, 1))
+    layer(X)
+    assert layer.quantized_bias() is None and layer.bias_type() is None
+
+
+def test_activation_type_is_signed_when_any_alive_element_is_signed():
+    layer, _ = _qb(hgly.QConv2d, 1, C, iq=PER_ELEMENT_KIF)
+    q = {v.name: v for v in layer._iq.variables}
+    k = np.zeros(q["k"].shape, "float32")
+    k.flat[0] = 1.0  # one signed element among unsigned ones
+    q["k"].assign(k)
+    assert layer.input_type().startswith("ap_fixed<")  # not ap_ufixed
+
+
+@pytest.mark.parametrize("activation", ["sigmoid", "tanh", "softplus", "exponential"])
+def test_ebops_do_not_depend_on_the_activation_of_the_layer(activation):
+    kw = dict(kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3))
+    a, b = hgly.QConv2d(4, **kw), hgly.QConv2d(4, activation=activation, **kw)
+    _fit_one_step(a, X)
+    _fit_one_step(b, X)
+    assert float(np_(a.ebops)) == float(np_(b.ebops))
+
+
+@pytest.mark.skipif(
+    keras.backend.backend() == "tensorflow", reason="HGQ2 has no half precision on TF"
+)
+def test_ebops_in_half_precision_train():
+    layer = hgly.QConv2d(
+        4,
+        kernel_size=1,
+        dtype="float16",
+        kq_conf=fixed(6, 1),
+        bq_conf=fixed(5, 1),
+        iq_conf=act(2, 3),
+    )
+    _fit_one_step(layer, X)
+    assert float(np_(layer.ebops)) > 0
+
+
+def test_ebops_saturate_in_the_uint32_variable_instead_of_wrapping():
+    layer = hgly.QConv2d(4, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3), ebops_factor=1e9)
+    inp = keras.Input((H, W, C))
+    out = layer(inp, training=True)
+    keras.Model(inp, out)
+    layer(X, training=True)
+    assert int(np_(layer.ebops)) == 4294967040
+    assert all(np.isfinite(float(np_(l))) for l in layer.losses)
+
+
+@pytest.mark.skipif(
+    keras.backend.backend() != "tensorflow", reason="sparse inputs are a TF feature"
+)
+def test_freeze_keeps_the_sparse_flag_of_the_inputs():
+    import tensorflow as tf
+
+    inp = keras.Input((H, W, C), sparse=True)
+    dense = keras.layers.Lambda(lambda t: tf.sparse.to_dense(t), output_shape=(H, W, C))(inp)
+    model = keras.Model(inp, hgly.QConv2d(2, kernel_size=1, kq_conf=fixed(6, 1))(dense))
+    frozen, _ = hgly.freeze(model)
+    assert frozen.inputs[0].sparse
+
+
+@needs_hls
+def test_apply_quantized_types_says_when_a_producer_keeps_its_own_result_type():
+    pytest.importorskip("hls4ml")
+    import hls4ml
+
+    from keras_hexagdly.hls4ml_ext import apply_quantized_types, patch_model_for_hls
+    from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+    register_hex_gather_layers("Vitis")
+    inp = keras.Input((H, W, C), name="x")
+    first = hgly.QConv2d(
+        4, kernel_size=1, name="c1", kq_conf=fixed(6, 1), iq_conf=act(2, 3), oq_conf=act(3, 2, k=0)
+    )
+    second = hgly.QConv2d(  # reads c1's output with other widths than c1's output quantizer
+        2, kernel_size=1, name="c2", kq_conf=fixed(6, 1), iq_conf=act(3, 3, k=0)
+    )
+    frozen, types = hgly.freeze(keras.Model(inp, second(first(inp))), activation_quantizers="types")
+    patched = patch_model_for_hls(frozen)
+    config = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vitis")
+    with pytest.warns(UserWarning, match="kept over"):
+        apply_quantized_types(config, patched, types)
+    assert config["LayerName"]["c1_linebuffer"]["Precision"]["result"] == types["c1"]["result"]
+
+
+@needs_hls
+def test_apply_quantized_types_refuses_consumers_that_want_different_input_types():
+    pytest.importorskip("hls4ml")
+    import hls4ml
+
+    from keras_hexagdly.hls4ml_ext import apply_quantized_types, patch_model_for_hls
+    from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+    register_hex_gather_layers("Vitis")
+    inp = keras.Input((H, W, C), name="x")
+    left = hgly.QConv2d(2, kernel_size=1, name="left", kq_conf=fixed(6, 1), iq_conf=act(2, 3))
+    right = hgly.QConv2d(2, kernel_size=1, name="right", kq_conf=fixed(6, 1), iq_conf=act(3, 4))
+    model = keras.Model(inp, [left(inp), right(inp)])
+    frozen, types = hgly.freeze(model, activation_quantizers="types")
+    patched = patch_model_for_hls(frozen)
+    config = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vitis")
+    with pytest.raises(ValueError, match="different input types"):
+        apply_quantized_types(config, patched, types)
+
+
+# ---- audit final: clear errors at the door ----
+
+
+def test_freeze_refuses_what_is_not_a_model():
+    with pytest.raises(TypeError, match="freeze expects a Keras model"):
+        hgly.freeze("model")
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"iq_conf": "foo"}, {"kq_conf": {"a": 1}}, {"bq_conf": 3}, {"oq_conf": object()}]
+)
+def test_a_quantizer_config_of_the_wrong_type_is_refused_at_construction(kwargs):
+    with pytest.raises(TypeError, match="QuantizerConfig"):
+        hgly.QConv2d(4, kernel_size=1, **kwargs)
+
+
+def test_a_negative_beta_is_refused():
+    with pytest.raises(ValueError, match="beta0 must be >= 0"):
+        hgly.QConv2d(4, kernel_size=1, iq_conf=act(2, 3), beta0=-1.0)
+
+
+@pytest.mark.skipif(keras.backend.backend() != "tensorflow", reason="a TensorFlow limitation")
+def test_half_precision_on_tensorflow_is_explained():
+    keras.config.set_dtype_policy("mixed_float16")
+    try:
+        with pytest.raises(ValueError, match="do not support half precision"):
+            hgly.QConv2d(4, kernel_size=1, kq_conf=fixed(6, 1))
+    finally:
+        keras.config.set_dtype_policy("float32")
+
+
+@needs_hls
+def test_patch_refuses_the_standalone_quantizers_that_freeze_keeps_by_default():
+    from keras_hexagdly.hls4ml_ext import patch_model_for_hls
+
+    inp = keras.Input((H, W, C))
+    model = keras.Model(
+        inp, hgly.QConv2d(2, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3))(inp)
+    )
+    kept, _ = hgly.freeze(model)  # the default: the activation quantizers stay as layers
+    with pytest.raises(ValueError, match="activation_quantizers='types'"):
+        patch_model_for_hls(kept)
+    patch_model_for_hls(hgly.freeze(model, activation_quantizers="types")[0])
