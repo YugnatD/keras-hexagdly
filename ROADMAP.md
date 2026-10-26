@@ -76,49 +76,36 @@ multiplication to a DSP or to LUTs, and on the target part).
 
 **Effort.** Medium (latency and DSP), larger if LUT/FF are wanted.
 
-### 3. Exporting a model that mixes these layers with HGQ2's own (`QDense`, ...)
+### 3. (done) Exporting a model that mixes these layers with HGQ2's own (`QDense`, ...)
 
-**Why.** Only the hexagonal layers are quantized in the notebook; the dense head runs in one uniform
-`ap_fixed` (`<24,12>`, because the logits reach 84). A real model nearly always has a head, and the learned
-bit widths would save there too.
+Route A of the earlier plan turned out to be small: hls4ml's bit-exact flow
+(`model/optimizer/passes/bit_exact.py`) asks each layer class for the values its output can take
+(`_produce_kif`); the hex convolution and max pooling now register one, built on the layer's own
+neighbour table, and the convolution declares an `accum_t` that the flow fills in. The exported model
+needs no types to be set by hand, the C simulation equals Keras exactly (`tests/test_hls_bit_exact_csim.py`).
 
-**What works today.** The *training* side: a model with `QConv2d` and HGQ2's `QDense` counts both in the
-EBOPs (checked: convolution 168 192 + head 55 320 = the 223 512 that `FreeEBOPs` reports), and `freeze`
-leaves the `QDense` untouched.
+**Found on the way.** Two quantizers in a row on one tensor (`oq_conf` then the next layer's `iq_conf`) are
+merged by hls4ml into a single type; with different grids this differs from Keras's double rounding by a
+step. `patch_model_for_hls` now warns; the notebook uses one quantizer per tensor. Whether HGQ2 could make
+the export faithful for that case (or `freeze` merge the two quantizers itself) was not explored.
 
-**What fails today.** The *export*: as soon as the model contains an HGQ2 layer, hls4ml follows HGQ2's own
-path, where every layer must say which precision it produces (`produce_kif`), and the exported hex layers
-cannot:
+**Per-channel and per-element activation quantizers** (HGQ2's default granularity) were tried: hls4ml refuses
+them in `io_stream` (`Heterogenous quantization for activations is only supported with IOType=io_parallel`,
+in its `hgq_proxy_model.py`), a limit of hls4ml, not of the exported layers. In `io_parallel` the exported hex
+nodes, whose output array is flattened to (pixels, channels), do not match the (H, W, C) masks of such
+quantizers (`assert k.ndim == lk.ndim` in `bit_exact.py`): giving the nodes an (H, W, C) output shape would
+be the first step, but `io_parallel` is not a validated path for these kernels.
 
-    NotImplementedError: No implementation of produce_kif for ... (HHexConvLineBuffer)
+**A global average after the hex layers** now exports: the hex nodes have an `(H, W, C)` output shape,
+and `QGlobalAveragePooling2D` works after them (hls4ml 1.3.0 returns a `(1, C)` array for its output where
+`(C,)` is expected: reshaped in the registration, to report to hls4ml). Its hardware cost was not
+investigated: a mean needs one accumulator per channel, and whether hls4ml's `global_pooling2d` is
+that cheap in this pipeline is not known. A sum (`QSum`) with the factor 1/(number of pixels) absorbed into the weights of
+the next dense layer is the first thing to try; a dedicated kernel in this library is the other.
 
-**What to do: two routes.**
-
-* *A. Make the exported hex layers acceptable to that path*: implement `produce_kif` (and whatever else the
-  path asks for) for `HHexConvLineBuffer` and `HHexPoolLineBuffer`, and decide how the types of the hex layers
-  (today set through `apply_quantized_types`) and the quantizers of the HGQ2 layers (which carry their own)
-  meet in one configuration. Needed only to export models built with HGQ2's own layers. Check first what
-  hls4ml's HGQ2 path requires from a custom layer.
-* *B. A `QDense` of this library* (a Keras `Dense` with HGQ2 quantizers, the same pattern as `QConv2d`).
-  After `freeze` the model holds only ordinary layers, so hls4ml uses its official handlers and never enters
-  the HGQ2 path; the learned types are given in the config as for the hex layers (the `Dense` precision keys
-  `weight`, `bias`, `accum`, `result` should take them, not verified). Simpler and consistent with the
-  rest of the library; the cost is one more class to maintain, and models that already use HGQ2's layers
-  still cannot be exported.
-
-Which one: A has the higher ceiling, B the lower risk. A covers every HGQ2 layer (dense, convolution, batch
-normalisation, ...), and hls4ml's precision propagation (`model/optimizer/passes/bit_exact.py`) is a
-per-layer-class registry (`_produce_kif.register(...)`) whose `Conv2D` entry is about thirty lines: put the
-input precisions in columns of neighbours (`im2col`), multiply by the kernel with interval arithmetic, read
-the output precision. The hex version would use this library's neighbour tables. If it works, hls4ml would
-derive every type, accumulators included, and `apply_quantized_types` / `AccumPrecision` would no longer be
-needed for such models: `freeze`, `patch_model_for_hls`, convert. To settle it, a small spike first:
-`produce_kif` for the hex convolution alone (no weight sharing), a model with a `QDense` head, and the C
-simulation against Keras. Unknown before that: the parity-dependent kernels and the sharing modes; whether
-that flow overwrites the result and accumulator types the kernels' templates read (today they read what
-`apply_quantized_types` sets); and whether it works in `io_stream` with the line-buffer kernels.
-
-**Effort.** A: medium to large. B: medium.
+**Remaining.** The 3D layers (no export), and the dependence on a private function of hls4ml (`_produce_kif`): a version check or a test
+against new hls4ml releases. Checked exact in the C simulation: default settings, `hex_reuse_config`,
+`ReuseFactor=4` with `Strategy='Resource'`, and the `Dataflow` kernel.
 
 ### 4. Batch-normalisation folding
 
@@ -160,12 +147,19 @@ is what the quantization notebook does in six cells.
 
 * **`Dataflow` mode.** Now at II=1 like the fused kernel (194 cycles on the 12x12 test layer, three sets of
   types). It keeps a structural cost: BRAM (33, 51 and 78 for the narrow, mid and wide types, against 14, 19
-  and 28 for the fused kernel), because of the stream between its two processes. Its reuse-factor > 1 behaviour
-  was not re-measured after the changes.
+  and 28 for the fused kernel), because of the stream between its two processes. Its reuse-factor > 1
+  behaviour was not re-measured after the changes.
 * **3D kernels** (`nnet_hex_conv_linebuffer_3d_stream.h`, `nnet_hex_pool_linebuffer_3d_stream.h`) carry a
   similar emit counter (`cur_emit_p`) but have a different structure (whole frames are buffered). They were
   not looked at, and their export is not a validated path.
 * **Mixed precision** is not supported by HGQ2 on the TensorFlow backend.
+* **ReLU in hls4ml 1.3**: a `keras.layers.ReLU` becomes `nnet::thresholded_relu` with a threshold of type
+  `ap_ufixed<2,32>` (the bit-exact flow's fallback for a zero parameter); the comparison `in > theta` is then true
+  for negative inputs, hidden when a saturating quantizer follows, visible with an unsigned wrapping result.
+  Worked around in `patch_model_for_hls` (`Activation("relu")`); worth reporting to hls4ml.
+* **`hls4ml`**: the export needs >= 1.3.0 (extra `hls`, checked at registration); no upper bound, 1.3.0 is the only
+  version tested, and the bit-exact flow is reached through a private function (`_produce_kif`). A CI job on the
+  newest hls4ml would catch a break early. Why 1.2 fails (all-zero C simulations) was not investigated.
 * **`hgq2`** has no upper bound in `pyproject.toml`. Versions 0.1.6, 0.1.9 and 0.2.0 were tested; 0.2.0
   needs Keras >= 3.15, hence Python >= 3.11.
 * Python 3.11 and the real GitHub CI were not run before the 0.7.0 work.

@@ -272,6 +272,24 @@ def _exact_accumulator(node):
     return bool(value)
 
 
+def _bit_exact_accum(node):
+    """The accumulator type hls4ml's bit-exact flow computed for the node (ap_fixed), or None.
+
+    That flow (taken when the model has HGQ2 quantizers) propagates the exact range of every value
+    by interval arithmetic, so its accumulator holds the sum of the products and the bias without
+    rounding: what ``ExactAccumulator`` builds by hand, and tighter (the real range, not a bound).
+    """
+    attributes = getattr(node, "attributes", None) or {}
+    if not attributes.get("bit_exact_transformed"):
+        return None
+    accum = attributes.get("accum_t")
+    precision = getattr(accum, "precision", None)
+    if precision is None or getattr(precision, "width", None) is None:
+        return None
+    unsigned = "" if precision.signed else "u"
+    return f"ap_{unsigned}fixed<{precision.width}, {precision.integer}>"
+
+
 def _accum_type_str(node, n_terms):
     """Return an ap_fixed<> string for the ring-MAC accumulator.
 
@@ -307,6 +325,9 @@ def _accum_type_str(node, n_terms):
     override = _accum_override(node)
     if override:
         return override
+    exact = _bit_exact_accum(node)
+    if exact:
+        return exact
     prec = node.get_weights("mac_weights").type.precision
     width = getattr(prec, "width", None)
     integer = getattr(prec, "integer", None)
@@ -408,13 +429,14 @@ class HHexConvLineBuffer(Layer):
         TypeAttribute("mac_weights"),
         WeightAttribute("mac_bias"),
         TypeAttribute("mac_bias"),
+        TypeAttribute("accum"),  # filled in by hls4ml's bit-exact flow (see _bit_exact_accum)
     ]
 
     def initialize(self):
-        n_out = self.attributes["out_height"] * self.attributes["out_width"]
-        n_filt = self.attributes["n_filt"]
-        # 2D shape [n_out, n_filt] so io_stream packs n_filt per token (depth n_out).
-        self.add_output_variable(shape=[n_out, n_filt])
+        # (H, W, C) like hls4ml's own convolutions: io_stream packs C per token (depth H * W), and
+        # the layers after this one (a pooling, HGQ2's quantizers) read the image shape from it.
+        a = self.attributes
+        self.add_output_variable(shape=[a["out_height"], a["out_width"], a["n_filt"]])
         self.add_weights_variable(name="mac_weights", var_name="w{index}")
         self.add_weights_variable(name="mac_bias", var_name="b{index}")
 
@@ -619,8 +641,8 @@ class HHexPoolLineBuffer(Layer):
     ]
 
     def initialize(self):
-        n_out = self.attributes["out_height"] * self.attributes["out_width"]
-        self.add_output_variable(shape=[n_out, self.attributes["n_chan"]])
+        a = self.attributes
+        self.add_output_variable(shape=[a["out_height"], a["out_width"], a["n_chan"]])
 
 
 class HexPoolLineBufferHandler(KerasV3LayerHandler):
@@ -1117,6 +1139,102 @@ class HexConvLineBuffer3DFunctionTemplate(FunctionCallTemplate):
 _registered = False
 
 
+def _register_bit_exact_kif():
+    """Teach hls4ml's bit-exact precision flow what the hex line-buffer layers produce.
+
+    hls4ml switches to a model-wide precision propagation (``optimizer/passes/bit_exact.py``) as
+    soon as a model contains HGQ2 quantizers or layers. Each layer class must say which values its
+    output can take (``_produce_kif``: per element, the sign, integer and fractional bits) from
+    those of its input, by quantized interval arithmetic. Done here for the hexagonal convolution
+    (the neighbours gathered through the layer's own table, the kernel expanded from its rings) and
+    for the max pooling. This uses a private function of hls4ml (``_produce_kif``): a missing one is
+    not an error, the layers then simply stay unusable with HGQ2's own layers.
+    """
+    try:
+        from hls4ml.model.optimizer.passes import bit_exact
+        from hls4ml.utils.qinterval import QIntervalArray
+
+        produce = bit_exact._produce_kif
+    except (ImportError, AttributeError):  # an hls4ml without the bit-exact flow
+        return
+
+    def gathered(layer, arrays):
+        """The input arrays (kif per input pixel and channel) laid out per output pixel and tap."""
+        a = layer.attributes
+        n_in, n_chan, k = a["in_height"] * a["in_width"], a["n_chan"], a["k"]
+        idx = np.asarray(layer.get_attr("indices_data")).reshape(-1, k)  # (N_out, K), -1 = outside
+        valid = idx >= 0
+        safe = np.where(valid, idx, 0)
+        out = []
+        for arr in arrays:
+            g = np.asarray(arr).reshape(n_in, n_chan)[safe]  # (N_out, K, Cin)
+            out.append(np.where(valid[:, :, None], g, 0).astype(np.int16))  # outside = exact zero
+        return out
+
+    @produce.register(HHexConvLineBuffer)
+    def _(layer):
+        a = layer.attributes
+        n_chan, n_filt, k = a["n_chan"], a["n_filt"], a["k"]
+        k_in, i_in, f_in = (np.asarray(x) for x in bit_exact.get_input_kifs(layer)[0])
+        kg, ig, fg = gathered(layer, (k_in, i_in, f_in))
+        n_out = kg.shape[0]
+        weights = np.asarray(a["mac_weights"].data, dtype=np.float64)
+        weights = weights.reshape(a["num_weight_rows"], n_chan, n_filt)
+        if a["share_neighbors"]:
+            weights = weights[np.asarray(layer.get_attr("row_map_data"))]  # slot -> its ring
+        kernel = weights.reshape(k * n_chan, n_filt)
+        qin = QIntervalArray.from_kif(
+            kg.reshape(n_out, -1), ig.reshape(n_out, -1), fg.reshape(n_out, -1)
+        )
+        qout = qin @ kernel
+        bias = a["mac_bias"]
+        if bias is not None:
+            qout = qout + np.asarray(bias.data, dtype=np.float64)
+        shape = (a["out_height"], a["out_width"], n_filt)
+        return tuple(x.astype(np.int16).reshape(shape) for x in qout.to_kif())
+
+    # hls4ml 1.3.0 returns a (1, C) array for the output of a global 2D pooling, one rank too many
+    # for the layers after it (an HGQ2 quantizer asserts equal ranks); it is a (C,) vector.
+    from hls4ml.model.layers import GlobalPooling2D
+
+    pooled = produce.dispatch(GlobalPooling2D)
+
+    @produce.register(GlobalPooling2D)
+    def _(layer):
+        n_filt = layer.attributes["n_filt"]
+        return tuple(np.asarray(x).reshape(n_filt) for x in pooled(layer))
+
+    @produce.register(HHexPoolLineBuffer)
+    def _(layer):
+        k_in, i_in, f_in = (np.asarray(x) for x in bit_exact.get_input_kifs(layer)[0])
+        kg, ig, fg = gathered(layer, (k_in, i_in, f_in))  # (N_out, K, C); outside taps count as 0
+        a = layer.attributes
+        shape = (a["out_height"], a["out_width"], a["n_chan"])
+        return tuple(g.max(axis=1).astype(np.int16).reshape(shape) for g in (kg, ig, fg))
+
+
+_MIN_HLS4ML = (1, 3, 0)
+
+
+def _require_hls4ml_version():
+    """The export needs hls4ml >= 1.3.0.
+
+    Earlier versions do not register the Keras handlers of the hex layers by themselves (1.2: no
+    metaclass), and the C simulations they give for these kernels were found to be all zeros.
+    """
+    parts = []
+    for piece in str(getattr(hls4ml, "__version__", "")).split(".")[:3]:
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            return  # a version string we cannot read: do not get in the way
+        parts.append(int(digits))
+    if tuple(parts) < _MIN_HLS4ML:
+        raise ImportError(
+            "The hls4ml export of keras-hexagdly needs hls4ml >= "
+            f"{'.'.join(map(str, _MIN_HLS4ML))} (found {hls4ml.__version__}): pip install -U hls4ml"
+        )
+
+
 def register_hex_gather_layers(backend_name="Vivado"):
     """Register the line-buffer hex layers with hls4ml.
 
@@ -1127,6 +1245,7 @@ def register_hex_gather_layers(backend_name="Vivado"):
     global _registered
     if _registered:
         return
+    _require_hls4ml_version()
 
     # Register hls4ml IR layer types
     hls4ml.model.layers.register_layer("HHexConvLineBuffer", HHexConvLineBuffer)
@@ -1161,5 +1280,7 @@ def register_hex_gather_layers(backend_name="Vivado"):
         p = here / fname
         if p.exists():
             backend.register_source(p)
+
+    _register_bit_exact_kif()
 
     _registered = True

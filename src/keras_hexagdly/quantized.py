@@ -653,7 +653,8 @@ def freeze(model, activation_quantizers="keep"):
 
     * ``"keep"`` (default): they stay in the frozen model as standalone HGQ2 ``Quantizer`` layers,
       so it computes exactly what ``model`` computes -- the way to check the quantization in Keras.
-      hls4ml cannot convert them in ``io_stream``.
+      hls4ml's bit-exact flow converts them and derives every type of the export itself (see
+      ``patch_model_for_hls``); nothing to set by hand.
     * ``"types"``: they are dropped; their precision is in ``types`` (``"input"`` / ``"result"``),
       to be set in the hls4ml config. The frozen model is then the float-activation model, and
       equals ``model`` only where the activations are already on their grid.

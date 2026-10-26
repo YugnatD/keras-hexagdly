@@ -207,8 +207,9 @@ With `trainable=False` in a `QuantizerConfig` the bit widths stay fixed (plain f
 regulariser they are learned, and a weight that reaches 0 bit is removed. `model.save()` and
 `load_model()` keep the quantizers and their configs. `freeze` returns a new model in which every
 quantized layer is back to its plain hexagonal layer, with the same outputs (its default
-`activation_quantizers="keep"` leaves the activation quantizers in the model as standalone layers; see the
-export below for `"types"`), and, for each quantized layer, the `ap_fixed` types to give hls4ml: `weight`, `bias`, `input`, `result` (for what was quantized) and
+`activation_quantizers="keep"` leaves the activation quantizers in the model as standalone layers, which
+hls4ml's bit-exact flow turns into the types of the export; see the export below, and `"types"` for setting
+them by hand), and, for each quantized layer, the `ap_fixed` types to give hls4ml: `weight`, `bias`, `input`, `result` (for what was quantized) and
 `accum`. `patch_model_for_hls` refuses a model that still has quantized layers.
 
 **EBOPs.** A convolution with an input quantizer (`iq_conf`) counts its cost in EBOPs (effective bit
@@ -233,8 +234,49 @@ from hgq.utils.sugar import BetaPID, FreeEBOPs
 model.fit(x, y, callbacks=[FreeEBOPs(), BetaPID(target_ebops=20_000, p=1e-5, i=1e-5)])
 ```
 
-**Exporting to hls4ml (`io_stream`).** hls4ml only handles per-element activation quantizers in
-`io_parallel`, so for the export give `iq_conf` / `oq_conf` one bit width per layer
+**Exporting to hls4ml (`io_stream`), the types derived by hls4ml.** With the default `freeze(model)` the
+activation quantizers stay in the frozen model as HGQ2 layers. hls4ml then runs its bit-exact precision
+flow, which computes the exact range of every value from the input quantizer and the values of the weights
+(interval arithmetic), and sets every type itself: result, weights, bias and accumulator. Nothing to
+give by hand; the exported hex layers take part in it, so the model can also contain HGQ2's own layers
+(`QDense`...):
+
+```python
+import hls4ml
+from keras_hexagdly.hls4ml_ext import hex_reuse_config, patch_model_for_hls
+from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
+
+frozen, _ = hgly.freeze(model)                       # the quantizers stay as layers
+register_hex_gather_layers("Vitis")
+patched = patch_model_for_hls(frozen)
+config = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vitis")
+hex_reuse_config(config, patched)                    # optional: an explicit reuse factor per hex layer
+hls_model = hls4ml.converters.convert_from_keras_model(
+    patched, hls_config=config, io_type="io_stream", backend="Vitis",
+    output_dir="prj", part="xc7vx485tffg1927-2", clock_period=5)
+hls_model.compile()                                  # C simulation: equal to the Keras model, bit for bit
+```
+
+One quantizer per tensor. An output quantizer (`oq_conf`) on a layer and the input quantizer (`iq_conf`) of the
+next one quantize the same tensor twice, and hls4ml merges them into one type: with different grids Keras
+rounds twice and hls4ml once, so the C simulation can differ by a step (`patch_model_for_hls` warns). Give
+the `iq_conf` to the consuming layer and no `oq_conf` to the producer, except on the output of the model.
+With that rule the C simulation of a trained model with learned bit widths equals Keras exactly.
+
+What it needs: the model input must be quantized (give the first hex layer an `iq_conf`, or start with an
+HGQ2 layer; `patch_model_for_hls` says so otherwise), and, for `io_stream`, one bit width per tensor for the
+activation quantizers (`homogeneous_axis=(0, 1, 2, 3)`): hls4ml stops on a per-channel or per-element one with
+`Heterogenous quantization for activations is only supported with IOType=io_parallel` (and with the exported
+hex layers those also hit a shape assertion in `io_parallel`, a path that is not validated anyway). The
+weights may have a bit width per element. The 3D layers
+and `QAvgPool2d` have no export. It relies on a private function of hls4ml (`_produce_kif`, in
+`optimizer/passes/bit_exact.py`), checked with hls4ml 1.3.0. `tests/test_hls_bit_exact_csim.py` compares
+the C simulation with Keras for a convolution, a max pooling, and a chain with ring sharing, strides and a
+`QDense` head: exactly equal.
+
+**Exporting to hls4ml (`io_stream`), the types set by hand.** To choose the types yourself, or when the rest
+of the model is plain Keras layers (a `Dense` head, say): hls4ml only handles per-element activation
+quantizers in `io_parallel`, so give `iq_conf` / `oq_conf` one bit width per layer
 (`homogeneous_axis=(0, 1, 2, 3)`), freeze with `activation_quantizers="types"` (the activation
 quantizers are dropped and their precision is in `types`), and put the types in the hls4ml config:
 
@@ -306,10 +348,8 @@ hgq2 `hasattr(keras_hexagdly, "QConv2d")` is simply False.
 
 Only what you give a quantizer is quantized: the other layers of a model, the activations without an
 `oq_conf`, and the bias without a `bq_conf` stay in float. The 3D layers have no hls4ml export yet.
-A model that also contains HGQ2's own layers (`QDense`, ...) trains fine and counts them in the EBOPs, but it
-cannot be exported to hls4ml yet (see `ROADMAP.md`): the hls4ml path for HGQ2 layers needs a precision
-function that the exported hex layers do not have, and the conversion stops with `No implementation of
-produce_kif`.
+A model that also contains HGQ2's own layers (`QDense`, ...) trains fine, counts them in the EBOPs, and
+exports through the bit-exact flow described above.
 
 ### New: same-padded temporal convolution (Conv3d)
 
@@ -349,6 +389,10 @@ The hex layers can be synthesised to HLS C++ through
 by a fused line-buffer kernel that keeps only the resident rows of the frame in
 a shift register, rather than materialising the whole gathered tensor.
 
+Needs **hls4ml >= 1.3.0** (`pip install keras-hexagdly[hls]`; 1.3.0 is the only version tested, and
+`register_hex_gather_layers` stops with a message on an older one: hls4ml 1.2 does not register the Keras
+handlers of the hex layers by itself and its C simulations of these kernels came out all zeros).
+
 ```python
 import hls4ml
 from keras_hexagdly.hls4ml_handler import register_hex_gather_layers
@@ -374,7 +418,7 @@ factor. Set `Dataflow` on a hex layer to run its line buffer and its MAC as two
 concurrent processes instead (`io_stream`, 2D only):
 
 ```python
-for layer in ("spatial_shared_linebuffer", "spatial_trigger_linebuffer"):
+for layer in ("conv1_linebuffer", "conv2_linebuffer"):
     config["LayerName"][layer]["Dataflow"] = True      # default False
 ```
 
@@ -494,9 +538,9 @@ Verified to pass on all three Keras 3 backends (set `KERAS_BACKEND=tensorflow|to
 before importing keras; tensorflow is the default if unset):
 
 ```
-KERAS_BACKEND=tensorflow   # 1142 passed, 16 skipped
-KERAS_BACKEND=torch        # 1134 passed, 24 skipped
-KERAS_BACKEND=jax          # 983 passed, 175 skipped (slower: per-shape JIT compile)
+KERAS_BACKEND=tensorflow   # 1157 passed, 16 skipped
+KERAS_BACKEND=torch        # 1149 passed, 24 skipped
+KERAS_BACKEND=jax          # 984 passed, 189 skipped (slower: per-shape JIT compile)
 ```
 
 A GitHub Actions workflow ([.github/workflows/test.yml](.github/workflows/test.yml))

@@ -488,6 +488,105 @@ _REPLACEMENTS_FOLDED = {
 }
 
 
+def _hls4ml_has_bit_exact_flow():
+    """Whether this hls4ml propagates precisions model-wide (``optimizer/passes/bit_exact.py``)."""
+    try:
+        from hls4ml.model.optimizer.passes import bit_exact  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _is_hgq(layer):
+    return type(layer).__module__.startswith("hgq")
+
+
+def _check_inputs_are_quantized(model):
+    """With HGQ2 layers or quantizers in the model, hls4ml's bit-exact flow needs a quantized input.
+
+    That flow derives every type from the one of the input, which must therefore be fixed by an HGQ2
+    quantizer (or a HGQ2 layer, which carries its own) right after the ``Input``; anything else
+    stops hls4ml with ``unexpected input layer chain``.
+    """
+    layers = list(model.layers)
+    if not any(_is_hgq(layer) for layer in layers):
+        return  # a plain model: the usual precision flow
+    for layer in layers:
+        if _is_hgq(layer) or isinstance(layer, keras.layers.InputLayer):
+            continue
+        sources = layer.input if isinstance(layer.input, (list, tuple)) else [layer.input]
+        for tensor in sources:
+            producer = tensor._keras_history.operation
+            if isinstance(producer, keras.layers.InputLayer):
+                raise ValueError(
+                    f"Layer {layer.name!r} reads the model input {producer.name!r} directly, but "
+                    "the model contains HGQ2 layers or quantizers: hls4ml then derives every "
+                    "type from the input, which must be quantized. Give the first hexagonal layer "
+                    "an iq_conf (or start the model with an HGQ2 layer)."
+                )
+
+
+def _warn_about_double_quantization(model):
+    """Warn when one tensor is quantized twice in a row (an output quantizer, then an input one).
+
+    hls4ml's bit-exact flow merges two quantizers that follow each other into one type. Keras
+    rounds twice, hls4ml once, and when the two grids differ the results can differ by a step
+    (0.74 on a grid of 0.25 gives 0.75, then 1.0 on a grid of 0.5; rounded once on the 0.5 grid
+    it is 0.5). One quantizer per tensor avoids it: the ``iq_conf`` of the consuming layer, no
+    ``oq_conf`` on the producer.
+    """
+    layers = list(model.layers)
+    consumers = {}
+    for layer in layers:
+        if isinstance(layer, keras.layers.InputLayer):
+            continue
+        sources = layer.input if isinstance(layer.input, (list, tuple)) else [layer.input]
+        for tensor in sources:
+            consumers.setdefault(tensor._keras_history.operation.name, []).append(layer)
+    transparent = (keras.layers.Flatten, keras.layers.Reshape, hgly.MaxPool2d, hgly.MaxPool3d)
+
+    def quantizes_its_input(layer):
+        return (type(layer).__name__ == "Quantizer" and _is_hgq(layer)) or (
+            _is_hgq(layer) and getattr(layer, "enable_iq", False)
+        )
+
+    pairs = []
+    for first in layers:
+        if not (type(first).__name__ == "Quantizer" and _is_hgq(first)):
+            continue
+        stack, seen = list(consumers.get(first.name, [])), set()
+        while stack:
+            layer = stack.pop()
+            if layer.name in seen:
+                continue
+            seen.add(layer.name)
+            if quantizes_its_input(layer):
+                pairs.append((first.name, layer.name))
+            elif isinstance(layer, transparent):
+                stack.extend(consumers.get(layer.name, []))
+    if pairs:
+        import warnings
+
+        listed = ", ".join(f"{a!r} then {b!r}" for a, b in pairs)
+        warnings.warn(
+            f"Some tensors are quantized twice in a row ({listed}). hls4ml merges the two "
+            "quantizers into one type, so when their grids differ the C simulation can differ from "
+            "the Keras model by a step. Use one quantizer per tensor: the iq_conf of the consuming "
+            "layer and no oq_conf on the producer.",
+            stacklevel=3,
+        )
+
+
+def _is_plain_relu(layer):
+    """A ``keras.layers.ReLU`` that is just max(0, x) (no cap, no slope, no threshold)."""
+    return (
+        type(layer) is keras.layers.ReLU
+        and layer.max_value is None
+        and not float(layer.negative_slope)
+        and not float(layer.threshold)
+    )
+
+
 def _all_layers(model):
     """The layers of ``model`` and, recursively, those of the models nested in it."""
     for layer in model.layers:
@@ -563,14 +662,16 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
         for layer in _all_layers(model)
         if type(layer).__name__ == "Quantizer" and type(layer).__module__.startswith("hgq")
     ]
-    if standalone:
+    if standalone and not _hls4ml_has_bit_exact_flow():
         raise ValueError(
-            f"The HGQ2 quantizer layers {standalone} (kept by freeze(model), the default) "
-            "cannot be "
-            "converted by hls4ml in io_stream. Freeze with activation_quantizers='types' for the "
-            "export: the activation precisions are then in the returned types, "
-            "see apply_quantized_types."
+            f"The HGQ2 quantizer layers {standalone} (kept by freeze(model), the default) can only "
+            "be converted by hls4ml's bit-exact precision flow, which this hls4ml does not have: "
+            "upgrade hls4ml, or freeze with activation_quantizers='types' (see "
+            "apply_quantized_types)."
         )
+
+    _check_inputs_are_quantized(model)
+    _warn_about_double_quantization(model)
 
     # No replacement exists for these, so left alone they would reach hls4ml as
     # an unknown custom layer and fail there with an unrelated error.
@@ -615,6 +716,13 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
             activation = getattr(layer, "activation", None)
             if activation is not None and activation is not keras.activations.linear:
                 y = keras.layers.Activation(activation, name=f"{layer.name}_activation")(y)
+        elif _is_plain_relu(layer):
+            # hls4ml 1.3 turns a keras.layers.ReLU into nnet::thresholded_relu, whose threshold
+            # gets a useless type (ap_ufixed<2,32>) in the bit-exact flow; with an unsigned
+            # wrapping result (a ReLU that no saturating quantizer follows) negative inputs then
+            # wrap around instead of giving 0. An Activation("relu") is the same function and
+            # converts well.
+            y = keras.layers.Activation("relu", name=layer.name)(x)
         else:
             y = layer(x) if not isinstance(x, list) else layer(x)
 

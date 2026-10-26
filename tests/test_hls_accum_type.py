@@ -163,3 +163,18 @@ def test_a_text_config_value_of_true_switches_it_on():
         FixedPrecisionType(7, 2), FixedPrecisionType(6, 3), model={"ExactAccumulator": True}
     )
     assert _accum_type_str(n, 7) == _accum_type_str(exact, 7)
+
+
+def test_an_old_hls4ml_is_refused_with_a_message(monkeypatch):
+    import hls4ml
+    import pytest
+
+    from keras_hexagdly import hls4ml_handler
+
+    monkeypatch.setattr(hls4ml, "__version__", "1.2.0")
+    with pytest.raises(ImportError, match=r"needs hls4ml >= 1\.3\.0 \(found 1\.2\.0\)"):
+        hls4ml_handler._require_hls4ml_version()
+    monkeypatch.setattr(hls4ml, "__version__", "1.3.0")
+    hls4ml_handler._require_hls4ml_version()
+    monkeypatch.setattr(hls4ml, "__version__", "2.0.1.dev3")
+    hls4ml_handler._require_hls4ml_version()

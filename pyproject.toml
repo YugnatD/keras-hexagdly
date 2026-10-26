@@ -49,6 +49,10 @@ dev = [
 qat = [
     "hgq2>=0.1.6; python_version >= '3.10'",
 ]
+# The hls4ml export of the hex layers (patch_model_for_hls and the line-buffer kernels).
+hls = [
+    "hls4ml>=1.3.0; python_version >= '3.10'",
+]
 
 [project.urls]
 Homepage = "https://github.com/YugnatD/keras-hexagdly"

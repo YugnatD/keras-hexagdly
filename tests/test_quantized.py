@@ -1296,7 +1296,9 @@ def test_apply_quantized_types_fills_the_config_of_a_chain_of_layers():
     assert apply_quantized_types(config, patched, types) is config
     layer = config["LayerName"]
     assert layer["x"]["Precision"]["result"] == types["c1"]["input"]
-    assert layer["c1_linebuffer"]["Precision"] == {
+    precision = dict(layer["c1_linebuffer"]["Precision"])
+    precision.pop("accum", None)  # the node declares an accumulator type, hls4ml adds its default
+    assert precision == {
         "result": types["c1"]["accum"],  # the MAC hands its sum on to the ReLU without wrapping it
         "mac_weights": types["c1"]["weight"],
         "mac_bias": types["c1"]["bias"],
@@ -1670,7 +1672,8 @@ def test_half_precision_on_tensorflow_is_explained():
 
 
 @needs_hls
-def test_patch_refuses_the_standalone_quantizers_that_freeze_keeps_by_default():
+def test_patch_explains_the_standalone_quantizers_when_hls4ml_lacks_the_bit_exact_flow(monkeypatch):
+    from keras_hexagdly import hls4ml_ext
     from keras_hexagdly.hls4ml_ext import patch_model_for_hls
 
     inp = keras.Input((H, W, C))
@@ -1678,6 +1681,8 @@ def test_patch_refuses_the_standalone_quantizers_that_freeze_keeps_by_default():
         inp, hgly.QConv2d(2, kernel_size=1, kq_conf=fixed(6, 1), iq_conf=act(2, 3))(inp)
     )
     kept, _ = hgly.freeze(model)  # the default: the activation quantizers stay as layers
-    with pytest.raises(ValueError, match="activation_quantizers='types'"):
+    patch_model_for_hls(kept)  # fine with an hls4ml that has the bit-exact flow
+    monkeypatch.setattr(hls4ml_ext, "_hls4ml_has_bit_exact_flow", lambda: False)
+    with pytest.raises(ValueError, match="bit-exact precision flow"):
         patch_model_for_hls(kept)
     patch_model_for_hls(hgly.freeze(model, activation_quantizers="types")[0])

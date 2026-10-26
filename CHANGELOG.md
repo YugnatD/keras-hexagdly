@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [0.7.0] - 2026-10-23
+## [0.7.0] - 2026-10-26
 
 ### Added
 
@@ -20,9 +20,45 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`model.save()` / `load_model()`, also in a fresh process that only imports `keras_hexagdly`:
   the package imports the quantized layers when hgq2 is installed). `import keras_hexagdly` still
   works without hgq2, where the quantized names are simply absent (`hasattr` is False).
+- **Export through hls4ml's bit-exact flow: no types to give, HGQ2's own layers allowed.** With the default
+  `freeze(model)` the activation quantizers stay in the model; hls4ml then derives every type (result,
+  weights, bias, accumulator) by interval arithmetic from the input quantizer and the values of the weights.
+  The exported hex convolution and max pooling now take part in that flow (they register `_produce_kif`
+  with hls4ml, from the layer's own neighbour table), and the convolution's accumulator is the one hls4ml
+  computed. A model with `QConv2d`, `QMaxPool2d` and HGQ2's `QDense` converts and its C simulation equals
+  the Keras model exactly (`tests/test_hls_bit_exact_csim.py`: convolution, max pooling, and chains with
+  ring sharing, strides, learned bit widths, a global average pooling and a `QDense` head). Before, any HGQ2 layer in the model
+  stopped the conversion with `No implementation of produce_kif for HHexConvLineBuffer`. One quantizer per tensor
+  is the rule that keeps it exact: an `oq_conf` followed by the `iq_conf` of the next layer quantizes the same
+  tensor twice, hls4ml merges the two into one type and the double rounding of Keras can differ from it by a
+  step with different grids (`patch_model_for_hls` warns). The model input must be quantized (an `iq_conf`
+  on the first hex layer): `patch_model_for_hls` says so otherwise. Needs an hls4ml
+  with that flow (1.3.0 tested); it uses a private function of it, `_produce_kif`. The 3D layers are not
+  covered. The manual route (`freeze(..., "types")` + `apply_quantized_types`) is unchanged.
+- **The exported hex convolution and pooling nodes have an image-shaped output `(H, W, C)`**, like hls4ml's
+  own convolutions (they were `(H * W, C)`). The stream is the same (C values per token, H * W tokens): the generated
+  firmware is identical (compared file by file on a two-convolution, one-pooling model), but the layers
+  after a hex node can now read the image shape: a global average pooling (`QGlobalAveragePooling2D`) or
+  HGQ2's per-pixel quantizers.
+  `tests/test_hls_bit_exact_csim.py` checks the shapes and a hex convolution -> max pooling -> global average
+  pooling -> `QDense` chain bit for bit. hls4ml 1.3.0 hands the layers after a global 2D pooling a `(1, C)`
+  array where a `(C,)` vector is expected (an HGQ2 quantizer there fails with an `AssertionError` on the
+  ranks); the bit-exact registration reshapes it. The hardware cost of hls4ml's global pooling was not
+  investigated (see ROADMAP.md).
+- `patch_model_for_hls` replaces a plain `keras.layers.ReLU` by `Activation("relu")` (the same function). hls4ml
+  1.3 turns a `ReLU` layer into a thresholded ReLU whose threshold gets the type `ap_ufixed<2,32>` in the
+  bit-exact flow; when no saturating quantizer follows (a last ReLU, with an unsigned wrapping result type),
+  negative inputs then wrap around instead of giving 0 in the C simulation (a regression test covers it);
+  `Activation("relu")` converts correctly.
+- **hls4ml >= 1.3.0 is required for the export**, declared as the extra `keras-hexagdly[hls]` and checked by
+  `register_hex_gather_layers`. Checked: hls4ml 1.0 and 1.1 have no Keras 3 converter; 1.2 does not register the
+  Keras handlers of the hex layers by itself (1.3 does, through a metaclass), and with them registered by hand the
+  C simulations of the line-buffer kernels came out all zeros. Only 1.3.0 is tested; there is no upper bound.
 - **A notebook** (`notebooks/keras_hexagdly_qat_hgq2_to_hls4ml.ipynb`) taking a hexagonal CNN from
   data to a Vitis HLS synthesis: float reference, QAT with EBOPs, `freeze`, hls4ml, C simulation, and a
   resource comparison with a uniform-precision export.
+- `notebooks/keras_hexagdly_hls4ml_export.ipynb` re-run end to end on this version (fused kernels at II=1,
+  C simulation, and the RTL co-simulation, which passes).
 - **EBOPs for the hexagonal convolutions** (`QConv2d`, `QConv3d`, `QConv2d_CustomKernel`,
   `QConv3d_CustomKernel` with an `iq_conf`): the same cost measure and the same training term
   (`beta * EBOPs`) as HGQ2's layers, with `enable_ebops`, `beta0` (default `1e-5`) and
@@ -38,8 +74,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and `types` gives, per layer, the `ap_fixed` type of the `weight`, `bias`, `input`, `result` (the
   input / output quantizer, with its rounding and overflow modes) and `accum`. `"keep"` leaves the
   activation quantizers in the frozen model as standalone HGQ2 layers (to check the quantization in
-  Keras); `"types"` drops them, their precision being in `types`, for hls4ml `io_stream` (per-layer
-  activation quantizers only: hls4ml handles per-element ones in `io_parallel` only). Per-layer methods:
+  Keras, and for hls4ml's bit-exact flow, see below); `"types"` drops them, their precision being in
+  `types`, to be set by hand in the hls4ml config (per-layer activation quantizers only for `io_stream`:
+  hls4ml handles per-element ones in `io_parallel` only). Per-layer methods:
   `weight_type()`, `bias_type()`, `input_type()`, `result_type()`, `accum_type()`.
 - **`ExactAccumulator` and `AccumPrecision`**, two hls4ml config keys for the accumulator of an exported
   hex convolution, both off by default (existing exports do not change). The default accumulator keeps
@@ -93,9 +130,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   types are refused instead of letting the last one win.
 - Clearer errors: `freeze` of something that is not a model, a quantizer config of the wrong type or a
   negative `beta0` (refused when the layer is built, not at the first `fit`), half precision on the
-  TensorFlow backend (HGQ2 cannot do it), and `patch_model_for_hls` on a model frozen with the default
-  `activation_quantizers="keep"` (the standalone quantizers cannot be converted by hls4ml: freeze with
-  `"types"`).
+  TensorFlow backend (HGQ2 cannot do it), and `patch_model_for_hls` on a model whose input is not quantized while it holds HGQ2 layers or quantizers
+  (hls4ml's bit-exact flow needs a quantized input), or with an hls4ml that lacks that flow.
 - `patch_model_for_hls` gives a clear error for a model whose output comes from a layer called more
   than once (a bare `KeyError` before).
 - The sdist lists its files explicitly (`pyproject.toml`): a local `python -m build` used to pick up every
