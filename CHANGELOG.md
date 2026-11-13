@@ -132,6 +132,8 @@ shows (II, clock, area) has no test in the suite; the numbers quoted are from Vi
   cell drawn above the centre held the weight applied to the cell below); it now shows each weight on the
   neighbour it applies to. `kernel_to_hextensor` works on a `Conv2d_CustomKernel`. `plot_hextensor` set
   the axis limits from the wrong dimensions (a grid much wider than tall was cut).
+- The extras `keras-hexagdly[qat]` and `keras-hexagdly[hls]` require `quantizers<2`: with quantizers 2.0.0
+  neither hgq2 0.1.x nor hls4ml 1.3.0 can be imported (`cannot import name 'get_fixed_quantizer_np'`).
 - README: the `Conv3d` example of the same-padding section passed `in_channels` (a `TypeError`).
 - `load_torch_state_dict`: a `Dense` that reads a flattened tensor was loaded with a plain transpose,
   although PyTorch flattens `(C, ...)` and Keras `(..., C)`: no error, a wrong model. The input features
