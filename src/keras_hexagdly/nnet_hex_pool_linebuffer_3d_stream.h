@@ -21,10 +21,9 @@
 //
 // Corresponds to the HexPoolLineBuffer3D Keras layer (hex_gather.py).
 //
-// KNOWN LIMITATION (RTL correctness, io_stream + Strategy='Latency'+RF=1 +
-// a downstream repack_stream layer such as Flatten): see the detailed note
-// in nnet_hex_conv_linebuffer_stream.h. Workaround: Strategy='Resource' with
-// ReuseFactor>=2.
+// RTL correctness with Strategy='Latency' + ReuseFactor=1 on the hex convolutions
+// and a downstream repack_stream layer such as Flatten: see the historical note in
+// nnet_hex_conv_linebuffer_stream.h (not reproduced with the current kernels).
 
 namespace nnet {
 
@@ -119,7 +118,7 @@ ReadFrames:
     for (int r = 0; r < R_TOTAL; r++) {
     ReadFramePixels:
         for (unsigned p = 0; p < N; p++) {
-            #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+            #pragma HLS PIPELINE II=1
             if (r < D_in) {
                 data_T tok = input.read();
                 const unsigned fslot = ((unsigned)r) % DKBUF;

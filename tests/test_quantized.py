@@ -21,10 +21,6 @@ from keras_hexagdly.quantized import _parse_type  # noqa: E402
 H, W, C = 9, 8, 3
 np_ = keras.ops.convert_to_numpy  # any backend, GPU tensors included
 X = np.random.default_rng(0).standard_normal((4, H, W, C)).astype("float32")
-needs_hls = pytest.mark.skipif(
-    keras.backend.backend() == "jax",
-    reason="the hls4ml export targets the tensorflow / torch backends",
-)
 
 
 def fixed(bits=8, ints=2):
@@ -214,7 +210,6 @@ def test_freeze_computes_the_same_function(share, kernel_size):
     assert list(types) == ["hex0"] and re.fullmatch(r"ap_fixed<\d+,\d+>", types["hex0"]["weight"])
 
 
-@needs_hls
 def test_the_frozen_model_goes_through_patch_model_for_hls():
     pytest.importorskip("hls4ml")
     from keras_hexagdly.hls4ml_ext import patch_model_for_hls
@@ -1266,7 +1261,6 @@ print('ok')
 # ---- the hls4ml config from freeze's types ----
 
 
-@needs_hls
 def test_apply_quantized_types_fills_the_config_of_a_chain_of_layers():
     pytest.importorskip("hls4ml")
     import hls4ml
@@ -1315,7 +1309,6 @@ def test_apply_quantized_types_fills_the_config_of_a_chain_of_layers():
     )
 
 
-@needs_hls
 def test_apply_quantized_types_rejects_types_of_another_model():
     pytest.importorskip("hls4ml")
     from keras_hexagdly.hls4ml_ext import apply_quantized_types, patch_model_for_hls
@@ -1596,7 +1589,6 @@ def test_freeze_keeps_the_sparse_flag_of_the_inputs():
     assert frozen.inputs[0].sparse
 
 
-@needs_hls
 def test_apply_quantized_types_says_when_a_producer_keeps_its_own_result_type():
     pytest.importorskip("hls4ml")
     import hls4ml
@@ -1620,7 +1612,6 @@ def test_apply_quantized_types_says_when_a_producer_keeps_its_own_result_type():
     assert config["LayerName"]["c1_linebuffer"]["Precision"]["result"] == types["c1"]["result"]
 
 
-@needs_hls
 def test_apply_quantized_types_refuses_consumers_that_want_different_input_types():
     pytest.importorskip("hls4ml")
     import hls4ml
@@ -1671,8 +1662,8 @@ def test_half_precision_on_tensorflow_is_explained():
         keras.config.set_dtype_policy("float32")
 
 
-@needs_hls
 def test_patch_explains_the_standalone_quantizers_when_hls4ml_lacks_the_bit_exact_flow(monkeypatch):
+    pytest.importorskip("hls4ml")  # the first patch below needs the real bit-exact flow
     from keras_hexagdly import hls4ml_ext
     from keras_hexagdly.hls4ml_ext import patch_model_for_hls
 

@@ -13,8 +13,9 @@ from matplotlib.collections import PatchCollection
 from matplotlib.patches import RegularPolygon
 
 
-def plot_hextensor(tensor, image_range=(0, None), channel_range=(0, None),
-                    cmap="Greys", figname="figure"):
+def plot_hextensor(
+    tensor, image_range=(0, None), channel_range=(0, None), cmap="Greys", figname="figure"
+):
     """Plot a channels-last (N, H, W, C) tensor in its hexagonal layout.
 
     Pass either one image with several channels, or one channel across
@@ -24,7 +25,7 @@ def plot_hextensor(tensor, image_range=(0, None), channel_range=(0, None),
     so a GPU-resident torch/jax tensor doesn't crash a bare np.asarray.
     """
     tensor = keras.ops.convert_to_numpy(tensor)
-    sub = tensor[image_range[0]:image_range[1], :, :, channel_range[0]:channel_range[1]]
+    sub = tensor[image_range[0] : image_range[1], :, :, channel_range[0] : channel_range[1]]
     n_images, H, W, n_channels = sub.shape
     if n_images != 1 and n_channels != 1:
         raise ValueError("Select one image and N channels, or one channel and N images.")
@@ -43,16 +44,22 @@ def plot_hextensor(tensor, image_range=(0, None), channel_range=(0, None),
             for y in range(H):
                 if np.isnan(img[y, x]):
                     continue
-                hexagons.append(RegularPolygon(
-                    (x * np.sqrt(3) / 2, -(y + np.mod(x, 2) * 0.5)),
-                    6, radius=0.577349, orientation=np.pi / 6))
+                hexagons.append(
+                    RegularPolygon(
+                        (x * np.sqrt(3) / 2, -(y + np.mod(x, 2) * 0.5)),
+                        6,
+                        radius=0.577349,
+                        orientation=np.pi / 6,
+                    )
+                )
                 intensities.append(img[y, x])
         ax = fig.add_subplot(gs[i])
-        ax.set_xlim([-1, H])
-        ax.set_ylim([-1.15 * W - 1, 1])
+        # x runs over the W columns (sqrt(3)/2 apart), y over the H rows (odd columns half a
+        # row lower). The two used to be swapped: a grid much wider than tall was cut.
+        ax.set_xlim([-1, (W - 1) * np.sqrt(3) / 2 + 1])
+        ax.set_ylim([-(H - 1) - 0.5 - 1, 1])
         ax.set_axis_off()
-        p = PatchCollection(np.array(hexagons), cmap=cmap, alpha=0.9,
-                             edgecolors="k", linewidth=1)
+        p = PatchCollection(np.array(hexagons), cmap=cmap, alpha=0.9, edgecolors="k", linewidth=1)
         p.set_array(np.array(intensities))
         ax.add_collection(p)
         ax.set_aspect("equal")
@@ -116,7 +123,11 @@ def _shared_kernel_hextensor(layer, in_channel):
     exactly the bug kernel_to_hextensor's mode dispatch exists to avoid.
     """
     n = layer.hexbase_size
-    ring_weights = keras.ops.convert_to_numpy(layer.ring_weights)  # (rings, in, out)
+    # a quantized layer (QConv2d) shows the weights it computes with, not the latent ones
+    source = (
+        layer.quantized_weights()[0] if hasattr(layer, "quantized_weights") else layer.ring_weights
+    )
+    ring_weights = keras.ops.convert_to_numpy(source)  # (rings, in, out)
     out_channels = ring_weights.shape[-1]
 
     g = 4 * n + 3
@@ -143,8 +154,16 @@ def _probe_layer(layer):
     complete kernel shape regardless of the original layer's stride.
     """
     mode = getattr(layer, "share_neighbors", False)
-    probe = type(layer)(
-        filters=layer.filters,
+    # A quantized layer (QConv2d) is probed through its plain class, carrying its
+    # QUANTIZED weights: a fresh QConv2d would re-quantize them with its default
+    # 8-bit kernel quantizer and show clipped values.
+    plain = getattr(layer, "_plain_class", None) or type(layer)
+    custom = "CustomKernel" in plain.__name__  # its kernels go into a plain Conv2d
+    if custom:
+        from keras_hexagdly import Conv2d as plain
+    quantized = layer.quantized_weights() if hasattr(layer, "quantized_weights") else None
+    probe = plain(
+        filters=layer.out_channels if custom else layer.filters,
         kernel_size=layer.hexbase_size,
         strides=1,
         use_bias=False,
@@ -153,43 +172,65 @@ def _probe_layer(layer):
     g = 6 * layer.hexbase_size + 11
     probe(keras.ops.zeros((1, g, g, layer.in_channels)))  # trigger build()
     if mode:
-        probe.ring_weights.assign(keras.ops.convert_to_numpy(layer.ring_weights))
+        src = quantized[0] if quantized is not None else layer.ring_weights
+        probe.ring_weights.assign(keras.ops.convert_to_numpy(src))
     else:
         for i in range(layer.hexbase_size + 1):
-            src = keras.ops.convert_to_numpy(getattr(layer, "kernel" + str(i)))
-            probe._base_kernels[i].assign(src)
+            if quantized is not None:
+                src = quantized[i]
+            else:
+                src = getattr(layer, f"kernel{i}") if custom else layer._base_kernels[i]
+            probe._base_kernels[i].assign(keras.ops.convert_to_numpy(src))
     return probe
 
 
 def _impulse_response_hextensor(layer, in_channel):
-    """General kernels: visualise the filter via its impulse response.
+    """General kernels: the weight the layer applies to each neighbour of a cell.
 
-    A single 1.0 (in input channel ``in_channel``) is fed through a strides=1
-    probe copy of the layer (see `_probe_layer` for why: probing the real
-    layer directly truncates the picture whenever stride>1) and the output is
-    the filter's response to a point source -- the standard way to picture a
-    conv kernel, and it works for any layer (ring-shared or not). The impulse
-    is placed on an odd column, where the hexagonal response footprint
-    coincides exactly with a put_shape hexagon, so it crops to a clean hex
-    tile. Cells outside the footprint are left NaN so plot_hextensor skips
-    them rather than drawing them as zeros.
+    A strides=1 probe copy of the layer (see `_probe_layer` for why: probing the
+    real layer directly truncates the picture whenever stride>1) is run on one
+    image per neighbouring cell, each holding a single 1.0 (in input channel
+    ``in_channel``) at that cell, and the output is read at the centre cell:
+    that value is the weight the centre applies to the cell holding the 1.0. It
+    works for any layer (ring-shared or not). Cells outside the kernel are left
+    NaN so plot_hextensor skips them rather than drawing them as zeros.
+
+    This used to feed ONE impulse at the centre and show the output around it.
+    That picture is the kernel turned by 180 degrees (the cell above the centre
+    showed the weight applied to the cell below): invisible on a ring-shared
+    kernel, wrong for an unshared or "sym" one.
     """
     n = layer.hexbase_size
     in_channels = layer.in_channels
-    probe = _probe_layer(layer) if layer.hexbase_stride != 1 else layer
+    # Always the probe copy, also at strides=1: it has no bias and no activation.
+    # Probing the real layer showed relu(w + b) - b instead of w for a layer with
+    # a fused activation (every negative weight clipped).
+    probe = _probe_layer(layer)
     g = 6 * n + 11
     cen = g // 2
-    cen = cen if cen % 2 == 1 else cen + 1  # impulse on an odd column
-    impulse = np.zeros((1, g, g, in_channels), dtype=np.float32)
-    impulse[0, cen, cen, in_channel] = 1.0
+    cen -= cen % 2  # an even centre column, as _shared_kernel_hextensor
+    cells = [
+        (r, c) for r in range(cen - n - 1, cen + n + 2) for c in range(cen - n - 1, cen + n + 2)
+    ]
+    impulses = np.zeros((len(cells), g, g, in_channels), dtype=np.float32)
+    for k, (r, c) in enumerate(cells):
+        impulses[k, r, c, in_channel] = 1.0
 
-    response = keras.ops.convert_to_numpy(probe(keras.ops.convert_to_tensor(impulse)))[0]
-    if probe.use_bias:
-        response = response - keras.ops.convert_to_numpy(layer.bias_tensor)
+    def at_centre():
+        out = keras.ops.convert_to_numpy(probe(keras.ops.convert_to_tensor(impulses)))
+        return out[:, cen, cen, :]  # (cells, out_channels)
 
-    grid = np.where(
-        np.any(np.abs(response) > 1e-6, axis=-1, keepdims=True), response, np.nan
-    ).astype(np.float32)
+    response = at_centre()
+    # The footprint is the kernel's geometry, not "where the response is non-zero": a weight
+    # that is exactly 0 (pruned by QAT) is a cell of the kernel and is drawn as 0. Taking the
+    # non-zero cells dropped it, and a fully pruned kernel had no footprint at all (ValueError).
+    for variable in probe.weights:
+        variable.assign(np.ones(variable.shape, dtype=np.float32))
+    footprint = at_centre()
+    grid = np.full((g, g, response.shape[-1]), np.nan, dtype=np.float32)
+    for k, (r, c) in enumerate(cells):
+        if np.any(footprint[k] > 0.5):
+            grid[r, c, :] = response[k]
     return _crop_to_footprint(grid)
 
 

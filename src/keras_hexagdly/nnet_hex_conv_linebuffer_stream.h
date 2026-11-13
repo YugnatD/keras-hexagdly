@@ -29,13 +29,17 @@
 // How that loop is scheduled depends on CONFIG_T::strategy, exactly as in
 // hls4ml's native kernel:
 //   latency  -- the loop is pipelined at II=reuse_factor and the whole MAC is
-//               unrolled inside it (max throughput, max area).
+//               unrolled inside it: one pixel every reuse_factor cycles. With
+//               reuse_factor > 1 the products and the additions are shared
+//               back onto n_in*n_out/reuse_factor operators by ALLOCATION caps
+//               (see hex_lb_fused_loop), but the multiplexing this needs is
+//               paid in LUTs. Measured against 'resource' at reuse_factor 4,
+//               for a third of the latency: 1.75x the LUT on a 12x12, 4->4
+//               layer (64 products), 2.7x on an 8x8, 8->8 one (448 products).
 //   resource -- the loop is NOT pipelined, so the inlined emit body keeps its
 //               MAC's own reuse loop and only n_in*n_out/reuse_factor
-//               products exist in hardware. Pipelining here would swallow that
-//               reuse loop and re-unroll everything, which is exactly how an
-//               earlier revision of this kernel ended up asking Vitis to place
-//               ~10k multipliers in one region and stalling its scheduler.
+//               products exist in hardware: the smallest hardware, about
+//               reuse_factor + 12 cycles per pixel.
 //
 // Scheduling invariant (why one row of lag is always enough): row r "unlocks"
 // output row oh_ready(r) = floor((r - dr_max) / stride) — since stride >= 1,
@@ -43,13 +47,14 @@
 // input row. Because out_width <= in_width always, that newly-unlocked row's
 // out_width output pixels always fit within the in_width column-iterations of
 // the VERY NEXT input row — so "emit the lagging row's next column" interleaved
-// with "read this row's next column" never falls behind, except for the row
-// unlocked by the very last input row (H-1), which has no "next row" to lag
-// into and is finished in a small, statically-bounded flush after the read loop.
+// with "read this row's next column" never falls behind. The row unlocked by
+// the very last input row (H-1) has no "next row" to lag into: the loop runs
+// over extra *virtual* rows (no read) so that it is emitted by the same loop.
 //
 // Input  stream: one pixel per token (data_T::size == n_chan), H*W tokens, raster
 //                order (row-major over the (H, W) grid).
-// Output stream: one pixel per token (res_T::size == n_filt), H*W tokens, raster.
+// Output stream: one pixel per token (res_T::size == n_filt), out_height*out_width
+//                tokens, raster (H*W at stride 1).
 //
 // Border / zero-padding: each output pixel (oh, ow) reads its K neighbor taps at
 // the parity-dependent compile-time offsets (dr, dc); a tap whose (oh+dr, ow+dc)
@@ -62,38 +67,25 @@
 //
 // Corresponds to the HexConvLineBuffer Keras layer (hex_gather.py).
 //
-// KNOWN LIMITATION (RTL correctness, io_stream only): when this kernel is
-// followed by a shape-changing layer that hls4ml implements via
-// nnet::repack_stream (e.g. Flatten), AND the model uses Strategy='Latency'
-// with ReuseFactor=1 (fully unrolled, near-combinational per-pixel body),
-// real RTL cosimulation (cosim_design, not just csim) can produce a WRONG,
-// CONSTANT (bias-only) output for every pixel/image, even though csim is
-// correct. Root cause: Vitis infers an "auto-rewind" pipeline for this
-// kernel inside the DATAFLOW region (see warning HLS 200-656, "Deadlocks can
-// occur ... ap_ctrl_none ... auto-rewind pipeline"), and at RF=1 the kernel's
-// per-pixel latency is too short for Vitis's auto-generated dataflow control
-// logic to correctly propagate "start" between this process and the
-// downstream repack_stream process -- a real, longstanding Vitis/hls4ml
-// dataflow-synchronization edge case (the same class of bug as
-// fastmachinelearning/hls4ml#351, where the fix was to remove the offending
-// pragma; here the auto-rewind inference is internal to Vitis and has no
-// user-facing pragma or config_dataflow option to disable it -- confirmed by
-// exhausting ap_ctrl_chain on the top function, config_dataflow
-// -start_fifo_depth / -strict_stable_sync=true, forcing ap_ctrl_hs on this
-// sub-process (rejected: Vitis disallows custom INTERFACE pragmas on
-// DATAFLOW-region sub-processes), and forcing a longer II on this kernel
-// alone -- none change the outcome).
+// RTL CORRECTNESS NOTE (io_stream only, historical). With an earlier version of
+// this kernel, a model using Strategy='Latency' with ReuseFactor=1 (fully
+// unrolled, near-combinational per-pixel body) and a shape-changing layer that
+// hls4ml implements via nnet::repack_stream downstream (e.g. Flatten) gave, in
+// real RTL cosimulation (cosim_design, not just csim), a WRONG, CONSTANT
+// (bias-only) output for every pixel/image, even though csim was correct. The
+// diagnosis at the time: Vitis infers an "auto-rewind" pipeline for the kernel
+// inside the DATAFLOW region (warning HLS 200-656, "Deadlocks can occur ...
+// ap_ctrl_none ... auto-rewind pipeline") and its auto-generated dataflow
+// control did not propagate "start" correctly to the downstream repack_stream
+// process (the same class of bug as fastmachinelearning/hls4ml#351); no pragma
+// or config_dataflow option changed the outcome.
 //
-// WORKAROUND (verified via real cosim_design, twice, on independent models):
-// use Strategy='Resource' with ReuseFactor>=2 for any model that combines
-// io_stream, this kernel (or the gather-path stream kernels -- the same
-// symptom reproduces there too, so this is not specific to keras-hexagdly),
-// and a repack_stream-triggering layer downstream. This is not a
-// resource/latency-neutral change: Strategy='Latency'+RF=1 is a legitimate
-// and common hls4ml configuration in its own right (not a "toy" mode), so
-// this workaround is a real tradeoff (extra latency), not a free lunch, if
-// RF=1 latency was actually required. Without Flatten/repack_stream
-// downstream, or in io_parallel, this kernel is unaffected at any RF.
+// It has NOT been reproduced with the current kernel: Conv -> MaxPool -> Flatten
+// and Conv -> Flatten at Latency / ReuseFactor=1 both co-simulate with RTL equal
+// to the C simulation (Vitis HLS 2024.2), as do Resource at ReuseFactor 1 and
+// Latency at ReuseFactor 4. Either the rewrites since removed it or it needs a
+// condition those models lack, so hls4ml_ext.check_hls_config still asks for a
+// co-simulation of that configuration. Strategy='Resource' was the workaround.
 
 namespace nnet {
 
@@ -199,6 +191,324 @@ TapGather:
     output.write(tok);
 }
 
+// One iteration (r, c) of the fused traversal: read a pixel, advance the line
+// buffer and the window, emit the output pixel the window now holds (if any).
+// INLINE: it is the body of the loop in hex_lb_fused_loop below, which exists in
+// three versions that differ only by their pragmas.
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_step(
+    int r, int c,
+    hls::stream<data_T> &input,
+    ap_shift_reg<typename data_T::value_type, (int)CONFIG_T::in_width + CONFIG_T::dc_max>
+        line_sr[CONFIG_T::rows_resident + 1][CONFIG_T::n_chan],
+    typename data_T::value_type win[CONFIG_T::rows_resident + 2][CONFIG_T::col_span][CONFIG_T::n_chan],
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output
+) {
+    #pragma HLS INLINE
+    constexpr int      H     = (int)CONFIG_T::in_height;
+    constexpr int      W     = (int)CONFIG_T::in_width;
+    constexpr int      W_OUT = (int)CONFIG_T::out_width;
+    constexpr int      S     = (int)CONFIG_T::stride;
+    constexpr int      DRMAX = CONFIG_T::dr_max;
+    constexpr int      DCMAX = CONFIG_T::dc_max;
+    constexpr int      OH    = (int)CONFIG_T::out_height;
+    constexpr int      CSPAN = (int)CONFIG_T::col_span;
+    constexpr unsigned Cin   = CONFIG_T::n_chan;
+    constexpr unsigned NR    = CONFIG_T::rows_resident + 2;
+    typedef typename data_T::value_type dval;
+
+    // 1. Pull the next pixel (zero on virtual rows/columns) and push it
+    //    down the delay chain to obtain the vertical strip at this
+    //    column: strip[i] is the pixel at (r - i, c).
+    const bool real_px = (r < H) && (c < W);
+    data_T tok;
+    if (real_px) {
+        tok = input.read();
+    }
+    dval strip[NR][Cin];
+    #pragma HLS ARRAY_PARTITION variable=strip complete dim=0
+    for (unsigned ic = 0; ic < Cin; ic++) {
+        #pragma HLS UNROLL
+        strip[0][ic] = real_px ? (dval)tok[ic] : (dval)0;
+    }
+    for (unsigned i = 1; i < NR; i++) {
+        #pragma HLS UNROLL
+        for (unsigned ic = 0; ic < Cin; ic++) {
+            #pragma HLS UNROLL
+            strip[i][ic] = line_sr[i - 1][ic].shift(strip[i - 1][ic]);
+        }
+    }
+
+    // 2. Slide the window one column left and drop the new strip in at
+    //    the right edge.
+    for (unsigned i = 0; i < NR; i++) {
+        #pragma HLS UNROLL
+        for (int j = 0; j < CSPAN - 1; j++) {
+            #pragma HLS UNROLL
+            for (unsigned ic = 0; ic < Cin; ic++) {
+                #pragma HLS UNROLL
+                win[i][j][ic] = win[i][j + 1][ic];
+            }
+        }
+        for (unsigned ic = 0; ic < Cin; ic++) {
+            #pragma HLS UNROLL
+            win[i][CSPAN - 1][ic] = strip[i][ic];
+        }
+    }
+
+    // 3. Emit the output pixel whose taps the window now holds. The
+    //    read head is DCMAX columns past it, so its output column is
+    //    (c - DCMAX)/stride -- only every stride-th iteration emits.
+    //    The output row is armed by the previous input row and emitted during
+    //    that one row only (with stride > 1 an output row is unlocked every S
+    //    input rows, so the "rr is a multiple of S" test of hex_lb_emit_index is
+    //    what stops it from being emitted S times).
+    const int ce = c - DCMAX;
+    // The pixel emitted at (r, c) is a pure function of the loop indices: output row
+    // (r - 1 - DRMAX) / S, armed at the end of the previous input row, output column ce / S.
+    // No state is carried between iterations (a counter tested and incremented in the same
+    // iteration is a loop-carried recurrence that held the pipeline at II=2).
+    const int rr = r - 1 - DRMAX;
+    int oh_emit, ow_emit;
+    if (hex_lb_emit_index<CONFIG_T>(rr, ce, oh_emit, ow_emit)) {
+        hex_lb_emit_pixel<res_T, w_T, b_T, CONFIG_T, dval>(
+            win, oh_emit, ow_emit, weights, bias, output);
+    }
+}
+
+// The traversal loop, in three versions selected at compile time from
+// CONFIG_T::strategy and CONFIG_T::reuse_factor (mirroring hls4ml's
+// conv_2d_buffer_cl):
+//   HEX_LB_LATENCY        (latency, reuse_factor 1) -> the per-pixel loop is
+//               pipelined at II=1; the inlined emit body (and its MAC) is
+//               unrolled into that pipeline.
+//   HEX_LB_LATENCY_SHARED (latency, reuse_factor > 1) -> pipelined at
+//               II=reuse_factor, with the additions capped so that they are
+//               shared across the reuse_factor cycles like the products.
+//   HEX_LB_RESOURCE       (resource) -> NOT pipelined here, so the inlined MAC
+//               keeps its own ReuseLoop and only n_in*n_out/reuse_factor
+//               products exist. Pipelining here would swallow that loop and
+//               re-unroll it.
+// The column loop runs C_TOTAL = W + dc_max iterations, not W: the last dc_max
+// of every row are *virtual columns* that read nothing. An output pixel is
+// emitted dc_max columns after the read head passes it, so the rightmost output
+// columns of a row would otherwise have no iteration left to be emitted in (the
+// column analogue of the virtual rows). A fixed C_TOTAL per row is also what
+// lets the shift registers be exactly C_TOTAL long.
+// Separate functions, not one loop with `if (strategy == latency) { #pragma HLS
+// PIPELINE }`: Vitis only accepts a pragma directly in a loop or function body
+// and ignored it inside the `if` (warning HLS 207-5575), so both strategies
+// used to give the same, never explicitly pipelined, hardware.
+enum { HEX_LB_RESOURCE = 0, HEX_LB_LATENCY = 1, HEX_LB_LATENCY_SHARED = 2 };
+// The same three for the frames of a 3D layer (CONFIG_T::n_frames > 1): see
+// HEX_LB_FRAMES_LOOP below.
+enum { HEX_LB_FRAMES = 3 };
+
+// How many adders a MAC pipelined at II=reuse_factor (> 1) may use, for the
+// `ALLOCATION operation instances=add` caps of HEX_LB_LATENCY_SHARED and of
+// hex_lb_mac_stream. A shared adder serves reuse_factor additions per pixel, so
+// the cap times reuse_factor must cover every addition of one pixel, or the loop
+// misses its II (measured: II=15 for a target of 4 when the cap was MAC_BLOCK
+// alone on a ring-shared layer). Per pixel there are
+//   * num_weight_rows*n_chan*n_filt accumulations of products  -> MAC_BLOCK per cycle,
+//   * n_filt `acc += part` per cycle                           -> n_filt,
+//   * (k - num_weight_rows)*n_chan ring sums of taps (share_neighbors only),
+//     spread over the reuse_factor cycles                      -> their ceil / RF,
+// plus HEX_LB_ADD_MARGIN for the loop counters and index arithmetic.
+#ifndef HEX_LB_ADD_MARGIN
+#define HEX_LB_ADD_MARGIN 8
+#endif
+template <typename CONFIG_T> struct hex_lb_add_budget {
+    static const unsigned mac_block =
+        DIV_ROUNDUP(CONFIG_T::num_weight_rows * CONFIG_T::n_chan, CONFIG_T::reuse_factor) *
+        CONFIG_T::n_filt;
+    static const unsigned ring_adds = (CONFIG_T::k - CONFIG_T::num_weight_rows) * CONFIG_T::n_chan;
+    static const unsigned shared = mac_block + CONFIG_T::n_filt +
+                                   DIV_ROUNDUP(ring_adds, CONFIG_T::reuse_factor) + HEX_LB_ADD_MARGIN;
+};
+#define HEX_LB_FUSED_STATE                                                            \
+    constexpr int      C_TOTAL = (int)CONFIG_T::in_width + CONFIG_T::dc_max;          \
+    constexpr unsigned NR      = CONFIG_T::rows_resident + 2;                         \
+    constexpr int      R_NEED  = (int)CONFIG_T::stride * ((int)CONFIG_T::out_height - 1) + CONFIG_T::dr_max + 2; \
+    constexpr int      R_TOTAL = (R_NEED > (int)CONFIG_T::in_height) ? R_NEED : (int)CONFIG_T::in_height; \
+    typedef typename data_T::value_type dval;                                         \
+    ap_shift_reg<dval, C_TOTAL> line_sr[NR - 1][CONFIG_T::n_chan];                    \
+    dval win[NR][CONFIG_T::col_span][CONFIG_T::n_chan];
+
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_loop(
+    hls::stream<data_T> &input,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output,
+    std::integral_constant<int, HEX_LB_LATENCY>
+) {
+    #pragma HLS INLINE
+    HEX_LB_FUSED_STATE
+    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
+ReadRows:
+    for (int r = 0; r < R_TOTAL; r++) {
+    ReadCols:
+        for (int c = 0; c < C_TOTAL; c++) {
+            #pragma HLS PIPELINE II=1
+            hex_lb_fused_step<data_T, w_T, b_T, res_T, CONFIG_T>(
+                r, c, input, line_sr, win, weights, bias, output);
+        }
+    }
+}
+
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_loop(
+    hls::stream<data_T> &input,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output,
+    std::integral_constant<int, HEX_LB_LATENCY_SHARED>
+) {
+    #pragma HLS INLINE
+    HEX_LB_FUSED_STATE
+    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
+    // Pipelining at II=reuse_factor unrolls the MAC's reuse loop: every product
+    // exists as an expression and the `mul` cap of the caller shares them onto
+    // MAC_BLOCK multipliers, but nothing shares the accumulation tree. Cap the
+    // additions too, as hex_lb_mac_stream does (it measured 265134 LUT of adders
+    // on a 19x16x32 layer at RF=16 without a cap). Measured here on an 8x8, 8->8
+    // layer (448 products) at RF=4: without the cap Vitis was still scheduling
+    // after 7 minutes and 11.6 GB; with it, 39 s and 0.5 GB.
+    // The cap is hex_lb_add_budget (see it), not MAC_BLOCK: at MAC_BLOCK the loop
+    // missed its II (5 instead of 4 on a 12x12, 4->4 layer, 9 on a ring-shared
+    // one). It lives in this function and not in the caller because an
+    // ALLOCATION pragma, even with a limit that binds nothing, changed the two
+    // other variants (reuse_factor 1: +10% LUT).
+    constexpr unsigned ADD_LIMIT = hex_lb_add_budget<CONFIG_T>::shared;
+    #pragma HLS ALLOCATION operation instances=add limit=ADD_LIMIT
+ReadRows:
+    for (int r = 0; r < R_TOTAL; r++) {
+    ReadCols:
+        for (int c = 0; c < C_TOTAL; c++) {
+            #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+            hex_lb_fused_step<data_T, w_T, b_T, res_T, CONFIG_T>(
+                r, c, input, line_sr, win, weights, bias, output);
+        }
+    }
+}
+
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_loop(
+    hls::stream<data_T> &input,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output,
+    std::integral_constant<int, HEX_LB_RESOURCE>
+) {
+    #pragma HLS INLINE
+    HEX_LB_FUSED_STATE
+    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
+ReadRows:
+    for (int r = 0; r < R_TOTAL; r++) {
+    ReadCols:
+        for (int c = 0; c < C_TOTAL; c++) {
+            hex_lb_fused_step<data_T, w_T, b_T, res_T, CONFIG_T>(
+                r, c, input, line_sr, win, weights, bias, output);
+        }
+    }
+}
+// Several frames (a 3D layer, behind a hex_depth_stack_stream): the traversal is
+// repeated for every frame, as ONE flat loop with the row and column in counters
+// just wide enough for them -- the form of hex_lb_window_stream, for the reason
+// given there. A third loop nested around ReadRows / ReadCols was flattened by
+// Vitis into a control recurrence on `r`: measured, the `resource` variant at
+// reuse_factor 1 (auto-pipelined) fell to II=2 on 3 frames or more (1471 cycles
+// for 4 frames of 12x12 where one frame takes 197), and the `latency` one lost
+// clock (3.70 ns against 3.46 ns). The 2D loops above are left as they were.
+#define HEX_LB_FRAMES_COUNTERS                                                        \
+    constexpr int R_BITS = hex_lb_bits((unsigned)R_TOTAL);                            \
+    constexpr int C_BITS = hex_lb_bits((unsigned)C_TOTAL);                            \
+    ap_uint<R_BITS> r_count = 0;                                                      \
+    ap_uint<C_BITS> c_count = 0;
+#define HEX_LB_FRAMES_STEP                                                            \
+    hex_lb_fused_step<data_T, w_T, b_T, res_T, CONFIG_T>(                             \
+        (int)r_count, (int)c_count, input, line_sr, win, weights, bias, output);      \
+    if (c_count == C_TOTAL - 1) {                                                     \
+        c_count = 0;                                                                  \
+        if (r_count == R_TOTAL - 1) {                                                 \
+            r_count = 0;                                                              \
+        } else {                                                                      \
+            r_count = r_count + 1;                                                    \
+        }                                                                             \
+    } else {                                                                          \
+        c_count = c_count + 1;                                                        \
+    }
+
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_loop(
+    hls::stream<data_T> &input,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output,
+    std::integral_constant<int, HEX_LB_FRAMES + HEX_LB_LATENCY>
+) {
+    #pragma HLS INLINE
+    HEX_LB_FUSED_STATE
+    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
+    HEX_LB_FRAMES_COUNTERS
+Traverse:
+    for (int it = 0; it < (int)CONFIG_T::n_frames * R_TOTAL * C_TOTAL; it++) {
+        #pragma HLS PIPELINE II=1
+        HEX_LB_FRAMES_STEP
+    }
+}
+
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_loop(
+    hls::stream<data_T> &input,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output,
+    std::integral_constant<int, HEX_LB_FRAMES + HEX_LB_LATENCY_SHARED>
+) {
+    #pragma HLS INLINE
+    HEX_LB_FUSED_STATE
+    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
+    constexpr unsigned ADD_LIMIT = hex_lb_add_budget<CONFIG_T>::shared;  // see the 2D variant
+    #pragma HLS ALLOCATION operation instances=add limit=ADD_LIMIT
+    HEX_LB_FRAMES_COUNTERS
+Traverse:
+    for (int it = 0; it < (int)CONFIG_T::n_frames * R_TOTAL * C_TOTAL; it++) {
+        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        HEX_LB_FRAMES_STEP
+    }
+}
+
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_loop(
+    hls::stream<data_T> &input,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output,
+    std::integral_constant<int, HEX_LB_FRAMES + HEX_LB_RESOURCE>
+) {
+    #pragma HLS INLINE
+    HEX_LB_FUSED_STATE
+    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
+    HEX_LB_FRAMES_COUNTERS
+Traverse:
+    for (int it = 0; it < (int)CONFIG_T::n_frames * R_TOTAL * C_TOTAL; it++) {
+        HEX_LB_FRAMES_STEP
+    }
+}
+#undef HEX_LB_FRAMES_COUNTERS
+#undef HEX_LB_FRAMES_STEP
+#undef HEX_LB_FUSED_STATE
+
 template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
 void hex_conv_linebuffer_stream_fused(
     hls::stream<data_T> &input,
@@ -206,21 +516,14 @@ void hex_conv_linebuffer_stream_fused(
     b_T bias[CONFIG_T::n_filt],
     hls::stream<res_T> &output
 ) {
-    constexpr int      H     = (int)CONFIG_T::in_height;
-    constexpr int      W     = (int)CONFIG_T::in_width;
-    constexpr int      W_OUT = (int)CONFIG_T::out_width;
-    constexpr int      S     = (int)CONFIG_T::stride;
     constexpr int      DRMAX = CONFIG_T::dr_max;
-    constexpr int      OH    = (int)CONFIG_T::out_height;
     constexpr unsigned Cin   = CONFIG_T::n_chan;
     // +2 (not +1): a triggered output row's emission is lagged into the NEXT
     // input row's read iterations (see file header). While that row streams in,
     // the tap window still needs rows_resident+1 older rows resident, so
-    // rows_resident+1(needed) + 1(currently incoming) = rows_resident+2 distinct
-    // row indices must be simultaneously live without a circular-slot collision.
+    // rows_resident+1(needed) + 1(currently incoming) = rows_resident+2 rows
+    // must be simultaneously live.
     constexpr unsigned NR    = CONFIG_T::rows_resident + 2;  // resident input rows
-
-    typedef typename data_T::value_type dval;
 
     // One pixel per token is baked into the read/emit bookkeeping below (one
     // input.read() per (row, column) iteration, one output token per output
@@ -290,126 +593,34 @@ void hex_conv_linebuffer_stream_fused(
     // window incrementally rather than re-gathering. Storage is unchanged in
     // order: (NR-1)*n_chan shift registers of C_TOTAL entries is the same
     // O(rows) footprint the row buffer had.
-    constexpr int      CSPAN   = (int)CONFIG_T::col_span;
-    constexpr int      DCMAX   = CONFIG_T::dc_max;
-    constexpr int      C_TOTAL = W + DCMAX;  // iterations per row (see below)
-
+    // (line_sr and win are declared in hex_lb_fused_loop: (NR-1)*n_chan shift
+    // registers of in_width + dc_max entries, partitioned on the CHANNEL axis only,
+    // exactly as hls4ml's own line buffer does. `complete dim=0` also splits
+    // ap_shift_reg's internal storage, which Vitis rejects outright ("must be a
+    // one dimensional array for valid memory shift operation(s)"); the row axis
+    // stays whole and is indexed by an unrolled loop, so its indices are
+    // compile-time constants anyway.)
     static_assert(DRMAX + 1 - (DRMAX - (int)CONFIG_T::rows_resident) <= (int)NR - 1,
                   "hex_conv_linebuffer_stream: row window too small for the tap span");
 
-    // Partition the CHANNEL axis only, exactly as hls4ml's own line buffer does.
-    // `complete dim=0` also splits ap_shift_reg's internal storage, which Vitis
-    // rejects outright ("must be a one dimensional array for valid memory shift
-    // operation(s)"); the row axis stays whole and is indexed by an unrolled
-    // loop, so its indices are compile-time constants anyway.
-    ap_shift_reg<dval, C_TOTAL> line_sr[NR - 1][Cin];
-    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
+    // The row loop of hex_lb_fused_loop runs R_TOTAL >= H iterations: real input
+    // rows (r < H, one input.read() per column) plus, if needed, a handful of
+    // *virtual* trailing rows (r >= H, no read -- taps referencing them are
+    // already 0 via the in_bounds check in hex_lb_emit_pixel) so the LAST output
+    // row always has somewhere to be emitted. This keeps emission inside the
+    // SAME single loop / single call site as the reads: splitting the tail into
+    // separate flush loops each got its own resource binding in Vitis (one
+    // multiplier bank per #pragma HLS PIPELINE region, even for tiny loops
+    // auto-pipelined by the tool), tripling DSP usage for identical math.
 
-    dval win[NR][CSPAN][Cin];
-    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
-
-    // The output row currently being emitted, lagging one input row behind its
-    // trigger -- see file header. The output COLUMN is derived from the read
-    // column instead of being counted, because the window fixes the lag at
-    // exactly DCMAX columns.
-
-    // The row loop runs R_TOTAL >= H iterations: real input rows (r < H, one
-    // input.read() per column) plus, if needed, a handful of *virtual* trailing
-    // rows (r >= H, no read -- taps referencing them are already 0 via the
-    // in_bounds check in hex_lb_emit_pixel) so the LAST output row's trigger
-    // (which needs one full row of lag to be consumed, like every other row --
-    // see file header) always has somewhere to be emitted. This keeps emission
-    // inside the SAME single pipelined loop / single call site as the reads:
-    // splitting the tail into separate flush loops each got its own resource
-    // binding in Vitis (one multiplier bank per #pragma HLS PIPELINE region,
-    // even for tiny loops auto-pipelined by the tool), tripling DSP usage for
-    // identical math. One loop, one call site, one hardware instance.
-    constexpr int last_trigger_r = S * (OH - 1) + DRMAX;         // r that unlocks oh = OH-1
-    constexpr int min_r_total    = last_trigger_r + 2;           // + 1 lag row to consume it
-    constexpr int R_TOTAL        = (min_r_total > H) ? min_r_total : H;
-
-    // Strategy dispatch, mirroring hls4ml's conv_2d_buffer_cl:
-    //   latency  -> pipeline the per-pixel loop at II=reuse_factor; the inlined
-    //               emit body (and its MAC) is unrolled into that pipeline.
-    //   resource -> do NOT pipeline here, so the inlined MAC keeps its own
-    //               ReuseLoop and only n_in*n_out/reuse_factor products exist.
-    //               Pipelining here would swallow that loop and re-unroll it.
-
-ReadRows:
-    for (int r = 0; r < R_TOTAL; r++) {
-        // C_TOTAL = W + DCMAX, not W: the last DCMAX iterations of every row are
-        // *virtual columns* that read nothing. They exist because an output
-        // pixel is emitted DCMAX columns after the read head passes it, so the
-        // rightmost output columns of a row would otherwise have no iteration
-        // left to be emitted in -- the column analogue of the virtual rows
-        // above. Keeping the per-row iteration count fixed at C_TOTAL is also
-        // what lets the shift registers be exactly C_TOTAL long: pushing a zero
-        // during a virtual column keeps every row aligned to the same phase.
-    ReadCols:
-        for (int c = 0; c < C_TOTAL; c++) {
-            if (CONFIG_T::strategy == nnet::latency) {
-                #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-            }
-
-            // 1. Pull the next pixel (zero on virtual rows/columns) and push it
-            //    down the delay chain to obtain the vertical strip at this
-            //    column: strip[i] is the pixel at (r - i, c).
-            const bool real_px = (r < H) && (c < W);
-            data_T tok;
-            if (real_px) {
-                tok = input.read();
-            }
-            dval strip[NR][Cin];
-            #pragma HLS ARRAY_PARTITION variable=strip complete dim=0
-            for (unsigned ic = 0; ic < Cin; ic++) {
-                #pragma HLS UNROLL
-                strip[0][ic] = real_px ? (dval)tok[ic] : (dval)0;
-            }
-            for (unsigned i = 1; i < NR; i++) {
-                #pragma HLS UNROLL
-                for (unsigned ic = 0; ic < Cin; ic++) {
-                    #pragma HLS UNROLL
-                    strip[i][ic] = line_sr[i - 1][ic].shift(strip[i - 1][ic]);
-                }
-            }
-
-            // 2. Slide the window one column left and drop the new strip in at
-            //    the right edge.
-            for (unsigned i = 0; i < NR; i++) {
-                #pragma HLS UNROLL
-                for (int j = 0; j < CSPAN - 1; j++) {
-                    #pragma HLS UNROLL
-                    for (unsigned ic = 0; ic < Cin; ic++) {
-                        #pragma HLS UNROLL
-                        win[i][j][ic] = win[i][j + 1][ic];
-                    }
-                }
-                for (unsigned ic = 0; ic < Cin; ic++) {
-                    #pragma HLS UNROLL
-                    win[i][CSPAN - 1][ic] = strip[i][ic];
-                }
-            }
-
-            // 3. Emit the output pixel whose taps the window now holds. The
-            //    read head is DCMAX columns past it, so its output column is
-            //    (c - DCMAX)/stride -- only every stride-th iteration emits.
-            //    The output row is armed by the previous input row and emitted during
-            //    that one row only (with stride > 1 an output row is unlocked every S
-            //    input rows, so the (rr % S) == 0 test below is what stops it from
-            //    being emitted S times).
-            const int ce = c - DCMAX;
-            // The pixel emitted at (r, c) is a pure function of the loop indices: output row
-            // (r - 1 - DRMAX) / S, armed at the end of the previous input row, output column ce / S.
-            // No state is carried between iterations (a counter tested and incremented in the same
-            // iteration is a loop-carried recurrence that held the pipeline at II=2).
-            const int rr = r - 1 - DRMAX;
-            if (rr >= 0 && (rr % S) == 0 && (rr / S) < OH && ce >= 0 && (ce % S) == 0 &&
-                (ce / S) < W_OUT) {
-                hex_lb_emit_pixel<res_T, w_T, b_T, CONFIG_T, dval>(
-                    win, rr / S, ce / S, weights, bias, output);
-            }
-        }
-    }
+    // The traversal itself, in the version CONFIG_T::strategy selects.
+    hex_lb_fused_loop<data_T, w_T, b_T, res_T, CONFIG_T>(
+        input, weights, bias, output,
+        std::integral_constant<int,
+            (CONFIG_T::n_frames > 1 ? HEX_LB_FRAMES : 0) +
+            (CONFIG_T::strategy != nnet::latency ? HEX_LB_RESOURCE
+             : CONFIG_T::reuse_factor == 1       ? HEX_LB_LATENCY
+                                                 : HEX_LB_LATENCY_SHARED)>());
 }
 
 
@@ -452,21 +663,9 @@ template <typename CONFIG_T, class dval> struct hex_tap_beats {
     static constexpr unsigned SIZE   = (N_TAPS + COUNT - 1) / COUNT;
 };
 
-// Compute and write one output pixel (oh, ow) from the sliding window.
-//
-// INLINE (not INLINE OFF), and it matters in both strategies:
-//   latency  -- the body must sit inside the caller's PIPELINE for the whole
-//               per-pixel path to schedule at II=reuse_factor. Making it a
-//               separate instance instead costs a measured 38x in latency and
-//               45x in II on an 8x8/k=1 layer (94 -> 3608 cycles, II 80 ->
-//               3600): each pixel then pays the emit function's full latency
-//               serially instead of being absorbed by the pipeline.
-//   resource -- the caller is NOT pipelined there, so inlining does NOT swallow
-//               the MAC's own ReuseLoop; its `PIPELINE II=1` survives and the
-//               products stay folded over reuse_factor cycles.
-// Since there is exactly one call site (the virtual-row design below), inlining
-// also cannot duplicate the multiplier bank, which is what an
-// `allocation ... limit=1 function` cap would otherwise have been needed for.
+// The taps of one output pixel (oh, ow), picked from the sliding window: the
+// gather half of hex_lb_emit_pixel, without the MAC (which runs in its own
+// process, hex_lb_mac_stream). INLINE: it is part of the window loop's pipeline.
 template <typename CONFIG_T, class dval>
 void hex_lb_gather_taps(
     // Sliding window in registers: win[i][j] holds the pixel at
@@ -568,7 +767,7 @@ void hex_lb_mac_stream(
     hls::stream<res_T> &output
 ) {
     constexpr unsigned Cout  = CONFIG_T::n_filt;
-    constexpr unsigned N_OUT = CONFIG_T::out_height * CONFIG_T::out_width;
+    constexpr unsigned N_OUT = CONFIG_T::n_frames * CONFIG_T::out_height * CONFIG_T::out_width;
 
     #pragma HLS ARRAY_PARTITION variable=bias complete
     #pragma HLS FUNCTION_INSTANTIATE variable=weights,bias
@@ -590,9 +789,14 @@ void hex_lb_mac_stream(
     // the loop counter. With the cap at MAC_BLOCK Vitis shared adders and MacPixels fell to II=2
     // (measured: 299 cycles instead of 194 on a 12x12 layer). Removing the cap altogether made
     // Vitis allocate ~49 GB while scheduling, so it is raised, not removed: 4x was enough for
-    // 6/7-bit, 9/10-bit and 16-bit weights, with the same LUT/FF as 2x. With reuse_factor > 1 the cap
-    // is what it was.
-    constexpr unsigned ADD_LIMIT = (CONFIG_T::reuse_factor == 1) ? 4 * MAC_BLOCK : MAC_BLOCK;
+    // 6/7-bit, 9/10-bit and 16-bit weights, with the same LUT/FF as 2x (plus the ring sums of a
+    // ring-shared layer, which that measurement did not have). With reuse_factor > 1 the cap is
+    // hex_lb_add_budget: it used to be MAC_BLOCK, which left no adder for the `acc += part` of
+    // each cycle nor for the ring sums, and MacPixels missed its II (15 for a target of 4 on a
+    // ring-shared k=2 layer, 3 for 2 on a plain one).
+    constexpr unsigned ADD_LIMIT = (CONFIG_T::reuse_factor == 1)
+                                       ? 4 * MAC_BLOCK + hex_lb_add_budget<CONFIG_T>::ring_adds
+                                       : hex_lb_add_budget<CONFIG_T>::shared;
     #pragma HLS ALLOCATION operation instances=add limit=ADD_LIMIT
 
     if (CONFIG_T::reuse_factor == 1) {
@@ -715,15 +919,19 @@ void hex_lb_window_stream(
     constexpr int min_r_total    = last_trigger_r + 2;           // + 1 lag row to consume it
     constexpr int R_TOTAL        = (min_r_total > H) ? min_r_total : H;
 
-    // Strategy dispatch, mirroring hls4ml's conv_2d_buffer_cl:
-    //   latency  -> pipeline the per-pixel loop at II=reuse_factor; the inlined
-    //               emit body (and its MAC) is unrolled into that pipeline.
-    //   resource -> do NOT pipeline here, so the inlined MAC keeps its own
-    //               ReuseLoop and only n_in*n_out/reuse_factor products exist.
-    //               Pipelining here would swallow that loop and re-unroll it.
-
-ReadRows:
-    for (int r = 0; r < R_TOTAL; r++) {
+    // One flat loop over the R_TOTAL x C_TOTAL iterations, with the row and column
+    // kept in counters just wide enough for them. The nested `for (r) for (c)` form
+    // was flattened by Vitis into a control recurrence on its 32-bit-typed indices
+    // (load c, exit test, reset select, c + 1, store) that set the clock of this
+    // process: 3.46 ns at a 4 ns target, against 3.05 / 2.96 / 2.83 ns this way on
+    // three layers, same II=1 and same values. (Flat with plain `int` counters fell
+    // to II=2.)
+    constexpr int R_BITS = hex_lb_bits((unsigned)R_TOTAL);
+    constexpr int C_BITS = hex_lb_bits((unsigned)C_TOTAL);
+    ap_uint<R_BITS> r_count = 0;
+    ap_uint<C_BITS> c_count = 0;
+Traverse:
+    for (int it = 0; it < (int)CONFIG_T::n_frames * R_TOTAL * C_TOTAL; it++) {
         // C_TOTAL = W + DCMAX, not W: the last DCMAX iterations of every row are
         // *virtual columns* that read nothing. They exist because an output
         // pixel is emitted DCMAX columns after the read head passes it, so the
@@ -732,11 +940,12 @@ ReadRows:
         // above. Keeping the per-row iteration count fixed at C_TOTAL is also
         // what lets the shift registers be exactly C_TOTAL long: pushing a zero
         // during a virtual column keeps every row aligned to the same phase.
-    ReadCols:
-        for (int c = 0; c < C_TOTAL; c++) {
-            if (CONFIG_T::strategy == nnet::latency) {
-                #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-            }
+        // Always II=1: this loop carries no multiplier, so neither the strategy
+        // nor the reuse factor (which belong to the MAC process) apply to it.
+        #pragma HLS PIPELINE II=1
+        {
+            const int r = (int)r_count;
+            const int c = (int)c_count;
 
             // 1. Pull the next pixel (zero on virtual rows/columns) and push it
             //    down the delay chain to obtain the vertical strip at this
@@ -782,19 +991,18 @@ ReadRows:
             //    (c - DCMAX)/stride -- only every stride-th iteration emits.
             //    The output row is armed by the previous input row and emitted during
             //    that one row only (with stride > 1 an output row is unlocked every S
-            //    input rows, so the (rr % S) == 0 test below is what stops it from
-            //    being emitted S times).
+            //    input rows, so the "rr is a multiple of S" test of hex_lb_emit_index
+            //    is what stops it from being emitted S times).
             const int ce = c - DCMAX;
             // Pure function of the loop indices, as in the fused kernel: output row
             // (r - 1 - DRMAX) / S, output column ce / S, no state carried between iterations
             // (the counters this replaces held the loop at II=2).
             const int rr = r - 1 - DRMAX;
-            if (rr >= 0 && (rr % S) == 0 && (rr / S) < OH && ce >= 0 && (ce % S) == 0 &&
-                (ce / S) < W_OUT) {
+            int oh_emit, ow_emit;
+            if (hex_lb_emit_index<CONFIG_T>(rr, ce, oh_emit, ow_emit)) {
                 dval taps_out[CONFIG_T::k * Cin];
                 #pragma HLS ARRAY_PARTITION variable=taps_out complete
-                hex_lb_gather_taps<CONFIG_T, dval>(
-                    win, rr / S, ce / S, taps_out);
+                hex_lb_gather_taps<CONFIG_T, dval>(win, oh_emit, ow_emit, taps_out);
                 typedef hex_tap_beats<CONFIG_T, dval> TB;
                 for (unsigned b = 0; b < TB::COUNT; b++) {
                     #pragma HLS UNROLL
@@ -807,6 +1015,19 @@ ReadRows:
                     taps.write(beat);
                 }
             }
+        }
+        if (c_count == C_TOTAL - 1) {
+            c_count = 0;
+            // The row counter wraps at the end of a frame only when there are several
+            // (a 3D layer): with one frame the test is a constant and the 2D hardware
+            // is unchanged.
+            if (CONFIG_T::n_frames > 1 && r_count == R_TOTAL - 1) {
+                r_count = 0;
+            } else {
+                r_count = r_count + 1;
+            }
+        } else {
+            c_count = c_count + 1;
         }
     }
 }
@@ -851,6 +1072,14 @@ void hex_conv_linebuffer_stream_dataflow(
     hls::stream<nnet::array<dval, TB::SIZE>> taps;
     constexpr unsigned tap_depth = (CONFIG_T::out_width + 2) * TB::COUNT;
     #pragma HLS STREAM variable=taps depth=tap_depth
+    // A shallow, very wide FIFO (out_width + 2 packs of k*n_chan values): left to
+    // Vitis it goes to block RAM, one per 18 or 36 bits of width whatever the depth
+    // (95 BRAM_18K for the two FIFOs of a 19x14 model, 16x560 and 9x1120 bits).
+    // Shift registers hold it in about one LUT per bit of width. Vitis HLS syntax:
+    // Vivado HLS keeps its default.
+#ifdef __VITIS_HLS__
+    #pragma HLS BIND_STORAGE variable=taps type=fifo impl=srl
+#endif
 
     hex_lb_window_stream<data_T, CONFIG_T>(input, taps);
     hex_lb_mac_stream<w_T, b_T, res_T, CONFIG_T, dval>(taps, weights, bias, output);

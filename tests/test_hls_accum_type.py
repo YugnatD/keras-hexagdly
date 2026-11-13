@@ -54,8 +54,23 @@ def test_a_larger_input_gives_a_wider_accumulator():
 def test_integer_and_unsigned_input_types():
     integer_input = node(FixedPrecisionType(16, 3), IntegerPrecisionType(8, signed=False))
     assert _accum_type_str(integer_input, 7) == "ap_fixed<27, 14>"
+    # unsigned weights on signed data: the sums can be negative, the accumulator is signed
     unsigned_weights = node(FixedPrecisionType(16, 3, signed=False), FixedPrecisionType(8, 4))
-    assert _accum_type_str(unsigned_weights, 8) == "ap_ufixed<23, 10>"
+    assert _accum_type_str(unsigned_weights, 8) == "ap_fixed<23, 10>"
+
+
+def test_the_accumulator_is_unsigned_only_when_every_operand_is():
+    weights = FixedPrecisionType(16, 3, signed=False)
+    data = FixedPrecisionType(8, 4, signed=False)
+    all_unsigned = node(weights, data, FixedPrecisionType(16, 3, signed=False))
+    assert _accum_type_str(all_unsigned, 8) == "ap_ufixed<23, 10>"
+    no_bias = node(weights, data, FixedPrecisionType(16, 3), bias=0.0)  # a zero bias has no sign
+    assert _accum_type_str(no_bias, 8) == "ap_ufixed<23, 10>"
+    # a signed bias: signed, with a sign bit on top of the unsigned range of the products
+    signed_bias = node(weights, data, FixedPrecisionType(16, 3))
+    assert _accum_type_str(signed_bias, 8) == "ap_fixed<24, 11>"
+    # an input type that cannot be read is taken as signed
+    assert _accum_type_str(node(weights), 8) == "ap_fixed<20, 7>"
 
 
 def test_unreadable_input_type_falls_back_to_the_weight_growth():
@@ -178,3 +193,36 @@ def test_an_old_hls4ml_is_refused_with_a_message(monkeypatch):
     hls4ml_handler._require_hls4ml_version()
     monkeypatch.setattr(hls4ml, "__version__", "2.0.1.dev3")
     hls4ml_handler._require_hls4ml_version()
+
+
+def test_an_unsigned_bias_gets_a_sign_bit_in_a_signed_accumulator():
+    """A bias of 12 typed ap_ufixed<8,4> in an ap_fixed<12,4> accumulator came out as -4."""
+    weights, data = FixedPrecisionType(8, 1), FixedPrecisionType(8, 0, signed=False)
+    unsigned_bias = node(weights, data, FixedPrecisionType(8, 4, signed=False))
+    assert _accum_type_str(unsigned_bias, 1) == "ap_fixed<13, 5>"
+    signed_bias = node(weights, data, FixedPrecisionType(8, 4))
+    assert _accum_type_str(signed_bias, 1) == "ap_fixed<12, 4>"
+
+
+def test_the_hex_options_fall_back_from_the_layer_to_the_model_section():
+    """With granularity="name" every layer has a LayerName entry: Model-level keys were ignored."""
+    from keras_hexagdly.hls4ml_handler import _layer_option
+
+    def configured(layer, model, layer_type=None):
+        sections = {"HLSConfig": {"Model": model, "LayerType": {"HHexConvLineBuffer": layer_type}}}
+        config = SimpleNamespace(
+            get_layer_config_value=lambda _node, key, default=None: layer.get(key, default),
+            get_config_value=lambda key, default=None: sections.get(key, default),
+        )
+        return SimpleNamespace(
+            model=SimpleNamespace(config=config), class_name="HHexConvLineBuffer"
+        )
+
+    assert (
+        _layer_option(configured({"Trace": False}, {"Dataflow": True}), "Dataflow", False) is True
+    )
+    by_type = configured({"Trace": False}, {}, {"Dataflow": True})
+    assert _layer_option(by_type, "Dataflow", False) is True
+    own = configured({"Dataflow": False}, {"Dataflow": True})
+    assert _layer_option(own, "Dataflow", False) is False  # the layer's own entry wins
+    assert _layer_option(configured({}, {}), "AccumPrecision") is None

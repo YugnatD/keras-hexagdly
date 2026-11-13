@@ -59,7 +59,7 @@ DepthOut:
     for (unsigned t = 0; t < CONFIG_T::n_depth_out; t++) {
     SpatialPixel:
         for (unsigned n = 0; n < N; n++) {
-            #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+            #pragma HLS PIPELINE II=1
             data_T taps[DK * CONFIG_T::k * C];
             #pragma HLS ARRAY_PARTITION variable=taps complete
             for (unsigned dd = 0; dd < DK; dd++) {

@@ -300,13 +300,7 @@ def test_avgpool_trains_and_roundtrips(x, tmp_path):
 
 # ---- hls4ml export --------------------------------------------------------------
 
-jax_skip = pytest.mark.skipif(
-    keras.backend.backend() == "jax",
-    reason="the linebuffer export layers are unsupported on the jax backend",
-)
 
-
-@jax_skip
 @pytest.mark.parametrize("strategy", ["linebuffer", "folded"])
 @pytest.mark.parametrize("strides", [1, 2])
 def test_hls_export_keeps_the_conv_activation(strategy, strides):
@@ -327,7 +321,6 @@ def test_hls_export_keeps_the_conv_activation(strategy, strides):
     np.testing.assert_allclose(patched.predict(xs, verbose=0), y_ref, atol=2e-4)
 
 
-@jax_skip
 def test_hls_export_adds_nothing_without_activation():
     inp = keras.Input((13, 11, 2))
     model = keras.Model(inp, hgly.Conv2d(3, kernel_size=1)(inp))

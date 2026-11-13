@@ -14,8 +14,19 @@ io_stream that materialised both the frame and the N_out*K*Cin gathered tensor
 in registers (34378 FF against 3077 for a comparable native conv), and it was
 removed on 2026-07-28.
 
-  HexConvLineBuffer / HexConvLineBuffer3D  -- Conv2d / Conv3d
-  HexPoolLineBuffer / HexPoolLineBuffer3D  -- MaxPool2d / MaxPool3d
+  HexConvLineBuffer                    -- Conv2d
+  HexPoolLineBuffer                    -- MaxPool2d
+  HexDepthStack + HexConvLineBuffer    -- Conv3d
+  HexDepthPool  + HexPoolLineBuffer    -- MaxPool3d
+
+A 3D layer is a depth stage followed by the 2D layer applied to every frame: the
+depth stage stacks the ``depth_size`` frames of each output frame as channels (or
+takes their max), and the hexagonal part is then exactly the 2D one. The 2D layers
+therefore also accept a (B, D, H, W, C) input, which they treat frame by frame.
+
+HexConvLineBuffer3D / HexPoolLineBuffer3D are the earlier single-layer 3D export
+(hex stride 1 only, never synthesised). ``patch_model_for_hls`` no longer produces
+them; they are kept so that a model saved with them still loads.
 """
 
 import keras
@@ -39,8 +50,8 @@ def _opt_out_of_automatic_xla(layer):
 class HexConvLineBuffer(keras.layers.Layer):
     """Fused hex neighbor gather + ring-MAC on the 2D grid.
 
-    Input:  (B, H, W, Cin)
-    Output: (B, H, W, Cout)   — stride-1 hex conv, output grid == input grid.
+    Input:  (B, H, W, Cin), or (B, D, H, W, Cin) for the frames of a 3D layer
+    Output: (B, H_out, W_out, Cout), with the same D in front for a 3D layer (any hex stride)
 
     Carries the gather table and the MAC weights together:
       neighbor_idx (N_out, K), -1 = border → zero (N_out == H*W).
@@ -118,15 +129,22 @@ class HexConvLineBuffer(keras.layers.Layer):
         super().build(input_shape)
 
     def call(self, x):
-        # x: (B, H, W, Cin)
+        # x: (B, H, W, Cin), or (B, D, H, W, Cin) for the frames of a 3D layer: each
+        # frame is convolved on its own (the frames are folded into the batch axis).
         Cin = x.shape[-1]
+        frames = x.shape[1] if len(x.shape) == 5 else None
         x_flat = keras.ops.reshape(x, (-1, self.H * self.W, Cin))  # (B, N_in, Cin)
 
         valid = keras.ops.greater_equal(self.neighbor_idx, 0)  # (N_out, K)
         safe_idx = keras.ops.maximum(self.neighbor_idx, 0)
         gathered = keras.ops.take(x_flat, safe_idx, axis=1)  # (B, N_out, K, Cin)
-        mask = keras.ops.cast(keras.ops.reshape(valid, (1, self.N_out, self.K, 1)), gathered.dtype)
-        gathered = gathered * mask
+        # A select, not a product by a 0/1 mask: an out-of-grid slot reads pixel 0
+        # as a placeholder, and inf * 0 is NaN (it reached every border output).
+        gathered = keras.ops.where(
+            keras.ops.reshape(valid, (1, self.N_out, self.K, 1)),
+            gathered,
+            keras.ops.zeros_like(gathered),
+        )
 
         if self.share_neighbors:
             W = keras.ops.take(self.mac_weights, self.ring_idx, axis=0)  # (K, Cin, Cout)
@@ -135,9 +153,13 @@ class HexConvLineBuffer(keras.layers.Layer):
 
         y = keras.ops.einsum("bnkc,kco->bno", gathered, W)  # (B, N_out, Cout)
         y = y + keras.ops.reshape(self.mac_bias, (1, 1, -1))
+        if frames is not None:
+            return keras.ops.reshape(y, (-1, frames, self.H_out, self.W_out, self.Cout))
         return keras.ops.reshape(y, (-1, self.H_out, self.W_out, self.Cout))
 
     def compute_output_shape(self, input_shape):
+        if len(input_shape) == 5:
+            return (input_shape[0], input_shape[1], self.H_out, self.W_out, self.Cout)
         return (input_shape[0], self.H_out, self.W_out, self.Cout)
 
     def get_config(self):
@@ -276,8 +298,11 @@ class HexConvLineBuffer3D(keras.layers.Layer):
         valid = keras.ops.greater_equal(self.neighbor_idx, 0)
         safe_idx = keras.ops.maximum(self.neighbor_idx, 0)
         G = keras.ops.take(x_flat, safe_idx, axis=2)  # (B, D_padded, N_out, K, Cin)
-        mask = keras.ops.cast(keras.ops.reshape(valid, (1, 1, self.N_out, self.K, 1)), G.dtype)
-        G = G * mask
+        # A select, not a product by a 0/1 mask: an out-of-grid slot reads pixel 0
+        # as a placeholder, and inf * 0 is NaN (it reached every border output).
+        G = keras.ops.where(
+            keras.ops.reshape(valid, (1, 1, self.N_out, self.K, 1)), G, keras.ops.zeros_like(G)
+        )
 
         if self.share_neighbors:
             # (depth_size, K, Cin, Cout) by gathering rings along axis 1
@@ -366,8 +391,9 @@ class HexPoolLineBuffer(keras.layers.Layer):
         super().build(input_shape)
 
     def call(self, x):
-        # x: (B, H, W, C)
+        # x: (B, H, W, C), or (B, D, H, W, C) for the frames of a 3D layer (pooled one by one)
         C = x.shape[-1]
+        frames = x.shape[1] if len(x.shape) == 5 else None
         x_flat = keras.ops.reshape(x, (-1, self.H * self.W, C))
         # maximum(), not where(): the border sentinel is -1, so clamping at 0
         # picks the same placeholder slot the mask below zeroes out anyway. The
@@ -379,12 +405,21 @@ class HexPoolLineBuffer(keras.layers.Layer):
         valid = keras.ops.greater_equal(self.neighbor_idx, 0)
         safe_idx = keras.ops.maximum(self.neighbor_idx, 0)
         gathered = keras.ops.take(x_flat, safe_idx, axis=1)  # (B, N_out, K, C)
-        mask = keras.ops.cast(keras.ops.reshape(valid, (1, self.N_out, self.K, 1)), gathered.dtype)
-        gathered = gathered * mask
+        # A select, not a product by a 0/1 mask: an out-of-grid slot reads pixel 0
+        # as a placeholder, and inf * 0 is NaN (it reached every border output).
+        gathered = keras.ops.where(
+            keras.ops.reshape(valid, (1, self.N_out, self.K, 1)),
+            gathered,
+            keras.ops.zeros_like(gathered),
+        )
         pooled = keras.ops.max(gathered, axis=2)  # (B, N_out, C)
+        if frames is not None:
+            return keras.ops.reshape(pooled, (-1, frames, self.H_out, self.W_out, C))
         return keras.ops.reshape(pooled, (-1, self.H_out, self.W_out, C))
 
     def compute_output_shape(self, input_shape):
+        if len(input_shape) == 5:
+            return (input_shape[0], input_shape[1], self.H_out, self.W_out, input_shape[-1])
         return (input_shape[0], self.H_out, self.W_out, input_shape[-1])
 
     def get_config(self):
@@ -456,8 +491,11 @@ class HexPoolLineBuffer3D(keras.layers.Layer):
         valid = keras.ops.greater_equal(self.neighbor_idx, 0)
         safe_idx = keras.ops.maximum(self.neighbor_idx, 0)
         G = keras.ops.take(x_flat, safe_idx, axis=2)  # (B, D_in, N_out, K, C)
-        mask = keras.ops.cast(keras.ops.reshape(valid, (1, 1, self.N_out, self.K, 1)), G.dtype)
-        G = G * mask
+        # A select, not a product by a 0/1 mask: an out-of-grid slot reads pixel 0
+        # as a placeholder, and inf * 0 is NaN (it reached every border output).
+        G = keras.ops.where(
+            keras.ops.reshape(valid, (1, 1, self.N_out, self.K, 1)), G, keras.ops.zeros_like(G)
+        )
         ds, dk = self.depth_stride, self.depth_size
         frames = []
         for t in range(self._d_out(d_in)):
@@ -485,3 +523,90 @@ class HexPoolLineBuffer3D(keras.layers.Layer):
         config = config.copy()
         config["neighbor_idx"] = np.asarray(config["neighbor_idx"], dtype=np.int32)
         return cls(**config)
+
+
+def _depth_out(d_in, depth_size, depth_stride, pad_front, pad_back):
+    return (int(d_in) + pad_front + pad_back - depth_size) // depth_stride + 1
+
+
+@keras.saving.register_keras_serializable(package="hexagdly_tf")
+class HexDepthStack(keras.layers.Layer):
+    """Depth stage of an exported Conv3d: the frames of each depth window, side by side.
+
+    Input:  (B, D_in, H, W, C)
+    Output: (B, D_out, H, W, depth_size * C)
+
+    Output frame ``t`` holds input frames ``t*depth_stride - pad_front + d`` for
+    ``d = 0 .. depth_size-1`` (zeros outside the volume), tap ``d`` in channels
+    ``d*C .. d*C + C-1``. A HexConvLineBuffer applied to it frame by frame, with the 3D
+    kernel laid out as (K, depth_size*C, Cout), is the 3D convolution. In hardware this
+    is a delay line of ``depth_size - 1`` frames (``nnet_hex_depth_stream.h``); it holds
+    no weight and does no arithmetic.
+    """
+
+    def __init__(self, depth_size, depth_stride=1, pad_front=0, pad_back=0, **kwargs):
+        super().__init__(**kwargs)
+        self.depth_size = int(depth_size)
+        self.depth_stride = int(depth_stride)
+        self.pad_front = int(pad_front)
+        self.pad_back = int(pad_back)
+
+    def _d_out(self, d_in):
+        return _depth_out(d_in, self.depth_size, self.depth_stride, self.pad_front, self.pad_back)
+
+    def call(self, x):
+        d_out = self._d_out(x.shape[1])
+        if self.pad_front or self.pad_back:
+            x = keras.ops.pad(x, [[0, 0], [self.pad_front, self.pad_back], [0, 0], [0, 0], [0, 0]])
+        span = (d_out - 1) * self.depth_stride + 1
+        taps = [x[:, d : d + span : self.depth_stride] for d in range(self.depth_size)]
+        return keras.ops.concatenate(taps, axis=-1)
+
+    def compute_output_shape(self, input_shape):
+        d_out = self._d_out(input_shape[1]) if input_shape[1] is not None else None
+        return (*input_shape[:1], d_out, *input_shape[2:4], self.depth_size * input_shape[4])
+
+    def get_config(self):
+        config = super().get_config()
+        config["depth_size"] = self.depth_size
+        config["depth_stride"] = self.depth_stride
+        config["pad_front"] = self.pad_front
+        config["pad_back"] = self.pad_back
+        return config
+
+
+@keras.saving.register_keras_serializable(package="hexagdly_tf")
+class HexDepthPool(keras.layers.Layer):
+    """Depth stage of an exported MaxPool3d: the max over each depth window, per pixel.
+
+    Input:  (B, D_in, H, W, C)
+    Output: (B, D_out, H, W, C),  D_out = (D_in - depth_size) // depth_stride + 1
+
+    The max over the depth window and the max over the hexagonal neighbourhood commute,
+    so a HexPoolLineBuffer applied to this frame by frame is the 3D pooling.
+    """
+
+    def __init__(self, depth_size, depth_stride=1, **kwargs):
+        super().__init__(**kwargs)
+        self.depth_size = int(depth_size)
+        self.depth_stride = int(depth_stride)
+
+    def _d_out(self, d_in):
+        return _depth_out(d_in, self.depth_size, self.depth_stride, 0, 0)
+
+    def call(self, x):
+        span = (self._d_out(x.shape[1]) - 1) * self.depth_stride + 1
+        out = x[:, 0 : span : self.depth_stride]
+        for d in range(1, self.depth_size):
+            out = keras.ops.maximum(out, x[:, d : d + span : self.depth_stride])
+        return out
+
+    def compute_output_shape(self, input_shape):
+        d_out = self._d_out(input_shape[1]) if input_shape[1] is not None else None
+        return (input_shape[0], d_out, *input_shape[2:])
+
+    def get_config(self):
+        config = super().get_config()
+        config["depth_size"] = self.depth_size
+        config["depth_stride"] = self.depth_stride
+        return config

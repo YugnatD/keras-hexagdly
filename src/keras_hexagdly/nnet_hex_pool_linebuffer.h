@@ -4,6 +4,54 @@
 #include "nnet_common.h"
 #include "nnet_helpers.h"
 
+// Which output pixel, if any, the traversal emits at the iteration whose read head is
+// rr = r - 1 - dr_max rows and ce = c - dc_max columns past it: (rr / S, ce / S) when both
+// are multiples of the stride and inside the output grid. Shared by the conv and pool
+// stream kernels.
+//
+// With a stride that is a power of two the division and the modulo are a shift and a mask.
+// With any other stride (3...) Vitis built real dividers in the traversal loop: measured at
+// stride 3 on a 9x9x2 window, a pipeline 39 stages deep with 4 DSP and 4972 FF; decoding
+// rr == o*S against every output row o (compile-time constants) instead gives 5 stages,
+// 0 DSP and 1020 FF, for the same values.
+#ifndef NNET_HEX_LB_EMIT_INDEX_
+#define NNET_HEX_LB_EMIT_INDEX_
+namespace nnet {
+template <typename CONFIG_T> bool hex_lb_emit_index(int rr, int ce, int &oh, int &ow) {
+    #pragma HLS INLINE
+    constexpr int S  = (int)CONFIG_T::stride;
+    constexpr int OH = (int)CONFIG_T::out_height;
+    constexpr int OW = (int)CONFIG_T::out_width;
+    if ((S & (S - 1)) == 0) {
+        oh = rr / S;
+        ow = ce / S;
+        return rr >= 0 && (rr % S) == 0 && oh < OH && ce >= 0 && (ce % S) == 0 && ow < OW;
+    }
+    bool row_hit = false, col_hit = false;
+    oh = 0;
+    ow = 0;
+    for (int o = 0; o < OH; o++) {
+        #pragma HLS UNROLL
+        if (rr == o * S) {
+            row_hit = true;
+            oh = o;
+        }
+    }
+    for (int o = 0; o < OW; o++) {
+        #pragma HLS UNROLL
+        if (ce == o * S) {
+            col_hit = true;
+            ow = o;
+        }
+    }
+    return row_hit && col_hit;
+}
+
+// Bits needed to count from 0 to n - 1 (at least 1).
+constexpr int hex_lb_bits(unsigned n) { return n <= 2 ? 1 : 1 + hex_lb_bits((n + 1) / 2); }
+} // namespace nnet
+#endif
+
 // Fused hexagonal neighbor max-pool for the "linebuffer" export strategy —
 // io_parallel variant + the shared per-pixel max body reused by the io_stream
 // line-buffer kernel (nnet_hex_pool_linebuffer_stream.h).
@@ -23,6 +71,8 @@ struct hex_pool_linebuffer_config {
     static const unsigned out_height = 8;
     static const unsigned out_width  = 8;
     static const unsigned stride     = 1;
+    // io_stream only: frames streamed back to back (see hex_conv_linebuffer_config).
+    static const unsigned n_frames   = 1;
     static const int      dr_max     = 1;
     static const unsigned n_chan     = 1;   // channels pass through
     static const unsigned k          = 7;   // neighbor slots K
@@ -73,7 +123,7 @@ void hex_pool_linebuffer(
 
 PoolPixel:
     for (unsigned n = 0; n < N_OUT; n++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
+        #pragma HLS PIPELINE II=1
         data_T taps[CONFIG_T::k * C];
         #pragma HLS ARRAY_PARTITION variable=taps complete
         for (unsigned ki = 0; ki < CONFIG_T::k; ki++) {

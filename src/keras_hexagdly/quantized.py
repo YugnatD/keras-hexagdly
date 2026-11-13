@@ -18,7 +18,7 @@ on one by one with a ``QuantizerConfig``:
 quantized layer        hexagonal layer           notes
 ====================== ========================= ============================================
 ``QConv2d``            ``Conv2d``
-``QConv3d``            ``Conv3d``                no hls4ml export in 3D yet
+``QConv3d``            ``Conv3d``
 ``QConv2d_CustomKernel`` ``Conv2d_CustomKernel`` kernels trained only with ``trainable=True``
 ``QConv3d_CustomKernel`` ``Conv3d_CustomKernel`` same
 ``QMaxPool2d``         ``MaxPool2d``             no weights: only ``iq_conf`` / ``oq_conf``

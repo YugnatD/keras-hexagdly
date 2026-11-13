@@ -109,6 +109,9 @@ def test_dataflow_and_fused_kernels_agree(
                 ["nm", "-C", str(library)], capture_output=True, text=True
             ).stdout
             assert ("hex_lb_mac_stream" in symbols) == flag
-            assert ("hex_conv_linebuffer_stream_fused" in symbols) == (not flag)
+            # the fused kernel is a thin wrapper around its loop (hex_lb_fused_loop, one version
+            # per strategy), which the compiler may inline either way
+            fused = "hex_conv_linebuffer_stream_fused" in symbols or "hex_lb_fused_" in symbols
+            assert fused == (not flag)
     np.testing.assert_array_equal(outputs["dataflow"], outputs["fused"])
     assert np.abs(outputs["fused"] - reference).max() < 0.05 * np.abs(reference).max()

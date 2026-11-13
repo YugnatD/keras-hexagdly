@@ -3,7 +3,7 @@
 Covers: Conv2d, MaxPool2d, Conv3d, MaxPool3d.
 
 No hls4ml dependency here — this module is used by:
-  - tests/test_indexed_equivalence.py   (bit-exact equivalence proof)
+  - tests/test_robustness.py            (the tables against the layers)
   - hls4ml_ext.py                        (EinsumDense / MaxPooling1D export)
 
 Core idea
@@ -71,7 +71,9 @@ def _probe_layer(kernel_size, stride, i_active, r_active, c_active):
         if ii == i_active:
             sk[0, 0, r_active, c_active] = 1.0
         sub_kernels.append(sk)
-    return Conv2d_CustomKernel(sub_kernels=sub_kernels, strides=stride, bias=None)
+    # float32 whatever the global dtype policy: the probe carries pixel indices as
+    # values (see build_neighbor_table), which float16 cannot hold beyond 2048.
+    return Conv2d_CustomKernel(sub_kernels=sub_kernels, strides=stride, bias=None, dtype="float32")
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +115,11 @@ def build_neighbor_table(layer, H, W):
     # Determine output shape with a single forward pass using the layer's actual
     # channel count (Conv2d may have Cin > 1; MaxPool2d is channel-agnostic but
     # also accepts any C, so we use 1 there).
+    if H * W >= 2**24:
+        raise ValueError(
+            f"build_neighbor_table: a {H}x{W} grid has too many pixels for the float32 probe "
+            "(pixel indices are exact up to 2**24)."
+        )
     cin = getattr(layer, "in_channels", None) or 1
     dummy = keras.ops.zeros((1, H, W, cin))
     if not layer.built:
@@ -125,25 +132,70 @@ def build_neighbor_table(layer, H, W):
     # unambiguously identifies the contributing input pixel.  Probes are always
     # Cin=1 / Cout=1 so this is always valid regardless of layer.in_channels.
     x_probe = np.arange(1, H * W + 1, dtype=np.float32).reshape(1, H, W, 1)
-    x_t = keras.ops.convert_to_tensor(x_probe)
+    # The probe runs in float32 even under a mixed_float16 policy: there the indices
+    # above 2048 were rounded, the table was silently wrong on any grid of more than
+    # 2048 pixels, and so was the model patch_model_for_hls built from it.
+    x_t = keras.ops.convert_to_tensor(x_probe, dtype="float32")
 
     neighbor_idx = np.full((N_out, K), -1, dtype=np.int64)
 
     for k_idx, (i, r, c) in enumerate(cells):
         probe = _probe_layer(kernel_size, stride, i, r, c)
         out_np = keras.ops.convert_to_numpy(probe(x_t))[0, :, :, 0]  # (H_out, W_out)
-        out_flat = out_np.reshape(N_out)
+        out_flat = np.asarray(out_np, dtype=np.float64).reshape(N_out)
         # Nonzero (≥0.5) output: the value is the contributing flat input index +1.
         # Zero: this slot is zero-padded (border), leave as -1.
-        for n_out_idx in range(N_out):
-            val = out_flat[n_out_idx]
-            if val > 0.5:
-                neighbor_idx[n_out_idx, k_idx] = int(round(val)) - 1
+        neighbor_idx[:, k_idx] = np.where(out_flat > 0.5, np.rint(out_flat) - 1, -1)
 
     return neighbor_idx, cells, (H_out, W_out)
 
 
-def build_parity_offset_tables(neighbor_idx, W_in, H_out, W_out, stride=1):
+_VIRTUAL_OFFSET_CACHE = {}
+
+
+def _virtual_parity_offset_tables(K, stride):
+    """The parity offset tables of a K-slot hex kernel, measured on a grid large enough.
+
+    The (dr, dc) offsets of the taps relative to the base input position of an output pixel only
+    depend on the kernel size, the stride and the parity of the output column -- not on the grid.
+    So when the real grid is too small to hold a fully-interior output pixel of each parity (the
+    late layers of a CNN: a 3x3 map, a single output column...), they are measured on a virtual
+    grid instead. The caller checks them against the real neighbor table.
+    """
+    key = (int(K), int(stride))
+    if key not in _VIRTUAL_OFFSET_CACHE:
+        import keras_hexagdly as hgly
+
+        n = 0
+        while 3 * n * (n + 1) + 1 < K:
+            n += 1
+        if 3 * n * (n + 1) + 1 != K:
+            raise ValueError(f"{K} neighbor slots is not a hexagonal kernel (1, 7, 19, 37, ...).")
+        side = 4 * stride + 4 * n + 8
+        proxy = hgly.MaxPool2d(kernel_size=n, strides=stride)
+        nbr, _, (h_out, w_out) = build_neighbor_table(proxy, side, side)
+        _VIRTUAL_OFFSET_CACHE[key] = build_parity_offset_tables(nbr, side, h_out, w_out, stride)[:2]
+    return _VIRTUAL_OFFSET_CACHE[key]
+
+
+def _offsets_reproduce_table(neighbor_idx, tables, W_in, H_out, W_out, stride, H_in=None):
+    """Whether offset tables + the in-grid test give back ``neighbor_idx`` exactly.
+
+    That is the model the line-buffer HLS kernels implement: tap = base + (dr, dc), zero outside
+    the grid. ``H_in`` unknown: a tap below the last row seen in the table is taken as outside.
+    """
+    neighbor_idx = np.asarray(neighbor_idx)
+    if H_in is None:
+        H_in = int(neighbor_idx.max()) // W_in + 1 if neighbor_idx.max() >= 0 else 0
+    oh, ow = np.divmod(np.arange(H_out * W_out), W_out)
+    offs = np.where((ow % 2 == 0)[:, None, None], tables[0][None], tables[1][None])  # (N, K, 2)
+    ih = stride * oh[:, None] + offs[:, :, 0]
+    iw = stride * ow[:, None] + offs[:, :, 1]
+    inside = (ih >= 0) & (ih < H_in) & (iw >= 0) & (iw < W_in)
+    return np.array_equal(np.where(inside, ih * W_in + iw, -1), neighbor_idx)
+
+
+def build_parity_offset_tables(neighbor_idx, W_in, H_out, W_out, stride=1, H_in=None):
     """Derive per-column-parity (dr, dc) tap offsets from a flat neighbor table.
 
     The line-buffer HLS kernel does not use the flat (N_out, K) index table: it
@@ -172,6 +224,8 @@ def build_parity_offset_tables(neighbor_idx, W_in, H_out, W_out, stride=1):
         W_in:         input grid width (for decoding flat input indices).
         H_out, W_out: output grid dims (H_out*W_out == N_out).
         stride:       hex stride (input base = stride * output position).
+        H_in:         input grid height; only used to check the tables measured on a virtual grid
+                      when this one is too small (see below). Optional.
 
     Returns:
         offsets_even:  int32 ndarray (K, 2) of (dr, dc) for even output columns.
@@ -182,9 +236,14 @@ def build_parity_offset_tables(neighbor_idx, W_in, H_out, W_out, stride=1):
                        conv's ``filt_height - 1``).
 
     Raises:
-        ValueError: if H_out * W_out != N_out, if the grid is too small to
-            contain a fully-interior pixel of each parity, or if the offsets are
-            not consistent across interior pixels of the same parity.
+        ValueError: if H_out * W_out != N_out, or if the offsets are not
+            consistent across interior pixels of the same parity.
+
+    A grid too small to contain a fully-interior output pixel of each parity
+    (3x3 at kernel size 1, a single output column...) used to be an error, which
+    made the late layers of a CNN impossible to export. The offsets do not depend
+    on the grid, so they are then measured on a larger virtual one
+    (``_virtual_parity_offset_tables``) and checked against ``neighbor_idx``.
     """
     neighbor_idx = np.asarray(neighbor_idx)
     N_out, K = neighbor_idx.shape
@@ -228,12 +287,31 @@ def build_parity_offset_tables(neighbor_idx, W_in, H_out, W_out, stride=1):
                     f"Inconsistent tap offsets across interior pixels of parity "
                     f"{parity} (pixel {n}). The grid geometry may be unsupported."
                 )
-        if ref is None:
-            raise ValueError(
-                f"Grid {H_out}x{W_out} too small: no fully-interior output pixel of "
-                f"column parity {parity} to derive tap offsets from. Use a larger grid."
-            )
         tables[parity] = ref
+
+    if tables[0] is None or tables[1] is None:
+        virtual = _virtual_parity_offset_tables(K, stride)
+        for parity in (0, 1):
+            if tables[parity] is not None and not np.array_equal(tables[parity], virtual[parity]):
+                raise ValueError(
+                    f"Tap offsets of parity {parity} on the {H_out}x{W_out} output grid differ "
+                    "from those of a large grid. The grid geometry may be unsupported."
+                )
+        tables = {0: virtual[0], 1: virtual[1]}
+        if not _offsets_reproduce_table(neighbor_idx, tables, W_in, H_out, W_out, stride, H_in):
+            raise ValueError(
+                f"Grid with a {H_out}x{W_out} output is too small to derive tap offsets from, and "
+                "the offsets of a large grid do not reproduce its neighbor table."
+            )
+
+    elif not _offsets_reproduce_table(neighbor_idx, tables, W_in, H_out, W_out, stride, H_in):
+        # The interior pixels agree with each other, but the line-buffer kernels apply these
+        # offsets to every pixel, border included: check that too (it used to be checked on
+        # small grids only).
+        raise ValueError(
+            "The tap offsets of the interior pixels do not reproduce the neighbor table at the "
+            "border. The grid geometry may be unsupported."
+        )
 
     all_dr = np.concatenate([tables[0][:, 0], tables[1][:, 0]])
     rows_resident = int(all_dr.max() - all_dr.min())

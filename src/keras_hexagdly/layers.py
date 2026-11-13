@@ -24,9 +24,10 @@ tensor layout are translated:
 
 Backend-agnostic: built entirely on ``keras`` + ``keras.ops``, so the layers run
 under any Keras 3 backend (tensorflow, jax, torch). The result is bit-for-bit
-equivalent to the original PyTorch HexagDLy (validated in
-tests/test_vs_pytorch_hexagdly.py against the upstream ``hexagdly`` PyPI
-package, for random inputs/strides/kernel sizes).
+equivalent to the original PyTorch HexagDLy (validated against the upstream
+``hexagdly`` PyPI package for random inputs/strides/kernel sizes; that
+comparison needs the upstream package and is kept out of this repository's
+tests).
 
 Convolution layers (Conv2d, Conv3d and their *_CustomKernel variants) are the
 primary target. MaxPool2d / MaxPool3d are also provided, implemented with a
@@ -35,7 +36,10 @@ dilation+stride either, so pooling uses an explicit shifted-slice max -- see
 _MaxPoolProcess).
 """
 
+import math
+import numbers
 import operator
+import random
 import sys
 import warnings
 
@@ -81,6 +85,27 @@ def _dilate_kernel(kernel, dilation):
 # ----------------------------------------------------------------------------
 # in_channels is always inferred in build() -- never a constructor argument.
 # ----------------------------------------------------------------------------
+
+
+def _plain_ints(value):
+    """Turn NumPy (or any ``numbers.Integral``) integers into plain ``int``.
+
+    ``kernel_size=np.int64(1)`` -- what an ``np.arange`` sweep or a value read from
+    an array gives -- used to be rejected as "not an integer". Converted here,
+    before validation, so the layer also stores (and serialises in get_config) a
+    plain int. Works through a tuple/list (the 3D ``(depth, hex)`` pairs);
+    anything else, bool included, is returned untouched for the validators to
+    reject.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, (tuple, list)):
+        return type(value)(_plain_ints(v) for v in value)
+    if isinstance(value, np.ndarray) and value.ndim == 1 and value.dtype.kind in "iu":
+        return tuple(int(v) for v in value)  # np.array([2, 1]) as a (depth, hex) pair
+    return value
 
 
 def _require_positive_int(name, value):
@@ -272,32 +297,67 @@ def _resolve_pool_size(pool_size, kernel_size):
     return 1 if kernel_size is None else kernel_size
 
 
-def _combined_fan_in_pool(total_fan_in, out_channels, debug):
-    """Draw one correctly-scaled pool of weight values, to be sliced into a
-    hex conv's several sub-kernel/ring-weight pieces.
+class _CombinedFanInHeNormal(keras.initializers.Initializer):
+    """He-normal initializer scaled by the fan-in of the WHOLE hex kernel.
 
     A hex convolution splits each output channel's receptive field across
     several separately-shaped tensors (kernel0, kernel1, ... -- or, with
     share_neighbors, one shared value per ring) whose contributions are
     SUMMED to produce the output. Calling a variance-scaling initializer
-    (He-normal) on each piece independently -- as upstream hexagdly,
+    (He-normal) on each piece with its own shape -- as upstream hexagdly,
     pytorch_hexagdly, and this port originally did -- calibrates each
     piece's variance as if it alone were the entire receptive field, so the
     summed output ends up with variance inflated by roughly the number of
     pieces (measured: ~sqrt(N) too much stddev per layer, N = number of
     sub-kernels, compounding across depth).
 
-    Since a variance-scaling initializer draws i.i.d. elements, a contiguous
-    slice of a pool sized by the TRUE combined fan-in is itself correctly
-    scaled -- so build() draws one (total_fan_in, out_channels) pool here and
-    slices+reshapes pieces off it for each sub-kernel/ring tensor, instead of
-    initializing each piece from its own (too-small) shape.
+    Every piece is therefore drawn with the standard deviation of the TRUE
+    combined fan-in (``total_fan_in``, all the taps times the input
+    channels), whatever its own shape: the same truncated normal as
+    keras.initializers.HeNormal, sqrt(2 / fan_in) before truncation.
 
-    debug=True keeps using all-ones (Ones() sliced anywhere is still all
-    1s, so no special-casing needed there).
+    It is a real initializer, called by add_weight: the layer can be built
+    anywhere Keras builds layers, including inside a traced function (a
+    Sequential without an Input on its first fit, on TensorFlow and JAX).
+    The values used to be drawn in build() and converted to NumPy there,
+    which fails on a symbolic tensor.
+
+    The seed is drawn from Python's ``random`` when the initializer is made,
+    like the Keras initializers do: keras.utils.set_random_seed makes the
+    weights reproducible, and each weight gets its own seed.
+
+    debug=True gives all ones instead.
     """
-    init = keras.initializers.Ones() if debug else keras.initializers.HeNormal()
-    return keras.ops.convert_to_numpy(init((total_fan_in, out_channels)))
+
+    _TRUNCATION = 0.87962566103423978  # std of a unit normal truncated at +-2, as in Keras
+
+    def __init__(self, total_fan_in, debug=False, seed=None):
+        self.total_fan_in = int(total_fan_in)
+        self.debug = bool(debug)
+        self._init_seed = seed
+        self.seed = random.randint(1, int(1e9)) if seed is None else seed
+
+    def __call__(self, shape, dtype=None):
+        if self.debug:
+            return keras.ops.ones(shape, dtype=dtype)
+        stddev = math.sqrt(2.0 / max(1, self.total_fan_in)) / self._TRUNCATION
+        return keras.random.truncated_normal(
+            shape, mean=0.0, stddev=stddev, dtype=dtype, seed=self.seed
+        )
+
+    def get_config(self):
+        return {"total_fan_in": self.total_fan_in, "debug": self.debug, "seed": self._init_seed}
+
+
+def _require_depth(input_shape, depth_size, what):
+    """A 3D layer without depth padding needs at least `depth_size` frames: fewer gave an empty
+    tensor on some backends and a backend error on the others."""
+    depth = input_shape[1]
+    if depth is not None and depth < depth_size:
+        raise ValueError(
+            f"{what} with a depth size of {depth_size} needs at least {depth_size} frames along "
+            f"the depth axis, got input_shape={tuple(input_shape)}."
+        )
 
 
 def _infer_in_channels(input_shape):
@@ -323,6 +383,12 @@ def _require_static_spatial(input_shape, dimensions):
     column count), so a dynamic/None spatial dim cannot work. Fail here with a
     readable message rather than crashing obscurely deep inside the conv.
     """
+    if len(input_shape) != dimensions + 2:
+        raise ValueError(
+            f"A {dimensions}D hex layer takes a channels-last tensor of rank {dimensions + 2} "
+            f"(batch, {'H, W' if dimensions == 2 else 'D, H, W'}, channels), "
+            f"got input_shape={tuple(input_shape)}."
+        )
     # channels-last: axis 0 = batch, last axis = channels; spatial axes in between.
     spatial = list(input_shape[1:-1])
     labels = ("H", "W") if dimensions == 2 else ("D", "H", "W")
@@ -497,12 +563,60 @@ class HexBase:
             input = keras.ops.concatenate([input[:, :1], input[:, 1:]], axis=1)
         return input
 
+    def _require_rows_for_stride(self, rows, cols):
+        half = self.hexbase_stride // 2
+        if rows < half or (rows == half and cols > self.hexbase_stride):
+            # The even-column group starts stride // 2 rows down: with no row left
+            # for it, the two groups come out with different heights and the
+            # backend failed on their concatenation with an unreadable error (the
+            # former assert tested >= 0, one row too lenient, and vanished under
+            # python -O). With cols <= stride there is no even group at all, so
+            # rows == stride // 2 is still fine there.
+            raise ValueError(
+                f"A hex layer with strides={self.hexbase_stride} needs more than "
+                f"{self.hexbase_stride // 2} row(s) on a grid wider than the stride; "
+                f"got {rows} row(s) and {cols} column(s)."
+            )
+
+    # --- output shape, without running the layer --------------------------------
+    def _hex_output_size(self, rows, cols):
+        """(rows, cols) of the output grid: the arithmetic of the two operations
+        below, on sizes only."""
+        stride, size = self.hexbase_stride, self.hexbase_size
+        if stride == 1:
+            return rows, cols
+        self._require_rows_for_stride(rows, cols)
+
+        def group(shape_for):  # sub-kernel 0: (2 * size + 1) rows, one column
+            slices, pads = shape_for([rows, cols], 0)
+            height = len(range(rows)[slices[0] : slices[1]]) + pads[2] + pads[3]
+            width = len(range(cols)[slices[2] : slices[3]]) + pads[0] + pads[1]
+            return (height - (2 * size + 1)) // stride + 1, (width - 1) // (2 * stride) + 1
+
+        out_rows, out_cols = group(self.shape_for_odd_columns)
+        if cols > stride:
+            out_cols += group(self.shape_for_even_columns)[1]
+        return out_rows, out_cols
+
+    def compute_output_shape(self, input_shape):
+        """Keras asks for it where it cannot call the layer (TimeDistributed, ...)."""
+        input_shape = tuple(input_shape)
+        _require_static_spatial(input_shape, self.dimensions)
+        out_rows, out_cols = self._hex_output_size(input_shape[-3], input_shape[-2])
+        channels = getattr(self, "filters", None) or getattr(self, "out_channels", None)
+        shape = [input_shape[0]]
+        if self.dimensions == 3:
+            depth = input_shape[1]
+            if getattr(self, "depth_padding", "valid") == "same":
+                depth += self.depth_size - 1
+            shape.append((depth - self.depth_size) // self.depth_stride + 1)
+        return (*shape, out_rows, out_cols, channels or input_shape[-1])
+
     # --- general operation with arbitrary stride (verbatim orchestration) ------
     def operation_with_arbitrary_stride(self, input):
         input = self._stabilize_3d_shape(input)
-        assert self._hw_ordered_size(input)[-2] - (self.hexbase_stride // 2) >= 0, (
-            "Too few rows to apply hex conv with the stide that is set"
-        )
+        rows, cols = self._hw_ordered_size(input)[-2:]
+        self._require_rows_for_stride(rows, cols)
         odd_columns = None
         even_columns = None
         # With no more columns than the stride, the even-column group of the
@@ -763,6 +877,52 @@ class _ConvProcess:
 # ----------------------------------------------------------------------------
 
 
+def _tie_sharing_maximum():
+    """``maximum(a, b)`` whose gradient is shared equally between a and b where they are equal.
+
+    That is what torch.maximum and jax.numpy.maximum do. tf.maximum gives the whole
+    gradient to its first argument, so on TensorFlow a max pooling over a flat region
+    (zeros after a ReLU, the zero padding of the border) trained differently from the
+    two other backends. Same values everywhere; only the TensorFlow gradient changes.
+
+    On torch, keras.ops.maximum of two float64 tensors returns float32 (Keras 3.12): a
+    max pooling under a float64 policy lost its precision. torch.maximum keeps the dtype.
+    """
+    if keras.backend.backend() == "torch":
+        import torch
+
+        def same_dtype_maximum(a, b):
+            if torch.is_tensor(a) and torch.is_tensor(b) and a.dtype == b.dtype:
+                return torch.maximum(a, b)
+            return keras.ops.maximum(a, b)
+
+        return same_dtype_maximum
+    if keras.backend.backend() != "tensorflow":
+        return keras.ops.maximum
+    import tensorflow as tf
+
+    @tf.custom_gradient
+    def maximum(a, b):
+        def grad(upstream):
+            half = tf.cast(0.5, upstream.dtype)
+            one = tf.cast(1.0, upstream.dtype)
+            to_a = tf.where(a > b, one, tf.where(tf.equal(a, b), half, one - one))
+            return upstream * to_a, upstream * (one - to_a)
+
+        return tf.maximum(a, b), grad
+
+    def same_shape_maximum(a, b):
+        a, b = tf.convert_to_tensor(a), tf.convert_to_tensor(b)
+        if a.dtype != b.dtype or a.shape != b.shape:  # the gradient above assumes neither
+            return keras.ops.maximum(a, b)
+        return maximum(a, b)
+
+    return same_shape_maximum
+
+
+_maximum = _tie_sharing_maximum()
+
+
 class _MaxPoolProcess:
     """Callable mimicking F.max_pool2d/3d on channels-last tensors.
 
@@ -772,7 +932,7 @@ class _MaxPoolProcess:
     max pool. The "kernel" here is a window *size* tuple, as in the original.
     """
 
-    reduce = staticmethod(keras.ops.maximum)
+    reduce = staticmethod(_maximum)
 
     def __init__(self, dimensions):
         self.dimensions = dimensions
@@ -782,6 +942,12 @@ class _MaxPoolProcess:
             kh, kw = window
             dh, dw = (1, 1) if dilation is None else dilation
             sh, sw = (1, 1) if stride is None else stride
+            # One strided slice per cell, on every backend. The vertical part of the
+            # window could go through the backend's own max pooling (1.1x to 3.5x
+            # faster on JAX and torch), but that one gives the whole gradient to a
+            # single cell at ties where the maximum of slices shares it (see
+            # _tie_sharing_maximum for TensorFlow), and TensorFlow's drops NaN: the
+            # three backends must give the same values and the same gradients.
             taps = [input[:, a * dh :: sh, b * dw :: sw, :] for a in range(kh) for b in range(kw)]
             return _reduce_aligned(taps, (1, 2), self.reduce)
         else:
@@ -870,33 +1036,60 @@ _WEIGHT_MAP_CACHE = {}
 _PROBE_ANCHOR_PARITY = 0  # even column; arbitrary but must be probe-invariant
 
 
-def _tap_offset(n, i, r, c):
-    """Physical (dr, dc) offset of sub-kernel cell (i, r, c) for kernel size n.
+_TAP_OFFSET_CACHE = {}
 
-    Fires a single tap through Conv2d_CustomKernel on a centered impulse and
-    reads back where the 1.0 lands. Pure measurement, no coordinate
-    assumptions -- except the probe's center column parity is pinned to
-    _PROBE_ANCHOR_PARITY (see that constant for why).
+
+def _tap_offsets(n):
+    """Physical (dr, dc) offset of every sub-kernel cell (i, r, c) for kernel size n.
+
+    One probe: a Conv2d_CustomKernel whose cells each carry a distinct integer
+    weight, on a centered impulse. Every cell reaches a different pixel, so the
+    value read at a pixel names the cell that put it there. Pure measurement, no
+    coordinate assumptions -- except the probe's center column parity is pinned
+    to _PROBE_ANCHOR_PARITY (see that constant for why). float32 throughout (the
+    probe ignores the global dtype policy: these are small integers used as
+    labels, and must stay exact).
+
+    This used to fire one probe *per cell* (building and running a layer each
+    time): 5 s for "ring" sharing at kernel size 5, in the layer's __init__.
     """
+    if n in _TAP_OFFSET_CACHE:
+        return _TAP_OFFSET_CACHE[n]
     g = 6 * n + 11
     cen = g // 2
     if cen % 2 != _PROBE_ANCHOR_PARITY:
         cen += 1
     imp = np.zeros((1, g, g, 1), np.float32)
     imp[0, cen, cen, 0] = 1.0
-    subk = []
+    subk, cells = [], []
     for k in range(n + 1):
         kh = 2 * n + 1 - k
         kw = 1 if k == 0 else 2
         a = np.zeros((1, 1, kh, kw), np.float32)
-        if k == i:
-            a[0, 0, r, c] = 1.0
+        for r in range(kh):
+            for c in range(kw):
+                cells.append((k, r, c))
+                a[0, 0, r, c] = float(len(cells))  # label, from 1
         subk.append(a)
     out = keras.ops.convert_to_numpy(
-        Conv2d_CustomKernel(sub_kernels=subk, strides=1)(keras.ops.convert_to_tensor(imp))
+        Conv2d_CustomKernel(sub_kernels=subk, strides=1, dtype="float32")(
+            keras.ops.convert_to_tensor(imp, dtype="float32")
+        )
     )[0, :, :, 0]
-    pos = np.argwhere(np.isclose(out, 1.0))
-    return int(pos[0][0] - cen), int(pos[0][1] - cen)
+    offsets = {}
+    for row, col in np.argwhere(out > 0.5):
+        offsets[cells[int(round(float(out[row, col]))) - 1]] = (int(row - cen), int(col - cen))
+    if len(offsets) != len(cells):
+        raise RuntimeError(
+            f"hex tap probe for kernel size {n}: {len(offsets)} cells found, {len(cells)} expected."
+        )
+    _TAP_OFFSET_CACHE[n] = offsets
+    return offsets
+
+
+def _tap_offset(n, i, r, c):
+    """Physical (dr, dc) offset of sub-kernel cell (i, r, c) for kernel size n."""
+    return _tap_offsets(n)[(i, r, c)]
 
 
 def _ring_maps_2d_uncached(n):
@@ -983,8 +1176,15 @@ def weight_maps_2d(n, mode="ring"):
             f"share_neighbors mode must be one of {SHARE_NEIGHBORS_MODES}, got {mode!r}."
         )
     key = (mode, n)
-    if key in _WEIGHT_MAP_CACHE:
-        return _WEIGHT_MAP_CACHE[key]
+    if key not in _WEIGHT_MAP_CACHE:
+        _WEIGHT_MAP_CACHE[key] = _weight_maps_2d_uncached(n, mode)
+    # Copies: the caller's arrays used to be the cached ones, so writing into
+    # them changed the sharing of every layer built afterwards.
+    maps, num = _WEIGHT_MAP_CACHE[key]
+    return [m.copy() for m in maps], num
+
+
+def _weight_maps_2d_uncached(n, mode):
 
     if mode == "ring":
         result = _ring_maps_2d_uncached(n)
@@ -996,8 +1196,6 @@ def weight_maps_2d(n, mode="ring"):
             )
         maps, num = _DIAG_SYM_MAPS[(mode, n)]
         result = ([m.copy() for m in maps], num)
-
-    _WEIGHT_MAP_CACHE[key] = result
     return result
 
 
@@ -1066,10 +1264,13 @@ class Conv2d(HexBase, keras.layers.Layer):
     ):
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
+        kernel_size = _plain_ints(kernel_size)
         _require_nonnegative_int("kernel_size", kernel_size)
+        strides = _plain_ints(strides)
         _require_positive_int("strides", strides)
         self.in_channels = None
-        self.filters = filters
+        self.filters = _plain_ints(filters)
+        _require_positive_int("filters", self.filters)
         self.kernel_size = kernel_size
         self.kernel_size_unit = _require_kernel_size_unit(kernel_size_unit)
         self.strides = strides
@@ -1095,18 +1296,20 @@ class Conv2d(HexBase, keras.layers.Layer):
         _require_static_spatial(input_shape, self.dimensions)
         in_channels = _infer_in_channels(input_shape)
         self.in_channels = in_channels
+        # Like keras.layers.Conv2D: a later call on another channel count is an error. Without
+        # it the backend ran a grouped convolution on the mismatched kernel, silently.
+        self.input_spec = keras.layers.InputSpec(ndim=self.dimensions + 2, axes={-1: in_channels})
         out_channels = self.filters
 
         # Total physical taps across kernel0..kernel{hexbase_size} -- the TRUE
         # combined receptive field whose summed output needs variance-preserving
-        # init. See _combined_fan_in_pool for why this must be combined, not
+        # init. See _CombinedFanInHeNormal for why this must be combined, not
         # computed per sub-kernel.
         total_taps = sum(
             (1 + 2 * self.hexbase_size - i) * (1 if i == 0 else 2)
             for i in range(self.hexbase_size + 1)
         )
-        pool = _combined_fan_in_pool(total_taps * in_channels, out_channels, self.debug)
-        offset = 0
+        fan_in = total_taps * in_channels
 
         # NOTE: trainable weights are created with self.add_weight (NOT a raw
         # Variable) so Keras tracks them in trainable_variables -- essential for
@@ -1116,36 +1319,26 @@ class Conv2d(HexBase, keras.layers.Layer):
         if self.share_neighbors:
             # One weight per hex ring, broadcast to every cell of that ring at
             # forward time (see _materialize_kernels). num_rings = n + 1.
-            count = self.num_rings * in_channels
-            values = pool[offset : offset + count].reshape(
-                self.num_rings, in_channels, out_channels
-            )
-            offset += count
             self.ring_weights = self.add_weight(
                 name="ring_weights",
                 shape=(self.num_rings, in_channels, out_channels),
-                initializer=keras.initializers.Constant(values),
+                initializer=_CombinedFanInHeNormal(fan_in, self.debug),
                 trainable=True,
             )
-            # Ring-index tensors only depend on kernel geometry, not on the
-            # weight values, so convert them from numpy once here rather than
-            # on every forward call (see _materialize_kernels).
-            self._ring_idx = [
-                keras.ops.convert_to_tensor(m, dtype="int32") for m in self._ring_maps
-            ]
+            # The ring maps stay NumPy arrays: a backend tensor made here belongs
+            # to whatever graph build() runs in, and a layer built inside a traced
+            # function (or shared between two models) then failed on it.
+            self._ring_idx = [np.asarray(m, dtype=np.int32) for m in self._ring_maps]
         else:
             self._base_kernels = []
             for i in range(self.hexbase_size + 1):
                 kh = 1 + 2 * self.hexbase_size - i
                 kw = 1 if i == 0 else 2
-                count = kh * kw * in_channels
-                values = pool[offset : offset + count].reshape(kh, kw, in_channels, out_channels)
-                offset += count
                 self._base_kernels.append(
                     self.add_weight(
                         name=f"base_kernel{i}",
                         shape=(kh, kw, in_channels, out_channels),
-                        initializer=keras.initializers.Constant(values),
+                        initializer=_CombinedFanInHeNormal(fan_in, self.debug),
                         trainable=True,
                     )
                 )
@@ -1247,10 +1440,13 @@ class Conv3d(HexBase, keras.layers.Layer):
     ):
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
+        kernel_size = _plain_ints(kernel_size)
         depth_size, hex_kernel_size = _require_depth_hex_kernel_size("kernel_size", kernel_size)
+        strides = _plain_ints(strides)
         _require_positive_int_or_pair("strides", strides)
         self.in_channels = None
-        self.filters = filters
+        self.filters = _plain_ints(filters)
+        _require_positive_int("filters", self.filters)
         self.kernel_size = kernel_size
         self.kernel_size_unit = _require_kernel_size_unit(kernel_size_unit)
         self.strides = strides
@@ -1289,16 +1485,20 @@ class Conv3d(HexBase, keras.layers.Layer):
         _require_static_spatial(input_shape, self.dimensions)
         in_channels = _infer_in_channels(input_shape)
         self.in_channels = in_channels
+        # Like keras.layers.Conv2D: a later call on another channel count is an error. Without
+        # it the backend ran a grouped convolution on the mismatched kernel, silently.
+        self.input_spec = keras.layers.InputSpec(ndim=self.dimensions + 2, axes={-1: in_channels})
         out_channels = self.filters
 
+        if self.depth_padding == "valid":
+            _require_depth(input_shape, self.depth_size, "A Conv3d (depth_padding='valid')")
         # Total physical taps across kernel0..kernel{hexbase_size} (including
-        # the depth axis) -- see Conv2d.build / _combined_fan_in_pool.
+        # the depth axis) -- see Conv2d.build / _CombinedFanInHeNormal.
         total_taps = self.depth_size * sum(
             (1 + 2 * self.hexbase_size - i) * (1 if i == 0 else 2)
             for i in range(self.hexbase_size + 1)
         )
-        pool = _combined_fan_in_pool(total_taps * in_channels, out_channels, self.debug)
-        offset = 0
+        fan_in = total_taps * in_channels
 
         # Trainable weights via self.add_weight (Keras tracks them); kernel{i} the
         # forward pass reads are derived tensors set per call (see _materialize_kernels).
@@ -1306,37 +1506,24 @@ class Conv3d(HexBase, keras.layers.Layer):
             # Share over the HEX axes only; the depth (time) axis stays fully
             # independent -- exactly TDSCAN's (L, num_rings, ...) layout. So
             # ring_weights is (depth, num_rings, in, out).
-            count = self.depth_size * self.num_rings * in_channels
-            values = pool[offset : offset + count].reshape(
-                self.depth_size, self.num_rings, in_channels, out_channels
-            )
-            offset += count
             self.ring_weights = self.add_weight(
                 name="ring_weights",
                 shape=(self.depth_size, self.num_rings, in_channels, out_channels),
-                initializer=keras.initializers.Constant(values),
+                initializer=_CombinedFanInHeNormal(fan_in, self.debug),
                 trainable=True,
             )
-            # See Conv2d.build: cache the ring-index tensors once rather than
-            # reconverting them from numpy on every forward call.
-            self._ring_idx = [
-                keras.ops.convert_to_tensor(m, dtype="int32") for m in self._ring_maps
-            ]
+            # NumPy, not backend tensors: see Conv2d.build.
+            self._ring_idx = [np.asarray(m, dtype=np.int32) for m in self._ring_maps]
         else:
             self._base_kernels = []
             for i in range(self.hexbase_size + 1):
                 kh = 1 + 2 * self.hexbase_size - i
                 kw = 1 if i == 0 else 2
-                count = self.depth_size * kh * kw * in_channels
-                values = pool[offset : offset + count].reshape(
-                    self.depth_size, kh, kw, in_channels, out_channels
-                )
-                offset += count
                 self._base_kernels.append(
                     self.add_weight(
                         name=f"base_kernel{i}",
                         shape=(self.depth_size, kh, kw, in_channels, out_channels),
-                        initializer=keras.initializers.Constant(values),
+                        initializer=_CombinedFanInHeNormal(fan_in, self.debug),
                         trainable=True,
                     )
                 )
@@ -1428,6 +1615,7 @@ class Conv2d_CustomKernel(HexBase, keras.layers.Layer):
     ):
         # Note: 'bias' here is the actual bias array (data), not a boolean
         # flag like Conv2d's -- it has no Keras-native rename, unlike stride.
+        strides = _plain_ints(strides)
         _require_positive_int("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
@@ -1442,9 +1630,10 @@ class Conv2d_CustomKernel(HexBase, keras.layers.Layer):
         # np.asarray here (not just list(...)): get_config()/from_config() round-trips
         # sub_kernels through plain Python lists (via .tolist()), and _check_sub_kernels
         # below needs real arrays (.ndim, .shape).
-        sub_kernels = (
-            [np.asarray(sk, dtype=np.float32) for sk in sub_kernels] if sub_kernels else []
-        )
+        # The dtype of the layer (float64 under a float64 policy): the kernels used to be
+        # float32 whatever it was, and a float64 layer then failed on its first call.
+        dtype = self.variable_dtype
+        sub_kernels = [np.asarray(sk, dtype=dtype) for sk in sub_kernels] if sub_kernels else []
         if debug or len(sub_kernels) == 0:
             sub_kernels = [
                 np.array([[[[1], [1], [1]]]]),
@@ -1454,20 +1643,20 @@ class Conv2d_CustomKernel(HexBase, keras.layers.Layer):
         self._check_sub_kernels(sub_kernels)
         # Keep the construction sub-kernels (PyTorch layout) + bias for get_config;
         # actual weight *values* are restored separately by Keras on load.
-        self._sub_kernels_init = [np.asarray(sk, dtype=np.float32) for sk in sub_kernels]
-        self._bias_init = None if bias is None else np.asarray(bias, dtype=np.float32)
+        self._sub_kernels_init = [np.asarray(sk, dtype=dtype) for sk in sub_kernels]
+        self._bias_init = None if bias is None else np.asarray(bias, dtype=dtype)
         for i, sk in enumerate(sub_kernels):
             # (out, in, rows, cols) -> (rows, cols, in, out)
-            tf_k = np.transpose(np.asarray(sk, dtype=np.float32), (2, 3, 1, 0))
+            tf_k = np.transpose(np.asarray(sk, dtype=dtype), (2, 3, 1, 0))
             setattr(
                 self,
                 "kernel" + str(i),
-                keras.Variable(tf_k, trainable=trainable, name=f"kernel{i}"),
+                keras.Variable(tf_k, dtype=dtype, trainable=trainable, name=f"kernel{i}"),
             )
 
         if not debug and bias is not None:
             self.bias_tensor = keras.Variable(
-                np.asarray(bias, dtype=np.float32), trainable=trainable, name="bias"
+                np.asarray(bias, dtype=dtype), dtype=dtype, trainable=trainable, name="bias"
             )
             self.kwargs = {"bias": self.bias_tensor}
             self.use_bias = True
@@ -1486,10 +1675,24 @@ class Conv2d_CustomKernel(HexBase, keras.layers.Layer):
                 self.out_channels = sk.shape[0]
                 self.in_channels = sk.shape[1]
             else:
+                if sk.shape[:2] != (self.out_channels, self.in_channels):
+                    raise ValueError(
+                        f"sub-kernel {i} has (out, in) channels {sk.shape[:2]}, sub-kernel 0 has "
+                        f"{(self.out_channels, self.in_channels)}: they must agree."
+                    )
                 assert sk.shape[3] == 2, f"sub-kernel {i}: must have 2 columns"
                 assert sk.shape[2] == 2 * self.hexbase_size + 1 - i, (
                     f"sub-kernel {i}: must have 2*(kernel size)+1-{i} rows"
                 )
+
+    def build(self, input_shape):
+        # As Conv2d.build: a readable error on a wrong rank or an unknown grid size, and on
+        # another channel count than the kernels' (the backend ran a grouped convolution on
+        # the mismatched kernel, silently).
+        _require_static_spatial(input_shape, self.dimensions)
+        self.input_spec = keras.layers.InputSpec(
+            ndim=self.dimensions + 2, axes={-1: self.in_channels}
+        )
 
     def call(self, input):
         if self.hexbase_stride == 1:
@@ -1503,7 +1706,9 @@ class Conv2d_CustomKernel(HexBase, keras.layers.Layer):
                 "sub_kernels": [sk.tolist() for sk in self._sub_kernels_init],
                 "strides": self.hexbase_stride,
                 "bias": None if self._bias_init is None else self._bias_init.tolist(),
-                "trainable": self._trainable_kernels,
+                # the kernels train when the argument said so and the layer itself is trainable:
+                # the Keras flag alone (layer.trainable = False) used to be lost on a round trip
+                "trainable": bool(self._trainable_kernels and self.trainable),
                 "debug": self._debug,
             }
         )
@@ -1534,6 +1739,7 @@ class Conv3d_CustomKernel(HexBase, keras.layers.Layer):
     ):
         # Note: 'bias' here is the actual bias array (data), not a boolean
         # flag like Conv3d's -- it has no Keras-native rename, unlike stride.
+        strides = _plain_ints(strides)
         _require_positive_int_or_pair("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
@@ -1554,9 +1760,10 @@ class Conv3d_CustomKernel(HexBase, keras.layers.Layer):
 
         # np.asarray here (not just list(...)): see the matching comment in
         # Conv2d_CustomKernel.__init__ -- config round-trips supply plain lists.
-        sub_kernels = (
-            [np.asarray(sk, dtype=np.float32) for sk in sub_kernels] if sub_kernels else []
-        )
+        # The dtype of the layer (float64 under a float64 policy): the kernels used to be
+        # float32 whatever it was, and a float64 layer then failed on its first call.
+        dtype = self.variable_dtype
+        sub_kernels = [np.asarray(sk, dtype=dtype) for sk in sub_kernels] if sub_kernels else []
         if debug or len(sub_kernels) == 0:
             sub_kernels = [
                 np.array([[[[[1], [1], [1]]]]]),
@@ -1566,20 +1773,20 @@ class Conv3d_CustomKernel(HexBase, keras.layers.Layer):
         self._check_sub_kernels(sub_kernels)
         # Keep the construction sub-kernels (PyTorch layout) + bias for get_config;
         # actual weight *values* are restored separately by Keras on load.
-        self._sub_kernels_init = [np.asarray(sk, dtype=np.float32) for sk in sub_kernels]
-        self._bias_init = None if bias is None else np.asarray(bias, dtype=np.float32)
+        self._sub_kernels_init = [np.asarray(sk, dtype=dtype) for sk in sub_kernels]
+        self._bias_init = None if bias is None else np.asarray(bias, dtype=dtype)
         for i, sk in enumerate(sub_kernels):
             # (out, in, depth, rows, cols) -> (depth, rows, cols, in, out)
-            tf_k = np.transpose(np.asarray(sk, dtype=np.float32), (2, 3, 4, 1, 0))
+            tf_k = np.transpose(np.asarray(sk, dtype=dtype), (2, 3, 4, 1, 0))
             setattr(
                 self,
                 "kernel" + str(i),
-                keras.Variable(tf_k, trainable=trainable, name=f"kernel{i}"),
+                keras.Variable(tf_k, dtype=dtype, trainable=trainable, name=f"kernel{i}"),
             )
 
         if not debug and bias is not None:
             self.bias_tensor = keras.Variable(
-                np.asarray(bias, dtype=np.float32), trainable=trainable, name="bias"
+                np.asarray(bias, dtype=dtype), dtype=dtype, trainable=trainable, name="bias"
             )
             self.kwargs = {"bias": self.bias_tensor}
             self.use_bias = True
@@ -1599,11 +1806,25 @@ class Conv3d_CustomKernel(HexBase, keras.layers.Layer):
                 self.in_channels = sk.shape[1]
                 self.depth_size = sk.shape[2]
             else:
+                if sk.shape[:2] != (self.out_channels, self.in_channels):
+                    raise ValueError(
+                        f"sub-kernel {i} has (out, in) channels {sk.shape[:2]}, sub-kernel 0 has "
+                        f"{(self.out_channels, self.in_channels)}: they must agree."
+                    )
                 assert sk.shape[4] == 2, f"sub-kernel {i}: must have 2 columns"
                 assert sk.shape[3] == 2 * self.hexbase_size + 1 - i, (
                     f"sub-kernel {i}: must have 2*(kernel size)+1-{i} rows"
                 )
                 assert sk.shape[2] == self.depth_size, f"sub-kernel {i}: depths are not consistent"
+
+    def build(self, input_shape):
+        # As Conv3d.build: a readable error on a wrong rank or an unknown grid size, and on
+        # another channel count than the kernels' (the backend ran a grouped convolution on
+        # the mismatched kernel, silently).
+        _require_static_spatial(input_shape, self.dimensions)
+        self.input_spec = keras.layers.InputSpec(
+            ndim=self.dimensions + 2, axes={-1: self.in_channels}
+        )
 
     def call(self, input):
         if self.hexbase_stride == 1:
@@ -1617,7 +1838,9 @@ class Conv3d_CustomKernel(HexBase, keras.layers.Layer):
                 "sub_kernels": [sk.tolist() for sk in self._sub_kernels_init],
                 "strides": self._stride_init,
                 "bias": None if self._bias_init is None else self._bias_init.tolist(),
-                "trainable": self._trainable_kernels,
+                # the kernels train when the argument said so and the layer itself is trainable:
+                # the Keras flag alone (layer.trainable = False) used to be lost on a round trip
+                "trainable": bool(self._trainable_kernels and self.trainable),
                 "debug": self._debug,
             }
         )
@@ -1637,6 +1860,12 @@ class MaxPool2d(HexBase, keras.layers.Layer):
     keras.layers.MaxPool2D order -- ``pool_size, strides, padding, name`` --
     so Keras-style positional calls mean the same thing here.
 
+    The border is padded with **zeros**, as in HexagDLy (and unlike
+    keras.layers.MaxPool2D, which ignores the cells outside the grid): a window
+    that overlaps the border never returns less than 0. It makes no difference
+    after a ReLU; with inputs that can be negative, the border outputs are
+    clamped at 0. The hls4ml export follows the same convention.
+
     ``pool_size`` follows ``kernel_size_unit`` like :class:`Conv2d`.
     """
 
@@ -1651,7 +1880,9 @@ class MaxPool2d(HexBase, keras.layers.Layer):
         **kwargs,
     ):
         pool_size = _resolve_pool_size(pool_size, kernel_size)
+        pool_size = _plain_ints(pool_size)
         _require_nonnegative_int("pool_size", pool_size)
+        strides = _plain_ints(strides)
         _require_positive_int("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
@@ -1664,9 +1895,12 @@ class MaxPool2d(HexBase, keras.layers.Layer):
         self.hexbase_stride = strides
         self.dimensions = 2
         self.process = _MaxPoolProcess(2)
-        self.combine = keras.ops.maximum
+        self.combine = _maximum
         for i in range(self.hexbase_size + 1):
             setattr(self, "kernel" + str(i), (1 + 2 * self.hexbase_size - i, 1 if i == 0 else 2))
+
+    def build(self, input_shape):
+        _require_static_spatial(input_shape, self.dimensions)
 
     def call(self, input):
         if self.hexbase_stride == 1:
@@ -1715,7 +1949,9 @@ class AvgPool2d(HexBase, keras.layers.Layer):
         **kwargs,
     ):
         pool_size = _resolve_pool_size(pool_size, kernel_size)
+        pool_size = _plain_ints(pool_size)
         _require_nonnegative_int("pool_size", pool_size)
+        strides = _plain_ints(strides)
         _require_positive_int("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
@@ -1728,6 +1964,7 @@ class AvgPool2d(HexBase, keras.layers.Layer):
         self.hexbase_stride = strides
         self.dimensions = 2
         self.process = _SumPoolProcess(2)
+        self._count_cache = {}  # (H, W) -> window cell counts, see _window_count
         self.combine = operator.add  # see _SumPoolProcess for why not keras.ops.add
         for i in range(self.hexbase_size + 1):
             setattr(self, "kernel" + str(i), (1 + 2 * self.hexbase_size - i, 1 if i == 0 else 2))
@@ -1737,12 +1974,39 @@ class AvgPool2d(HexBase, keras.layers.Layer):
             return self.operation_with_single_hexbase_stride(input)
         return self.operation_with_arbitrary_stride(input)
 
+    def build(self, input_shape):
+        _require_static_spatial(input_shape, self.dimensions)
+        self._window_count(input_shape[1], input_shape[2])
+
+    def _window_count(self, height, width):
+        """The number of in-grid cells of each window, (1, H_out, W_out, 1), or None.
+
+        Summing a tensor of ones over the same windows counts them, since the hex
+        padding is zeros. It only depends on the grid, so it is computed once per
+        (H, W) and kept as a NumPy constant, instead of a second window sum at
+        every call (+40 % on an eager forward pass). None when it cannot be
+        evaluated here (first met inside a traced function): call() then counts
+        in the graph, where the backend folds it into a constant anyway.
+        """
+        key = (height, width)
+        if key not in self._count_cache:
+            try:
+                ones = keras.ops.ones((1, height, width, 1), dtype="float32")
+                self._count_cache[key] = np.asarray(
+                    keras.ops.convert_to_numpy(self._window_sum(ones)), dtype=np.float32
+                )
+            except Exception:
+                return None
+        return self._count_cache[key]
+
     def call(self, input):
-        # Summing a tensor of ones over the same windows counts the in-grid
-        # cells of each window, since the hex padding is zeros. The window
-        # centre is always in the grid, so the count is never zero.
+        # The window centre is always in the grid, so the count is never zero.
         total = self._window_sum(input)
-        count = self._window_sum(keras.ops.ones_like(input[..., :1]))
+        count = self._window_count(input.shape[1], input.shape[2])
+        if count is None:
+            count = self._window_sum(keras.ops.ones_like(input[..., :1]))
+        else:
+            count = keras.ops.convert_to_tensor(count, dtype=total.dtype)
         return total / count
 
     def get_config(self):
@@ -1782,7 +2046,9 @@ class MaxPool3d(HexBase, keras.layers.Layer):
         **kwargs,
     ):
         kernel_size = _resolve_pool_size(pool_size, kernel_size)
+        kernel_size = _plain_ints(kernel_size)
         depth_size, hex_kernel_size = _require_depth_hex_kernel_size("pool_size", kernel_size)
+        strides = _plain_ints(strides)
         _require_positive_int_or_pair("strides", strides)
         keras.layers.Layer.__init__(self, name=name, **kwargs)
         HexBase.__init__(self)
@@ -1800,13 +2066,17 @@ class MaxPool3d(HexBase, keras.layers.Layer):
             self.depth_stride = strides[0]
         self.dimensions = 3
         self.process = _MaxPoolProcess(3)
-        self.combine = keras.ops.maximum
+        self.combine = _maximum
         for i in range(self.hexbase_size + 1):
             setattr(
                 self,
                 "kernel" + str(i),
                 (self.depth_size, 1 + 2 * self.hexbase_size - i, 1 if i == 0 else 2),
             )
+
+    def build(self, input_shape):
+        _require_static_spatial(input_shape, self.dimensions)
+        _require_depth(input_shape, self.depth_size, "A MaxPool3d")
 
     def call(self, input):
         if self.hexbase_stride == 1:

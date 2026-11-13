@@ -21,21 +21,25 @@ Usage
 
 Supported scope
 ---------------
-**io_stream + the 2D layers (Conv2d, MaxPool2d) is the validated path.** That
-combination is covered by C-simulation and confirmed by RTL co-simulation.
+**io_stream is the validated path**, for the 2D layers (Conv2d, MaxPool2d) and
+the 3D ones (Conv3d, MaxPool3d). It is covered by C-simulation and confirmed by
+RTL co-simulation.
+
+A 3D layer is exported as a depth stage followed by the 2D kernel: the depth
+stage (a delay line of ``depth_size - 1`` frames) hands the 2D kernel the frames
+of each depth window stacked as channels, or their max for a pooling, and the 2D
+kernel runs over the output frames one after the other. Everything the 2D kernel
+supports therefore holds in 3D: any hex stride, depth stride and depth padding,
+weight sharing, ``Strategy``, ``ReuseFactor``, ``Dataflow``.
 
 The rest does not silently misbehave, it refuses:
 
-* ``patch_model_for_hls`` raises NotImplementedError on Conv3d / MaxPool3d.
-  The 3D kernels pass C-simulation, but they buffer whole frames along the
-  depth axis (depth-major streaming leaves no alternative) and synthesis is
-  pathologically slow as a result; no RTL co-simulation has ever completed.
 * ``check_hls_config`` raises NotImplementedError on io_parallel, which
   registerises every intermediate tensor -- Vitis' clang frontend segfaults
-  elaborating that many registers at realistic layer sizes.
-
-Both accept ``allow_unvalidated=True`` to proceed anyway; nothing about the
-numerics or the resource usage of those paths is guaranteed.
+  elaborating that many registers at realistic layer sizes. It accepts
+  ``allow_unvalidated=True`` to proceed anyway; nothing about the numerics or
+  the resource usage of that path is guaranteed.
+* The 3D layers have no io_parallel kernel at all: the conversion raises.
 
 What it does
 ------------
@@ -50,8 +54,8 @@ Two strategies are available via the ``strategy`` argument to
 ``patch_model_for_hls``:
 
 "linebuffer" (default -- the production path):
-    One fused layer per op (HexConvLineBuffer / HexConvLineBuffer3D /
-    HexPoolLineBuffer / HexPoolLineBuffer3D), keeping the (H, W) grid, backed by
+    One fused layer per op (HexConvLineBuffer / HexPoolLineBuffer, behind a
+    HexDepthStack / HexDepthPool for a 3D layer), keeping the (H, W) grid, backed by
     custom hls4ml KerasV3LayerHandlers and HLS C++ kernels.  In io_stream the
     kernel slides a register window over shift-register line buffers, so only
     2*kernel_size + 1 image rows are ever resident instead of the whole frame
@@ -60,11 +64,11 @@ Two strategies are available via the ``strategy`` argument to
     already frame-buffered), so the handler warns and falls back to a
     frame-buffered fused kernel.
 
-    2D conv/pool support any hex stride: output pixel (oh, ow) maps to input base
-    (stride*oh, stride*ow) with constant per-parity tap offsets.  The 3D variants
-    are hex-stride 1 (depth handled as a dense/pooled axis); the depth axis keeps
-    depth_size frames resident -- the streaming-3D memory floor (3D cannot reach
-    O(rows) like 2D: depth taps are N=H*W tokens apart in the stream).
+    Conv/pool support any hex stride: output pixel (oh, ow) maps to input base
+    (stride*oh, stride*ow) with constant per-parity tap offsets.  A 3D layer keeps
+    depth_size - 1 frames resident in its depth stage -- the streaming-3D memory
+    floor (3D cannot reach O(rows) like 2D: depth taps are N=H*W tokens apart in
+    the stream) -- and any depth stride or depth padding.
 
 "folded" (cross-check only, not a deployment path):
     Conv2d/Conv3d become one EinsumDense with a (N_in, Cin, N_out, Cout) kernel
@@ -298,7 +302,7 @@ def _maxpool3d_replacement(layer, x):
         "MaxPool3d export is not available for strategy='folded'. "
         "Max is not linear, so it cannot be folded into an EinsumDense kernel. "
         "Use patch_model_for_hls(model, strategy='linebuffer'), which maps "
-        "MaxPool3d to HexPoolLineBuffer3D."
+        "MaxPool3d to HexDepthPool + HexPoolLineBuffer."
     )
 
 
@@ -392,31 +396,20 @@ def _maxpool2d_linebuffer(layer, x):
 
 
 def _conv3d_linebuffer(layer, x):
-    """Conv3d -> single fused HexConvLineBuffer3D (linebuffer strategy).
+    """Conv3d -> HexDepthStack + HexConvLineBuffer (linebuffer strategy).
 
-    Fuses the per-depth-tap gather+MAC+Add scaffolding into one
-    layer that keeps the (D, H, W) grid.  Spatial neighbor table and per-tap
-    weights are identical; the depth axis rides through as a dense conv handled
-    inside the layer.  Only depth_stride=1 is supported.
+    A 3D convolution over (depth window, hex neighbourhood) is a 2D hex convolution over
+    the ``depth_size`` frames of the window stacked as channels. The depth stage
+    (HexDepthStack) does the stacking -- in hardware a delay line of ``depth_size - 1``
+    frames, the least a streamed 3D layer can store -- and the 2D layer, the same one a
+    Conv2d exports to, runs on each output frame with the kernel laid out as
+    (K or rings, depth_size*Cin, Cout). Hex stride, depth stride and depth padding are all
+    supported: they belong to one stage or the other.
     """
-    from keras_hexagdly.hex_gather import HexConvLineBuffer3D
-
-    if layer.hexbase_stride != 1:
-        raise NotImplementedError(
-            "Conv3d linebuffer export supports hex strides=1 only "
-            f"(got strides={layer.hexbase_stride})."
-        )
-    if layer.depth_stride != 1:
-        raise NotImplementedError(
-            f"Conv3d linebuffer export only supports depth_stride=1, got {layer.depth_stride}."
-        )
+    from keras_hexagdly.hex_gather import HexConvLineBuffer, HexDepthStack
 
     H, W = int(x.shape[2]), int(x.shape[3])
-    nbr, cells, _ = build_neighbor_table_3d(layer, int(x.shape[1]), H, W)
-
-    proxy = hgly.MaxPool2d(kernel_size=layer.hexbase_size, strides=layer.hexbase_stride)
-    _, _, (H_out, W_out) = build_neighbor_table(proxy, H, W)
-
+    nbr, cells, (_, H_out, W_out) = build_neighbor_table_3d(layer, int(x.shape[1]), H, W)
     bias = layer.bias_tensor.numpy() if layer.use_bias else None
 
     if layer.share_neighbors:
@@ -425,45 +418,60 @@ def _conv3d_linebuffer(layer, x):
     else:
         weights = get_cell_weights_3d(layer, cells)  # (D_kernel, K, Cin, Cout)
         ring_idx = None
+    # (D_kernel, rows, Cin, Cout) -> (rows, D_kernel*Cin, Cout): channel d*Cin + c of the
+    # stacked frames is channel c of depth tap d (the order HexDepthStack writes them in).
+    dk, rows, cin, cout = weights.shape
+    weights = np.transpose(weights, (1, 0, 2, 3)).reshape(rows, dk * cin, cout)
 
-    return HexConvLineBuffer3D(
-        neighbor_idx=nbr,
-        H=H_out,
-        W=W_out,
-        weights_array=weights,
+    pad_front = (layer.depth_size - 1) // 2 if layer.depth_padding == "same" else 0
+    pad_back = layer.depth_size - 1 - pad_front if layer.depth_padding == "same" else 0
+    stacked = HexDepthStack(
         depth_size=layer.depth_size,
         depth_stride=layer.depth_stride,
-        depth_padding=layer.depth_padding,
-        ring_idx=ring_idx,
-        bias=bias,
-        name=f"{layer.name}_linebuffer",
+        pad_front=pad_front,
+        pad_back=pad_back,
+        name=f"{layer.name}_depth",
     )(x)
-
-
-def _maxpool3d_linebuffer(layer, x):
-    """MaxPool3d -> single fused HexPoolLineBuffer3D (linebuffer strategy).
-
-    Keeps the (D, H, W) grid and maxes
-    over the depth pool window + K spatial taps as the volume streams.  Hex stride
-    1 only (spatial output grid == input grid); depth_size/depth_stride arbitrary.
-    """
-    from keras_hexagdly.hex_gather import HexPoolLineBuffer3D
-
-    if layer.hexbase_stride != 1:
-        raise NotImplementedError(
-            f"MaxPool3d linebuffer export supports hex strides=1 only (got {layer.hexbase_stride})."
-        )
-    H, W = int(x.shape[2]), int(x.shape[3])
-    nbr, cells, _ = build_neighbor_table_3d(layer, int(x.shape[1]), H, W)
-
-    return HexPoolLineBuffer3D(
+    return HexConvLineBuffer(
         neighbor_idx=nbr,
         H=H,
         W=W,
+        stride=layer.hexbase_stride,
+        H_out=H_out,
+        W_out=W_out,
+        weights_array=weights,
+        ring_idx=ring_idx,
+        bias=bias,
+        name=f"{layer.name}_linebuffer",
+    )(stacked)
+
+
+def _maxpool3d_linebuffer(layer, x):
+    """MaxPool3d -> HexDepthPool + HexPoolLineBuffer (linebuffer strategy).
+
+    The max over the depth window (HexDepthPool, per pixel) and the max over the hex
+    neighbourhood (the 2D pooling layer, run on each output frame) commute. Any hex
+    stride, depth size and depth stride.
+    """
+    from keras_hexagdly.hex_gather import HexDepthPool, HexPoolLineBuffer
+
+    H, W = int(x.shape[2]), int(x.shape[3])
+    nbr, cells, (_, H_out, W_out) = build_neighbor_table_3d(layer, int(x.shape[1]), H, W)
+
+    pooled = HexDepthPool(
         depth_size=layer.depth_size,
         depth_stride=layer.depth_stride,
-        name=f"{layer.name}_linebuffer",
+        name=f"{layer.name}_depth",
     )(x)
+    return HexPoolLineBuffer(
+        neighbor_idx=nbr,
+        H=H,
+        W=W,
+        stride=layer.hexbase_stride,
+        H_out=H_out,
+        W_out=W_out,
+        name=f"{layer.name}_linebuffer",
+    )(pooled)
 
 
 _STRATEGIES = ("linebuffer", "folded")
@@ -486,6 +494,24 @@ _REPLACEMENTS_FOLDED = {
     hgly.Conv3d: _conv3d_replacement,
     hgly.MaxPool3d: _maxpool3d_replacement,
 }
+
+
+# Layers hls4ml 1.3.0 cannot apply to the (D, H, W, C) output of a 3D layer. BatchNormalization
+# is the dangerous one: hls4ml only knows its channel count for (H, W, C) and (W, C) inputs, and
+# the generated code then reads scale and bias out of bounds -- wrong values, no error.
+# Concatenate stops at compile time on a missing nnet::concatenate4d.
+_NOT_AFTER_3D = (keras.layers.BatchNormalization, keras.layers.Concatenate)
+
+
+def _refuse_after_a_3d_layer(layer, x):
+    tensors = x if isinstance(x, (list, tuple)) else [x]
+    if isinstance(layer, _NOT_AFTER_3D) and any(len(t.shape) == 5 for t in tensors):
+        raise NotImplementedError(
+            f"{layer.name!r} ({type(layer).__name__}) is applied to the (D, H, W, C) output of a "
+            "3D layer, which hls4ml cannot convert correctly (a BatchNormalization there gives "
+            "wrong values without an error). Fold it into the weights of the layer before it, or "
+            "move it after a Reshape to (D*H, W, C) or a Flatten."
+        )
 
 
 def _hls4ml_has_bit_exact_flow():
@@ -630,16 +656,14 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
         A new keras.Model — plain Keras, no hls4ml dependency.  Pass this to
         ``hls4ml.converters.convert_from_keras_model()``.
 
-        allow_unvalidated: opt out of the support guard. The 2D path
-                  (Conv2d/MaxPool2d, io_stream) is the one validated by RTL
-                  cosimulation; 3D is C-simulation only. Set True to export it
-                  anyway, knowingly.
+        allow_unvalidated: no longer needed and ignored. It used to opt in to the
+                  export of the 3D layers, which is now a validated path.
 
     Raises:
         TypeError:           if ``model`` is not a keras.Model.
-        NotImplementedError: for 3D layers unless allow_unvalidated=True.
         ValueError:          if ``strategy`` is not a recognised value.
-        NotImplementedError: for MaxPool3d layers, or Conv3d with depth_stride > 1.
+        NotImplementedError: with strategy="folded", for MaxPool3d layers or a Conv3d
+                             with depth_stride > 1.
         NotImplementedError: for AvgPool2d layers.
 
     A Conv2d/Conv3d ``activation`` is kept: it is re-applied as a separate
@@ -679,18 +703,6 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
     if unsupported:
         raise NotImplementedError(f"AvgPool2d layers {unsupported} have no hls4ml export path yet.")
 
-    if not allow_unvalidated:
-        volumetric = [l.name for l in model.layers if isinstance(l, (hgly.Conv3d, hgly.MaxPool3d))]
-        if volumetric:
-            raise NotImplementedError(
-                f"3D layers {volumetric} are not a validated export path. They "
-                "pass C-simulation, but the 3D kernel buffers whole frames along "
-                "the depth axis (depth-major streaming leaves it no choice), and "
-                "synthesis is pathologically slow as a result -- over 40 min on a "
-                "4x8x8 toy where the 2D path takes 9 min on a full 24x24 model, "
-                "and no RTL cosimulation has ever completed on it. Pass "
-                "allow_unvalidated=True to proceed anyway."
-            )
     if strategy not in _STRATEGIES:
         raise ValueError(f"Unknown strategy {strategy!r}. Choose from: {_STRATEGIES}.")
 
@@ -703,11 +715,23 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
         if isinstance(layer, keras.layers.InputLayer):
             continue
 
+        if isinstance(layer, keras.Model):
+            raise NotImplementedError(
+                f"{layer.name!r} is a model nested in {model.name!r}: patch_model_for_hls does "
+                "not look inside nested models, and hls4ml would not see the hex layers in it. "
+                "Build one flat functional model (call the inner layers on the outer tensors) "
+                "and patch that."
+            )
+
         # Resolve this layer's input tensor(s) through the map.
         x = _mapped_inputs(layer, tensor_map)
 
-        # Apply replacement or pass-through.
+        # Apply replacement or pass-through. An exact type first (a quantized layer has its own
+        # entry), then the first base class that has one: a user subclass of a hex layer used to
+        # go through unpatched, without a word.
         fn = replacements.get(type(layer))
+        if fn is None:
+            fn = next((f for cls, f in replacements.items() if isinstance(layer, cls)), None)
         if fn is not None:
             y = fn(layer, x)
             # Replacements are rebuilt from the layer's weights and geometry
@@ -724,7 +748,8 @@ def patch_model_for_hls(model, strategy="linebuffer", allow_unvalidated=False):
             # converts well.
             y = keras.layers.Activation("relu", name=layer.name)(x)
         else:
-            y = layer(x) if not isinstance(x, list) else layer(x)
+            _refuse_after_a_3d_layer(layer, x)
+            y = layer(x)
 
         # Store replacement output tensor(s).
         raw_out = layer.output
@@ -767,17 +792,22 @@ def _hex_mac_shape(layer):
     shape = tuple(w.shape)
     if len(shape) == 3:  # (rows, Cin, Cout)
         return shape[0] * shape[1], shape[2]
-    if len(shape) == 4:  # 3D: (depth, rows, Cin, Cout)
+    if len(shape) == 4:  # the earlier single-layer 3D export: (depth, rows, Cin, Cout)
         return shape[0] * shape[1] * shape[2], shape[3]
     return None
 
 
 def recommended_reuse_factor(layer, max_mac_block=_MAX_MAC_BLOCK):
-    """Smallest ReuseFactor keeping this layer's MAC_BLOCK within budget.
+    """A ReuseFactor keeping this layer's MAC_BLOCK within budget.
 
     MAC_BLOCK = ceil(n_in / rf) * n_filt is how many multipliers the kernel
     instantiates, and also how many weights it reads per cycle. Returns 1 for
     layers that are already small enough.
+
+    Not always the smallest such factor: when a divisor of n_in lies between it and
+    twice it, the divisor is returned, so that no multiplier slot stays idle in the
+    last cycle of the fold. That trades latency (up to 2x on this layer) for fewer
+    multipliers; pass the result through ``min`` with your own value to refuse it.
     """
     shape = _hex_mac_shape(layer)
     if shape is None:
@@ -786,7 +816,14 @@ def recommended_reuse_factor(layer, max_mac_block=_MAX_MAC_BLOCK):
     if n_filt >= max_mac_block:  # a single output slice already exceeds it
         return n_in
     per_cycle = max(1, max_mac_block // n_filt)
-    return max(1, -(-n_in // per_cycle))
+    rf = max(1, -(-n_in // per_cycle))
+    # Prefer a reuse factor that divides n_in when one is close (at most twice as
+    # large): otherwise the last cycle of the fold has idle multiplier slots, and
+    # the handler warns about them.
+    for divisor in range(rf, min(2 * rf, n_in) + 1):
+        if n_in % divisor == 0:
+            return divisor
+    return rf
 
 
 def hex_reuse_config(config, model, max_mac_block=_MAX_MAC_BLOCK, verbose=True):
@@ -796,10 +833,11 @@ def hex_reuse_config(config, model, max_mac_block=_MAX_MAC_BLOCK, verbose=True):
 
     1. `config_from_keras_model(granularity='name')` writes ReuseFactor=1 into
        the LayerName entry of every layer it RECOGNISES, and that per-layer
-       value overrides Model.ReuseFactor. Hex layers are not recognised, so they
-       get no entry and silently fall through to the model-level value instead --
-       a hex-vs-standard comparison then runs the two at different reuse factors
-       without saying so.
+       value overrides Model.ReuseFactor. Hex layers are not recognised: their
+       entry (hls4ml 1.3 gives them one, with Precision and Trace only) has no
+       ReuseFactor, so they silently fall through to the model-level value
+       instead -- a hex-vs-standard comparison then runs the two at different
+       reuse factors without saying so.
 
     2. The kernels have a narrow viable window. Too low a reuse factor and the
        multiplier count explodes; in the middle, the weight ROM is duplicated
@@ -865,7 +903,7 @@ def apply_quantized_types(config, model, types, accumulator="exact", wide="ap_fi
 
     inputs, chosen = [], {}  # chosen: layers whose result type a ``result`` of types decided
     for key, entry in types.items():
-        name = key.rsplit("/", 1)[-1]  # a nested model's layers are flattened by the patch
+        name = key.rsplit("/", 1)[-1]  # the layer's own name (keys may carry a scope prefix)
         conv = f"{name}_linebuffer"
         if conv not in layers:
             raise ValueError(
@@ -885,10 +923,15 @@ def apply_quantized_types(config, model, types, accumulator="exact", wide="ap_fi
             mac["result"] = wide_result
             if "result" in entry:
                 precision(activation)["result"] = chosen[activation] = entry["result"]
-        else:
-            mac["result"] = entry.get("result", wide_result)
-            if "result" in entry:
-                chosen[conv] = entry["result"]
+        elif "result" in entry:
+            mac["result"] = chosen[conv] = entry["result"]
+        elif "weight" in entry:
+            mac["result"] = wide_result
+        elif not mac:
+            # a max pooling without an output quantizer: it returns one of its inputs, so its
+            # result is left to hls4ml, which gives it the type of its input. (It used to get
+            # ``wide``: a stream, a FIFO and the next line buffers 32 bits wide for nothing.)
+            del layer_cfg[conv]["Precision"]
         if accumulator == "exact" and "accum" in entry:
             layer_cfg[conv]["AccumPrecision"] = entry["accum"]
         if "input" in entry:
@@ -897,7 +940,12 @@ def apply_quantized_types(config, model, types, accumulator="exact", wide="ap_fi
     # the input type of a layer is the result type of its producer, unless that has its own
     wanted = {}  # producer -> (input type, the layer that asked for it)
     for conv, input_type in inputs:
-        producer = layers[conv].input._keras_history.operation.name
+        source = layers[conv].input._keras_history.operation
+        if type(source).__name__ in ("HexDepthStack", "HexDepthPool"):
+            # a 3D layer: the type goes on what feeds its depth stage, which hands it on. Put on
+            # the depth stage itself, the frames were stored unquantized in its delay line.
+            source = source.input._keras_history.operation
+        producer = source.name
         if producer in wanted and wanted[producer][0] != input_type:
             raise ValueError(
                 f"{wanted[producer][1]!r} and {conv!r} both read the output of {producer!r} but "
@@ -946,32 +994,76 @@ def check_hls_config(config, model, io_type="io_stream", allow_unvalidated=False
             "allow_unvalidated=True to proceed anyway."
         )
 
+    volumetric = [
+        layer.name
+        for layer in model.layers
+        if type(layer).__name__ in ("HexDepthStack", "HexDepthPool")
+    ]
+    if io_type != "io_stream" and volumetric:
+        raise NotImplementedError(
+            f"io_type={io_type!r}: the 3D hexagonal layers ({volumetric}) have an io_stream "
+            "kernel only; the conversion would raise."
+        )
+
     issues = []
     model_cfg = config.get("Model", {})
     layer_cfg = config.get("LayerName", {})
 
-    # Known RTL-correctness failure, see nnet_hex_conv_linebuffer_stream.h:
-    # Strategy='Latency' + ReuseFactor=1 + a repack_stream-triggering layer
-    # downstream (Flatten/Reshape) gives a constant, bias-only output in real
-    # cosim while C-simulation stays correct.
+    # RTL-correctness failure seen with earlier versions of the kernels, see
+    # nnet_hex_conv_linebuffer_stream.h: Strategy='Latency' + ReuseFactor=1 + a
+    # repack_stream-triggering layer downstream (Flatten/Reshape) gave a constant,
+    # bias-only output in real cosim while C-simulation stayed correct. It no
+    # longer reproduces (Conv -> MaxPool -> Flatten and Conv -> Flatten co-simulate
+    # correctly), so the message asks for a co-simulation instead of calling the
+    # RTL wrong. Strategy='Resource' with ReuseFactor=1 is not flagged: it is what
+    # hex_reuse_config picks for small layers, and it co-simulates correctly.
     reshapes = any(
         isinstance(l, (keras.layers.Flatten, keras.layers.Reshape)) for l in model.layers
     )
+    type_cfg = config.get("LayerType", {})
+
+    def option(layer, key, default):
+        """Per key: the layer's LayerName entry, else its LayerType entry, else Model."""
+        for section in (
+            layer_cfg.get(layer.name),
+            type_cfg.get("H" + type(layer).__name__),  # the IR class of a patched hex layer
+            model_cfg,
+        ):
+            if section and section.get(key) is not None:
+                return section[key]
+        return default
+
     for layer in model.layers:
         if _hex_mac_shape(layer) is None:
             continue
-        entry = layer_cfg.get(layer.name, {})
-        strat = str(entry.get("Strategy", model_cfg.get("Strategy", "Latency"))).lower()
-        rf = int(entry.get("ReuseFactor", model_cfg.get("ReuseFactor", 1)))
-        if reshapes and strat == "latency" and rf == 1:
+        strat = str(option(layer, "Strategy", "Latency")).lower()
+        rf = int(option(layer, "ReuseFactor", 1))
+        dataflow = option(layer, "Dataflow", False)
+        if isinstance(dataflow, str):
+            dataflow = dataflow.strip().lower() in ("1", "true", "yes", "on")
+        if reshapes and rf == 1 and strat == "latency":
             issues.append(
                 f"{layer.name}: Strategy='Latency' with ReuseFactor=1 and a "
-                "Flatten/Reshape downstream is known to produce WRONG RTL "
-                "(bias-only output) while C-simulation passes. Use "
-                "Strategy='Resource' with ReuseFactor>=2."
+                "Flatten/Reshape downstream has produced wrong RTL (bias-only output) "
+                "with earlier versions of these kernels while C-simulation passed. It "
+                "has not been reproduced since, but run an RTL co-simulation before "
+                "relying on it, or use Strategy='Resource'."
             )
         shape = _hex_mac_shape(layer)
+        products = shape[0] * shape[1]
         mac_block = -(-shape[0] // max(rf, 1)) * shape[1]
+        is_2d = len(tuple(layer.mac_weights.shape)) == 3  # not the earlier single-layer 3D export
+        # the Dataflow kernel has one implementation: it does not read the strategy
+        if is_2d and strat == "latency" and rf > 1 and not dataflow:
+            issues.append(
+                f"{layer.name}: Strategy='Latency' with ReuseFactor={rf} pipelines the per-pixel "
+                f"loop and shares its {products} products back onto {mac_block} multipliers. That "
+                "is faster than Strategy='Resource' (about 3x on plain layers at ReuseFactor=4) "
+                "but the sharing is paid in LUT: measured 1.75x on a 64-product layer and 2.7x "
+                "on a 448-product one, and not measured beyond. 'Latency' is hls4ml's default: "
+                "set Strategy='Resource' on this layer (hex_reuse_config does) for the smallest "
+                "hardware."
+            )
         if mac_block > _MAX_MAC_BLOCK:
             issues.append(
                 f"{layer.name}: ReuseFactor={rf} gives MAC_BLOCK={mac_block} "

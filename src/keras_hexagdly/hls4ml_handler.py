@@ -1,6 +1,6 @@
 """hls4ml handler for the line-buffer hex layers.
 
-Call ``register_hex_gather_layers()`` once before converting a model that uses
+Call ``register_hex_gather_layers()`` before converting a model that uses
 strategy="linebuffer".  This registers:
   - KerasV3 layer handlers  (convert the HexConvLineBuffer / HexPoolLineBuffer
     Keras layers into hls4ml IR nodes)
@@ -208,6 +208,17 @@ def _input_precision(node):
     return int(integer), int(width) - int(integer)
 
 
+def _input_signed(node):
+    """Whether the layer's input type is signed, or None when it cannot be read."""
+    try:
+        prec = node.get_input_variable().type.precision
+    except Exception:
+        return None
+    if getattr(prec, "width", None) is None:
+        return None
+    return bool(getattr(prec, "signed", True))
+
+
 def _bias_precision(node):
     """The fixed-point precision of the layer's bias, or None when there is nothing to hold: the
     type cannot be read, or the bias is all zeros (``use_bias=False`` still gives hls4ml a zero
@@ -239,16 +250,36 @@ def _bias_fraction_bits(node):
         return 0
 
 
-def _accum_override(node):
-    """The accumulator type the user set in the layer config (``AccumPrecision``), or None.
+def _layer_option(node, key, default=None):
+    """A key of the hex layers' own (``Dataflow``, ``AccumPrecision``, ``ExactAccumulator``), read
+    from the layer's ``LayerName`` entry, else its ``LayerType`` entry, else ``Model``.
 
-    Read like ``Dataflow`` and ``ParallelizationFactor``: ``config["LayerName"][name]
-    ["AccumPrecision"] = "ap_fixed<W,I>"``. Nodes without a model (stand-alone calls) have none.
+    hls4ml's ``get_layer_config_value`` stops at the first section that has an entry for the
+    layer, and ``config_from_keras_model(granularity="name")`` gives every layer a ``LayerName``
+    entry: a key set at the ``LayerType`` or ``Model`` level was then ignored without a word.
     """
     model = getattr(node, "model", None)
     if model is None:
-        return None
-    value = model.config.get_layer_config_value(node, "AccumPrecision", None)
+        return default
+    value = model.config.get_layer_config_value(node, key, None)
+    if value is None:
+        hls_config = model.config.get_config_value("HLSConfig", None) or {}
+        class_name = getattr(node, "class_name", None)
+        for section in (hls_config.get("LayerType", {}).get(class_name), hls_config.get("Model")):
+            if section and section.get(key) is not None:
+                value = section[key]
+                break
+    return default if value is None else value
+
+
+def _accum_override(node):
+    """The accumulator type the user set in the layer config (``AccumPrecision``), or None.
+
+    ``config["LayerName"][name]["AccumPrecision"] = "ap_fixed<W,I>"``, or the same key in the
+    layer's ``LayerType`` entry or in ``Model`` (see ``_layer_option``). Nodes without a model
+    (stand-alone calls) have none.
+    """
+    value = _layer_option(node, "AccumPrecision")
     return str(value) if value else None
 
 
@@ -260,13 +291,7 @@ def _exact_accumulator(node):
     read here because a layer that has a ``LayerName`` entry does not fall back to the ``Model``
     section for the keys read through ``get_layer_config_value``.
     """
-    model = getattr(node, "model", None)
-    if model is None:
-        return False
-    value = model.config.get_layer_config_value(node, "ExactAccumulator", None)
-    if value is None:
-        section = (model.config.get_config_value("HLSConfig", None) or {}).get("Model", {})
-        value = section.get("ExactAccumulator", False)
+    value = _layer_option(node, "ExactAccumulator", False)
     if isinstance(value, str):  # a config read from text: "False" must not switch it on
         return value.strip().lower() in ("true", "1", "yes", "on")
     return bool(value)
@@ -295,11 +320,12 @@ def _accum_type_str(node, n_terms):
 
     The accumulator is seeded with the bias and sums ``n_terms`` products ``weight * input``:
 
+    * sign: signed unless the weights, the input and the (non-zero) bias are all unsigned;
     * integer bits: those of the weights, plus those of the input (a product of a weight below 4
       and an activation up to 800 reaches 3200, whatever the weight type says), plus
       ceil(log2(n_terms)) for the sum -- or those of the bias if it is wider than that;
-    * fractional bits: the finer of the weights and the input, since the kernel casts the data
-      into the accumulator before multiplying and would otherwise drop its fine bits.
+    * fractional bits: the finer of the weights and the input (the product has the sum of the
+      two; what is beyond the finer one is dropped when it enters the accumulator).
 
     Before 0.6.0 the accumulator was sized from the weight type alone. It overflowed silently as
     soon as the activations were larger than about 1 (the accumulator wraps around, C simulation
@@ -336,16 +362,57 @@ def _accum_type_str(node, n_terms):
         return node.get_weights("mac_weights").type.name
     input_integer, input_fraction = _input_precision(node)
     growth = int(math.ceil(math.log2(max(1, n_terms))))
-    products_integer = integer + input_integer + growth
+    # Signed as soon as one operand is: the weights, the input (assumed signed when its type cannot
+    # be read) or a non-zero bias. The sign used to be that of the weights alone, and unsigned
+    # weights on signed data gave an ap_ufixed accumulator in which every negative sum wrapped.
+    input_signed = _input_signed(node)
+    bias_precision = _bias_precision(node)
+    bias_signed = bias_precision is not None and bool(getattr(bias_precision, "signed", True))
+    signed = bool(signed) or input_signed is not False or bias_signed
+    # weights and input both without a sign bit: the signed accumulator needs one of its own
+    sign_bit = 1 if signed and not getattr(prec, "signed", True) and input_signed is not True else 0
+    products_integer = integer + input_integer + growth + sign_bit
+    # an unsigned bias in a signed accumulator needs a sign bit on top of its own integer bits
+    bias_unsigned = bias_precision is not None and not bias_signed
+    bias_integer = _bias_integer_bits(node) + (1 if signed and bias_unsigned else 0)
     if _exact_accumulator(node):
         # every bit of the products and of the bias is kept, and the bias addition has a carry
-        accum_integer = max(products_integer, _bias_integer_bits(node)) + 1
+        accum_integer = max(products_integer, bias_integer) + 1
         accum_fraction = max((width - integer) + input_fraction, _bias_fraction_bits(node))
     else:
-        accum_integer = max(products_integer, _bias_integer_bits(node))
+        accum_integer = max(products_integer, bias_integer)
         accum_fraction = max(width - integer, input_fraction)
     u = "" if signed else "u"
     return f"ap_{u}fixed<{accum_integer + accum_fraction}, {accum_integer}>"
+
+
+def _ringsum_type_str(node, accum_t_str):
+    """Return the type of a tap and of a ring sum of taps, as they enter the product.
+
+    The input type, widened by ceil(log2(largest ring)) integer bits so that the sum of the taps
+    sharing a weight is exact (no widening without ``share_neighbors``: a ring is then one tap).
+    The kernels used to form these sums in the accumulator type; but that one is sized for the sum
+    of the products, and with small weights (HGQ2's bit-exact flow, ``ExactAccumulator``,
+    ``AccumPrecision``) it is narrower than the data: the taps wrapped before the product and the
+    C simulation differed from Keras.
+
+    Falls back to the accumulator type (the previous behaviour) when the input precision cannot be
+    read, e.g. a type that is not fixed point.
+    """
+    import math
+
+    try:
+        prec = node.get_input_variable().type.precision
+    except Exception:
+        return accum_t_str
+    width, integer = getattr(prec, "width", None), getattr(prec, "integer", None)
+    if width is None or integer is None:
+        return accum_t_str
+    row_map = np.asarray(node.get_attr("row_map_data")).reshape(-1)
+    largest = int(np.bincount(row_map).max()) if row_map.size else 1
+    growth = int(math.ceil(math.log2(max(1, largest))))
+    u = "" if getattr(prec, "signed", True) else "u"
+    return f"ap_{u}fixed<{int(width) + growth}, {int(integer) + growth}>"
 
 
 # ---------------------------------------------------------------------------
@@ -375,13 +442,12 @@ def _is_stream(node):
 def _dataflow(node):
     """True when the layer's hls4ml config asks for the dataflow kernel (key ``Dataflow``).
 
-    Read per layer, from ``config["LayerName"][<layer name>]["Dataflow"]`` (or a ``LayerType``
-    entry); a layer that has a ``LayerName`` entry does not fall back to the ``Model`` section,
-    like every other per-layer key. The dataflow kernel splits the line buffer and the MAC into
-    two concurrent processes: much lower latency, more LUT. It exists for io_stream only, so
-    the flag is ignored (with a warning) under io_parallel.
+    Read from ``config["LayerName"][<layer name>]["Dataflow"]``, else the layer's ``LayerType``
+    entry, else ``config["Model"]["Dataflow"]`` (see ``_layer_option``). The dataflow kernel
+    splits the line buffer and the MAC into two concurrent processes: much lower latency, more
+    LUT. It exists for io_stream only, so the flag is ignored (with a warning) under io_parallel.
     """
-    value = node.model.config.get_layer_config_value(node, "Dataflow", False)
+    value = _layer_option(node, "Dataflow", False)
     if isinstance(value, str):
         value = value.strip().lower() in ("1", "true", "yes", "on")
     if value and not _is_stream(node):
@@ -394,6 +460,28 @@ def _dataflow(node):
         )
         return False
     return bool(value)
+
+
+def _split_frames(shape):
+    """(n_frames, [H, W, C]) of a layer shape: (H, W, C), or (D, H, W, C) for a 3D layer."""
+    shape = [int(v) for v in shape]
+    if len(shape) == 4:
+        return shape[0], shape[1:]
+    return 1, shape
+
+
+def _grid_shape(n_frames, height, width, channels):
+    """The hls4ml shape of a hex layer output: the frame axis only when there are several."""
+    if n_frames > 1:
+        return [n_frames, height, width, channels]
+    return [height, width, channels]
+
+
+def _refuse_frames_in_parallel(node):
+    if node.attributes.get("n_frames", 1) > 1:
+        raise NotImplementedError(
+            f'layer "{node.name}": the 3D hexagonal layers are exported for io_stream only.'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +506,7 @@ class HHexConvLineBuffer(Layer):
         Attribute("out_height"),
         Attribute("out_width"),
         Attribute("stride"),
+        Attribute("n_frames", default=1),  # > 1: the frames of a 3D layer, one after the other
         Attribute("dr_max"),
         Attribute("n_chan"),
         Attribute("n_filt"),
@@ -436,7 +525,9 @@ class HHexConvLineBuffer(Layer):
         # (H, W, C) like hls4ml's own convolutions: io_stream packs C per token (depth H * W), and
         # the layers after this one (a pooling, HGQ2's quantizers) read the image shape from it.
         a = self.attributes
-        self.add_output_variable(shape=[a["out_height"], a["out_width"], a["n_filt"]])
+        self.add_output_variable(
+            shape=_grid_shape(a.get("n_frames", 1), a["out_height"], a["out_width"], a["n_filt"])
+        )
         self.add_weights_variable(name="mac_weights", var_name="w{index}")
         self.add_weights_variable(name="mac_bias", var_name="b{index}")
 
@@ -447,8 +538,9 @@ class HexConvLineBufferHandler(KerasV3LayerHandler):
     def handle(self, layer, in_tensors, out_tensors):
         from keras_hexagdly.indexed import build_parity_offset_tables
 
-        in_shape = list(in_tensors[0].shape[1:])  # (H_in, W_in, Cin)
-        out_shape = list(out_tensors[0].shape[1:])  # (H_out, W_out, Cout)
+        # (H_in, W_in, Cin) -> (H_out, W_out, Cout), with the frames of a 3D layer in front
+        n_frames, in_shape = _split_frames(in_tensors[0].shape[1:])
+        _, out_shape = _split_frames(out_tensors[0].shape[1:])
         H = int(in_shape[0])
         W = int(in_shape[1])
         n_chan = int(in_shape[2])
@@ -459,7 +551,9 @@ class HexConvLineBufferHandler(KerasV3LayerHandler):
 
         nbr = np.asarray(keras_ops_to_numpy(layer.neighbor_idx), dtype=np.int32)
         k = int(nbr.shape[1])
-        off_even, off_odd, rows_resident = build_parity_offset_tables(nbr, W, H_out, W_out, stride)
+        off_even, off_odd, rows_resident = build_parity_offset_tables(
+            nbr, W, H_out, W_out, stride, H_in=H
+        )
         dr_max = int(max(off_even[:, 0].max(), off_odd[:, 0].max()))
 
         w = keras_ops_to_numpy(layer.mac_weights).astype(np.float32).reshape(-1)
@@ -477,6 +571,7 @@ class HexConvLineBufferHandler(KerasV3LayerHandler):
             "out_height": H_out,
             "out_width": W_out,
             "stride": stride,
+            "n_frames": n_frames,
             "dr_max": dr_max,
             "n_chan": n_chan,
             "n_filt": n_filt,
@@ -500,6 +595,7 @@ struct config{index} : nnet::hex_conv_linebuffer_config {{
     static const unsigned out_height = {out_height};
     static const unsigned out_width  = {out_width};
     static const unsigned stride     = {stride};
+    static const unsigned n_frames   = {n_frames};
     static const int      dr_max     = {dr_max};
     static const unsigned n_chan    = {n_chan};
     static const unsigned n_filt    = {n_filt};
@@ -525,6 +621,7 @@ struct config{index} : nnet::hex_conv_linebuffer_config {{
     typedef {mac_weights_t.name} weight_t;
     typedef {mac_bias_t.name}    bias_t;
     typedef {accum_t_str} accum_t;
+    typedef {ringsum_t_str} ringsum_t;
     // Product kernel chosen from the data/weight precisions, exactly as
     // hls4ml does for its own layers (see _product_type).
     template<class x_T, class y_T> using product = nnet::product::{product_type}<x_T, y_T>;
@@ -568,6 +665,7 @@ class HexConvLineBufferConfigTemplate(LayerConfigTemplate):
             "rows_resident",
         ):
             params[a] = node.attributes[a]
+        params["n_frames"] = node.attributes.get("n_frames", 1)
         n_out = node.attributes["out_height"] * node.attributes["out_width"]
         pf = _choose_parallelization(node, n_out)
         params["n_pixels"] = pf
@@ -590,6 +688,7 @@ class HexConvLineBufferConfigTemplate(LayerConfigTemplate):
             )
         n_terms = node.attributes["k"] * node.attributes["n_chan"]
         params["accum_t_str"] = _accum_type_str(node, n_terms)
+        params["ringsum_t_str"] = _ringsum_type_str(node, params["accum_t_str"])
         params["product_type"] = _product_type(node)
         return self.template.format(**params)
 
@@ -616,6 +715,7 @@ class HexConvLineBufferFunctionTemplate(FunctionCallTemplate):
         params["output"] = node.get_output_variable().name
         if _is_stream(node):
             return self.template_stream.format(**params)
+        _refuse_frames_in_parallel(node)
         print(
             f'WARNING: layer "{node.name}" uses the linebuffer strategy under '
             "io_parallel, where a line buffer gives no memory benefit (the gather "
@@ -634,6 +734,7 @@ class HHexPoolLineBuffer(Layer):
         Attribute("out_height"),
         Attribute("out_width"),
         Attribute("stride"),
+        Attribute("n_frames", default=1),  # > 1: the frames of a 3D layer, one after the other
         Attribute("dr_max"),
         Attribute("n_chan"),
         Attribute("k"),
@@ -642,7 +743,9 @@ class HHexPoolLineBuffer(Layer):
 
     def initialize(self):
         a = self.attributes
-        self.add_output_variable(shape=[a["out_height"], a["out_width"], a["n_chan"]])
+        self.add_output_variable(
+            shape=_grid_shape(a.get("n_frames", 1), a["out_height"], a["out_width"], a["n_chan"])
+        )
 
 
 class HexPoolLineBufferHandler(KerasV3LayerHandler):
@@ -651,8 +754,9 @@ class HexPoolLineBufferHandler(KerasV3LayerHandler):
     def handle(self, layer, in_tensors, out_tensors):
         from keras_hexagdly.indexed import build_parity_offset_tables
 
-        in_shape = list(in_tensors[0].shape[1:])  # (H_in, W_in, C)
-        out_shape = list(out_tensors[0].shape[1:])  # (H_out, W_out, C)
+        # (H_in, W_in, C) -> (H_out, W_out, C), with the frames of a 3D layer in front
+        n_frames, in_shape = _split_frames(in_tensors[0].shape[1:])
+        _, out_shape = _split_frames(out_tensors[0].shape[1:])
         H = int(in_shape[0])
         W = int(in_shape[1])
         n_chan = int(in_shape[2])
@@ -662,7 +766,9 @@ class HexPoolLineBufferHandler(KerasV3LayerHandler):
 
         nbr = np.asarray(keras_ops_to_numpy(layer.neighbor_idx), dtype=np.int32)
         k = int(nbr.shape[1])
-        off_even, off_odd, rows_resident = build_parity_offset_tables(nbr, W, H_out, W_out, stride)
+        off_even, off_odd, rows_resident = build_parity_offset_tables(
+            nbr, W, H_out, W_out, stride, H_in=H
+        )
         dr_max = int(max(off_even[:, 0].max(), off_odd[:, 0].max()))
 
         return {
@@ -672,6 +778,7 @@ class HexPoolLineBufferHandler(KerasV3LayerHandler):
             "out_height": H_out,
             "out_width": W_out,
             "stride": stride,
+            "n_frames": n_frames,
             "dr_max": dr_max,
             "n_chan": n_chan,
             "k": k,
@@ -689,6 +796,7 @@ struct config{index} : nnet::hex_pool_linebuffer_config {{
     static const unsigned out_height = {out_height};
     static const unsigned out_width  = {out_width};
     static const unsigned stride     = {stride};
+    static const unsigned n_frames   = {n_frames};
     static const int      dr_max     = {dr_max};
     static const unsigned n_chan     = {n_chan};
     static const unsigned k          = {k};
@@ -733,6 +841,7 @@ class HexPoolLineBufferConfigTemplate(LayerConfigTemplate):
             "rows_resident",
         ):
             params[a] = node.attributes[a]
+        params["n_frames"] = node.attributes.get("n_frames", 1)
         params["indices_vals"] = _int_csv(node.get_attr("indices_data"))
         off_even = node.get_attr("off_even_data")
         off_odd = node.get_attr("off_odd_data")
@@ -762,12 +871,146 @@ class HexPoolLineBufferFunctionTemplate(FunctionCallTemplate):
         params["output"] = node.get_output_variable().name
         if _is_stream(node):
             return self.template_stream.format(**params)
+        _refuse_frames_in_parallel(node)
         print(
             f'WARNING: layer "{node.name}" uses the linebuffer strategy under '
             "io_parallel (no line-buffer benefit); using the frame-buffered pool "
             "kernel. Use io_type='io_stream' for the line-buffer win."
         )
         return self.template.format(**params)
+
+
+# ---------------------------------------------------------------------------
+# Depth stage of the 3D layers (HexDepthStack / HexDepthPool), io_stream only.
+# See nnet_hex_depth_stream.h: a delay line of depth_size - 1 frames in front of
+# the 2D kernel, which then runs on n_frames = n_depth_out frames.
+# ---------------------------------------------------------------------------
+
+
+class _HHexDepth(Layer):
+    _expected_attributes = [
+        Attribute("n_depth_in"),
+        Attribute("n_depth_out"),
+        Attribute("depth_size"),
+        Attribute("depth_stride"),
+        Attribute("pad_front"),
+        Attribute("in_height"),
+        Attribute("in_width"),
+        Attribute("n_chan"),
+    ]
+    _stacks = True  # output channels: depth_size * n_chan (stack) or n_chan (pool)
+
+    def initialize(self):
+        a = self.attributes
+        n_out = a["n_chan"] * (a["depth_size"] if self._stacks else 1)
+        self.add_output_variable(shape=[a["n_depth_out"], a["in_height"], a["in_width"], n_out])
+
+
+class HHexDepthStack(_HHexDepth):
+    """hls4ml IR node for HexDepthStack (depth stage of a Conv3d)."""
+
+
+class HHexDepthPool(_HHexDepth):
+    """hls4ml IR node for HexDepthPool (depth stage of a MaxPool3d)."""
+
+    _stacks = False
+
+
+class HexDepthStackHandler(KerasV3LayerHandler):
+    handles = ("keras_hexagdly.hex_gather.HexDepthStack",)
+    _class_name = "HHexDepthStack"
+
+    def handle(self, layer, in_tensors, out_tensors):
+        d_in, height, width, n_chan = (int(v) for v in in_tensors[0].shape[1:])
+        return {
+            "class_name": self._class_name,
+            "n_depth_in": d_in,
+            "n_depth_out": int(out_tensors[0].shape[1]),
+            "depth_size": int(layer.depth_size),
+            "depth_stride": int(layer.depth_stride),
+            "pad_front": int(getattr(layer, "pad_front", 0)),
+            "in_height": height,
+            "in_width": width,
+            "n_chan": n_chan,
+        }
+
+
+class HexDepthPoolHandler(HexDepthStackHandler):
+    handles = ("keras_hexagdly.hex_gather.HexDepthPool",)
+    _class_name = "HHexDepthPool"
+
+
+hex_depth_config_template = """\
+struct config{index} : nnet::hex_depth_config {{
+    static const unsigned n_depth_in   = {n_depth_in};
+    static const unsigned n_depth_out  = {n_depth_out};
+    static const unsigned depth_size   = {depth_size};
+    static const unsigned depth_stride = {depth_stride};
+    static const unsigned pad_front    = {pad_front};
+    static const unsigned n_pix        = {n_pix};
+    static const unsigned n_chan       = {n_chan};
+}};\n"""
+
+hex_depth_function_template = (
+    "nnet::hex_depth_{kind}_stream<{input_t}, {output_t}, {config}>({input}, {output});"
+)
+hex_depth_include_list = ["nnet_utils/nnet_hex_depth_stream.h"]
+
+
+class _HexDepthConfigTemplate(LayerConfigTemplate):
+    _node_class = None
+
+    def __init__(self):
+        super().__init__(self._node_class)
+        self.template = hex_depth_config_template
+
+    def format(self, node):
+        params = self._default_config_params(node)
+        for a in ("n_depth_in", "n_depth_out", "depth_size", "depth_stride", "pad_front", "n_chan"):
+            params[a] = node.attributes[a]
+        params["n_pix"] = node.attributes["in_height"] * node.attributes["in_width"]
+        return self.template.format(**params)
+
+
+class _HexDepthFunctionTemplate(FunctionCallTemplate):
+    _node_class = None
+    _kind = None
+
+    def __init__(self):
+        super().__init__(self._node_class, include_header=hex_depth_include_list)
+        self.template = hex_depth_function_template
+
+    def format(self, node):
+        if not _is_stream(node):
+            raise NotImplementedError(
+                f'layer "{node.name}": the 3D hexagonal layers are exported for io_stream only.'
+            )
+        return self.template.format(
+            kind=self._kind,
+            config=f"config{node.index}",
+            input_t=node.get_input_variable(node.inputs[0]).type.name,
+            output_t=node.get_output_variable().type.name,
+            input=node.get_input_variable(node.inputs[0]).name,
+            output=node.get_output_variable().name,
+        )
+
+
+class HexDepthStackConfigTemplate(_HexDepthConfigTemplate):
+    _node_class = HHexDepthStack
+
+
+class HexDepthPoolConfigTemplate(_HexDepthConfigTemplate):
+    _node_class = HHexDepthPool
+
+
+class HexDepthStackFunctionTemplate(_HexDepthFunctionTemplate):
+    _node_class = HHexDepthStack
+    _kind = "stack"
+
+
+class HexDepthPoolFunctionTemplate(_HexDepthFunctionTemplate):
+    _node_class = HHexDepthPool
+    _kind = "pool"
 
 
 class HHexPoolLineBuffer3D(Layer):
@@ -811,7 +1054,7 @@ class HexPoolLineBuffer3DHandler(KerasV3LayerHandler):
 
         nbr = np.asarray(keras_ops_to_numpy(layer.neighbor_idx), dtype=np.int32)
         k = int(nbr.shape[1])
-        off_even, off_odd, rows_resident = build_parity_offset_tables(nbr, W, H, W, 1)
+        off_even, off_odd, rows_resident = build_parity_offset_tables(nbr, W, H, W, 1, H_in=H)
         dr_max = int(max(off_even[:, 0].max(), off_odd[:, 0].max()))
 
         return {
@@ -979,7 +1222,7 @@ class HexConvLineBuffer3DHandler(KerasV3LayerHandler):
         nbr = np.asarray(keras_ops_to_numpy(layer.neighbor_idx), dtype=np.int32)
         k = int(nbr.shape[1])
         # 3D linebuffer is hex-stride 1 (spatial output grid == input grid).
-        off_even, off_odd, rows_resident = build_parity_offset_tables(nbr, W, H, W, 1)
+        off_even, off_odd, rows_resident = build_parity_offset_tables(nbr, W, H, W, 1, H_in=H)
 
         w = keras_ops_to_numpy(layer.mac_weights).astype(np.float32).reshape(-1)
         num_weight_rows = int(layer.mac_weights.shape[1])  # (depth, rows, Cin, Cout)
@@ -1039,6 +1282,7 @@ struct config{index} : nnet::hex_conv_linebuffer_3d_config {{
     typedef {mac_weights_t.name} weight_t;
     typedef {mac_bias_t.name}    bias_t;
     typedef {accum_t_str} accum_t;
+    typedef {ringsum_t_str} ringsum_t;
     // Product kernel chosen from the data/weight precisions, exactly as
     // hls4ml does for its own layers (see _product_type).
     template<class x_T, class y_T> using product = nnet::product::{product_type}<x_T, y_T>;
@@ -1097,6 +1341,7 @@ class HexConvLineBuffer3DConfigTemplate(LayerConfigTemplate):
         params["off_odd_vals"] = _int_pairs_csv(node.get_attr("off_odd_data"))
         n_terms = node.attributes["depth_size"] * node.attributes["k"] * node.attributes["n_chan"]
         params["accum_t_str"] = _accum_type_str(node, n_terms)
+        params["ringsum_t_str"] = _ringsum_type_str(node, params["accum_t_str"])
         params["product_type"] = _product_type(node)
         return self.template.format(**params)
 
@@ -1137,6 +1382,7 @@ class HexConvLineBuffer3DFunctionTemplate(FunctionCallTemplate):
 # ---------------------------------------------------------------------------
 
 _registered = False
+_registered_backends = set()
 
 
 def _register_bit_exact_kif():
@@ -1162,13 +1408,16 @@ def _register_bit_exact_kif():
         """The input arrays (kif per input pixel and channel) laid out per output pixel and tap."""
         a = layer.attributes
         n_in, n_chan, k = a["in_height"] * a["in_width"], a["n_chan"], a["k"]
+        frames = a.get("n_frames", 1)
         idx = np.asarray(layer.get_attr("indices_data")).reshape(-1, k)  # (N_out, K), -1 = outside
         valid = idx >= 0
         safe = np.where(valid, idx, 0)
         out = []
         for arr in arrays:
-            g = np.asarray(arr).reshape(n_in, n_chan)[safe]  # (N_out, K, Cin)
-            out.append(np.where(valid[:, :, None], g, 0).astype(np.int16))  # outside = exact zero
+            # (frames * N_out, K, Cin): the frames of a 3D layer are independent images
+            g = np.asarray(arr).reshape(frames, n_in, n_chan)[:, safe]
+            g = np.where(valid[None, :, :, None], g, 0)  # outside = exact zero
+            out.append(g.reshape(frames * idx.shape[0], k, n_chan).astype(np.int16))
         return out
 
     @produce.register(HHexConvLineBuffer)
@@ -1190,7 +1439,7 @@ def _register_bit_exact_kif():
         bias = a["mac_bias"]
         if bias is not None:
             qout = qout + np.asarray(bias.data, dtype=np.float64)
-        shape = (a["out_height"], a["out_width"], n_filt)
+        shape = _grid_shape(a.get("n_frames", 1), a["out_height"], a["out_width"], n_filt)
         return tuple(x.astype(np.int16).reshape(shape) for x in qout.to_kif())
 
     # hls4ml 1.3.0 returns a (1, C) array for the output of a global 2D pooling, one rank too many
@@ -1209,8 +1458,31 @@ def _register_bit_exact_kif():
         k_in, i_in, f_in = (np.asarray(x) for x in bit_exact.get_input_kifs(layer)[0])
         kg, ig, fg = gathered(layer, (k_in, i_in, f_in))  # (N_out, K, C); outside taps count as 0
         a = layer.attributes
-        shape = (a["out_height"], a["out_width"], a["n_chan"])
+        shape = _grid_shape(a.get("n_frames", 1), a["out_height"], a["out_width"], a["n_chan"])
         return tuple(g.max(axis=1).astype(np.int16).reshape(shape) for g in (kg, ig, fg))
+
+    def depth_taps(layer, arr):
+        """(depth_size, D_out, H, W, C): the frames each output frame is made of (0 outside)."""
+        a = layer.attributes
+        dk, ds, front = a["depth_size"], a["depth_stride"], a["pad_front"]
+        d_in, d_out = a["n_depth_in"], a["n_depth_out"]
+        arr = np.asarray(arr).reshape(d_in, a["in_height"], a["in_width"], a["n_chan"])
+        back = max(0, (d_out - 1) * ds + dk - front - d_in)
+        padded = np.pad(arr, [(front, back), (0, 0), (0, 0), (0, 0)])
+        span = (d_out - 1) * ds + 1
+        return np.stack([padded[d : d + span : ds] for d in range(dk)])
+
+    @produce.register(HHexDepthStack)
+    def _(layer):
+        kifs = bit_exact.get_input_kifs(layer)[0]
+        return tuple(
+            np.concatenate(list(depth_taps(layer, x)), axis=-1).astype(np.int16) for x in kifs
+        )
+
+    @produce.register(HHexDepthPool)
+    def _(layer):
+        kifs = bit_exact.get_input_kifs(layer)[0]
+        return tuple(depth_taps(layer, x).max(axis=0).astype(np.int16) for x in kifs)
 
 
 _MIN_HLS4ML = (1, 3, 0)
@@ -1235,35 +1507,111 @@ def _require_hls4ml_version():
         )
 
 
-def register_hex_gather_layers(backend_name="Vivado"):
+def _register_pool_result_precision():
+    """Give the hex max pooling the type of its input when its result type is left to ``auto``.
+
+    hls4ml's ``infer_precision_types`` pass only knows its own layer classes: for any other it
+    falls back to the model default precision. A max pooling returns one of its inputs, so with an
+    input wider than the default (a convolution whose result type was set by hand) the pooled
+    values wrapped silently. hls4ml's own pooling layers get the input type; so do these now.
+    Relies on a private method of that pass: if it is not there, nothing is changed.
+    """
+    try:
+        from hls4ml.model.optimizer import get_optimizer
+
+        opt = get_optimizer("infer_precision_types")
+        infer, matching = opt._infer_precision, opt._infer_output_matching_precision
+    except Exception:
+        return
+    if getattr(opt, "_hex_pool_patched", False):
+        return
+
+    def _infer_precision(node, types_to_infer):
+        # layers that only move or select input values: the result has the input type
+        if node.class_name in (
+            "HHexPoolLineBuffer",
+            "HHexPoolLineBuffer3D",
+            "HHexDepthStack",
+            "HHexDepthPool",
+        ):
+            if "result_t" in types_to_infer:
+                matching(node, ["result_t"])
+                return ["result_t"]
+            return []
+        return infer(node, types_to_infer)
+
+    opt._infer_precision = _infer_precision
+    opt._hex_pool_patched = True
+
+
+_KNOWN_BACKENDS = ("Vivado", "Vitis")
+
+
+def register_hex_gather_layers(backend_name=None):
     """Register the line-buffer hex layers with hls4ml.
 
     Call once before ``hls4ml.converters.convert_from_keras_model`` when the
     model went through ``patch_model_for_hls(..., strategy='linebuffer')`` (the
     default).  Idempotent — safe to call multiple times.
+
+    ``backend_name``: ``"Vivado"``, ``"Vitis"`` or nothing all do the same thing, and cover both
+    backends: the templates go to ``"Vivado"`` (the Vitis flow applies the Vivado templates, so
+    registering them twice only formatted every layer twice) and the kernel sources to both, each
+    backend copying its own. Registering one of the two and converting with the other therefore
+    works. (It used not to: the conversion failed at compile time on a missing
+    ``nnet_hex_conv_linebuffer.h``.) Any other name gets the templates and the sources itself.
     """
     global _registered
-    if _registered:
-        return
-    _require_hls4ml_version()
+    if not _registered:
+        _require_hls4ml_version()
 
-    # Register hls4ml IR layer types
-    hls4ml.model.layers.register_layer("HHexConvLineBuffer", HHexConvLineBuffer)
-    hls4ml.model.layers.register_layer("HHexConvLineBuffer3D", HHexConvLineBuffer3D)
-    hls4ml.model.layers.register_layer("HHexPoolLineBuffer", HHexPoolLineBuffer)
-    hls4ml.model.layers.register_layer("HHexPoolLineBuffer3D", HHexPoolLineBuffer3D)
+        # Register hls4ml IR layer types
+        hls4ml.model.layers.register_layer("HHexConvLineBuffer", HHexConvLineBuffer)
+        hls4ml.model.layers.register_layer("HHexConvLineBuffer3D", HHexConvLineBuffer3D)
+        hls4ml.model.layers.register_layer("HHexPoolLineBuffer", HHexPoolLineBuffer)
+        hls4ml.model.layers.register_layer("HHexPoolLineBuffer3D", HHexPoolLineBuffer3D)
+        hls4ml.model.layers.register_layer("HHexDepthStack", HHexDepthStack)
+        hls4ml.model.layers.register_layer("HHexDepthPool", HHexDepthPool)
 
-    backend = hls4ml.backends.get_backend(backend_name)
+        _register_bit_exact_kif()
+        _register_pool_result_precision()
+        _registered = True
 
-    # Register config + function templates
-    backend.register_template(HexConvLineBufferConfigTemplate)
-    backend.register_template(HexConvLineBufferFunctionTemplate)
-    backend.register_template(HexConvLineBuffer3DConfigTemplate)
-    backend.register_template(HexConvLineBuffer3DFunctionTemplate)
-    backend.register_template(HexPoolLineBufferConfigTemplate)
-    backend.register_template(HexPoolLineBufferFunctionTemplate)
-    backend.register_template(HexPoolLineBuffer3DConfigTemplate)
-    backend.register_template(HexPoolLineBuffer3DFunctionTemplate)
+    known = {name.lower(): name for name in _KNOWN_BACKENDS}
+    if backend_name is None or str(backend_name).lower() in known:
+        template_name, source_names, strict = "Vivado", _KNOWN_BACKENDS, False
+    else:
+        template_name, source_names, strict = backend_name, (backend_name,), True
+
+    for name in dict.fromkeys((template_name, *source_names)):
+        if name in _registered_backends:
+            continue
+        try:
+            backend = hls4ml.backends.get_backend(name)
+        except Exception:
+            if strict:
+                raise
+            continue  # only the backends this hls4ml has
+        _register_backend(backend, templates=(name == template_name))
+        _registered_backends.add(name)
+
+
+def _register_backend(backend, templates=True):
+    """Register the kernel sources of the hex layers with a backend, and the templates if asked."""
+    if templates:
+        # Register config + function templates
+        backend.register_template(HexConvLineBufferConfigTemplate)
+        backend.register_template(HexConvLineBufferFunctionTemplate)
+        backend.register_template(HexConvLineBuffer3DConfigTemplate)
+        backend.register_template(HexConvLineBuffer3DFunctionTemplate)
+        backend.register_template(HexPoolLineBufferConfigTemplate)
+        backend.register_template(HexPoolLineBufferFunctionTemplate)
+        backend.register_template(HexPoolLineBuffer3DConfigTemplate)
+        backend.register_template(HexPoolLineBuffer3DFunctionTemplate)
+        backend.register_template(HexDepthStackConfigTemplate)
+        backend.register_template(HexDepthStackFunctionTemplate)
+        backend.register_template(HexDepthPoolConfigTemplate)
+        backend.register_template(HexDepthPoolFunctionTemplate)
 
     # Register HLS C++ source files (Phase 4 — must exist alongside this file)
     here = Path(__file__).parent
@@ -1276,11 +1624,8 @@ def register_hex_gather_layers(backend_name="Vivado"):
         "nnet_hex_pool_linebuffer_stream.h",
         "nnet_hex_pool_linebuffer_3d.h",
         "nnet_hex_pool_linebuffer_3d_stream.h",
+        "nnet_hex_depth_stream.h",
     ):
         p = here / fname
         if p.exists():
             backend.register_source(p)
-
-    _register_bit_exact_kif()
-
-    _registered = True

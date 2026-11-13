@@ -27,6 +27,11 @@ It also adds functionality that does not exist in upstream HexagDLy:
   limited to `io_stream` and the 2D layers.
 - **`AvgPool2d`**: hexagonal average pooling over the same window as
   `MaxPool2d` (upstream HexagDLy only provides max pooling).
+
+Like HexagDLy, `MaxPool2d` pads the border with zeros (`keras.layers.MaxPool2D`
+ignores the cells outside the grid instead): a window that overlaps the border
+never returns less than 0. Nothing changes after a ReLU; with inputs that can be
+negative the border outputs are clamped at 0. The hls4ml export does the same.
 - **`kernel_size_unit="pixels"`** and `kernel_size`/`pool_size=0`: an
   alternative kernel-size convention and the true 1x1 it needs, [described
   below](#new-kernel_size_unit----reading-kernel_size-as-a-square-kernel-width).
@@ -268,8 +273,8 @@ HGQ2 layer; `patch_model_for_hls` says so otherwise), and, for `io_stream`, one 
 activation quantizers (`homogeneous_axis=(0, 1, 2, 3)`): hls4ml stops on a per-channel or per-element one with
 `Heterogenous quantization for activations is only supported with IOType=io_parallel` (and with the exported
 hex layers those also hit a shape assertion in `io_parallel`, a path that is not validated anyway). The
-weights may have a bit width per element. The 3D layers
-and `QAvgPool2d` have no export. It relies on a private function of hls4ml (`_produce_kif`, in
+weights may have a bit width per element. The 3D layers export the same way (with
+`homogeneous_axis=(0, 1, 2, 3, 4)`); `QAvgPool2d` has no export. It relies on a private function of hls4ml (`_produce_kif`, in
 `optimizer/passes/bit_exact.py`), checked with hls4ml 1.3.0. `tests/test_hls_bit_exact_csim.py` compares
 the C simulation with Keras for a convolution, a max pooling, and a chain with ring sharing, strides and a
 `QDense` head: exactly equal.
@@ -338,8 +343,8 @@ The weight and bias types in `types` are derived from the quantized values thems
 signed `ap_fixed` that holds them exactly, negative integer bits included), the activation types from
 the quantizer parameters. `freeze` works on Sequential and Functional models, with raw operations
 (`+`, `keras.ops.*`), layers called more than once and nested models; `get_config` / `from_config`
-round-trip the quantizers, and the quantized layers are saved/cloned (`clone_model`, `.h5`) with their quantizers. `QAvgPool2d` and the 3D layers
-have no hls4ml export. Mixed precision / half precision is not supported by HGQ2 on the TensorFlow backend (it
+round-trip the quantizers, and the quantized layers are saved/cloned (`clone_model`, `.h5`) with their quantizers. `QAvgPool2d`
+has no hls4ml export. Mixed precision / half precision is not supported by HGQ2 on the TensorFlow backend (it
 works on torch and JAX: the quantizer outputs are cast back to the compute dtype). An activation
 quantizer with a `scaler` or `affine` has no `ap_fixed` type: `freeze(model)` leaves its type out of
 `types`, `freeze(model, activation_quantizers="types")` refuses it. `import keras_hexagdly` imports the
@@ -347,15 +352,15 @@ quantized layers when hgq2 is installed (a saved QAT model needs them registered
 hgq2 `hasattr(keras_hexagdly, "QConv2d")` is simply False.
 
 Only what you give a quantizer is quantized: the other layers of a model, the activations without an
-`oq_conf`, and the bias without a `bq_conf` stay in float. The 3D layers have no hls4ml export yet.
+`oq_conf`, and the bias without a `bq_conf` stay in float.
 A model that also contains HGQ2's own layers (`QDense`, ...) trains fine, counts them in the EBOPs, and
 exports through the bit-exact flow described above.
 
 ### New: same-padded temporal convolution (Conv3d)
 
 ```python
-conv3d = hgly.Conv3d(in_channels, out_channels, kernel_size=(depth_k, hex_k),
-                      depth_padding="same")  # output depth == input depth
+conv3d = hgly.Conv3d(filters, kernel_size=(depth_k, hex_k),
+                     depth_padding="same")  # output depth == input depth
 ```
 
 Before applying these layers, your data must already be arranged on the
@@ -434,31 +439,106 @@ only predicts the RTL while no type overflows: keep the types wide enough.
 
 ### Supported scope
 
-**Only `io_stream` and the 2D layers (`Conv2d`, `MaxPool2d`) are supported for
-now.** That is the combination that is covered by C-simulation and validated by
-RTL co-simulation.
+**`io_stream` is the supported path**, for the 2D layers (`Conv2d`, `MaxPool2d`).
+It is covered by C-simulation and validated by RTL co-simulation. The 3D layers
+(`Conv3d`, `MaxPool3d`) are exported there too, as **experimental**: new in 0.7.1,
+exact in C simulation and co-simulated in RTL on small networks only, with the
+limits listed in the section below.
 
 | | `io_stream` | `io_parallel` |
 |---|---|---|
 | `Conv2d`, `MaxPool2d` | **supported** | not supported |
-| `Conv3d`, `MaxPool3d` | not supported | not supported |
+| `Conv3d`, `MaxPool3d` | **supported (experimental)** | no kernel |
 | `AvgPool2d` | not supported | not supported |
 
-The unsupported paths are not silently wrong -- they raise. `patch_model_for_hls`
-raises `NotImplementedError` on a 3D layer, and `check_hls_config` raises on
-`io_type="io_parallel"`. Both accept `allow_unvalidated=True` if you want to
-experiment with them anyway, but nothing about their numerics or resource usage
-is guaranteed. `AvgPool2d` has no export path at all yet, so
-`patch_model_for_hls` refuses it unconditionally.
+The unsupported paths are not silently wrong -- they raise. `check_hls_config`
+raises on `io_type="io_parallel"` (it accepts `allow_unvalidated=True` if you want
+to experiment with the 2D layers there anyway, with nothing guaranteed), the
+conversion of a 3D layer raises under `io_parallel`, and `AvgPool2d` has no export
+path at all yet, so `patch_model_for_hls` refuses it.
+
+#### 3D layers: a depth stage in front of the 2D kernel
+
+hls4ml has no 3D convolution or pooling of its own (its only route for a
+`keras.layers.Conv3D` is the da4ml fallback, which turns the whole layer into one
+block of combinational logic). The hexagonal 3D layers are exported as two
+kernels in a row:
+
+```
+Conv3d    ->  HexDepthStack  ->  HexConvLineBuffer   (the 2D kernel, run on every output frame)
+MaxPool3d ->  HexDepthPool   ->  HexPoolLineBuffer
+```
+
+A 3D convolution over a depth window and a hex neighbourhood is a 2D hex
+convolution over the `depth_size` frames of the window stacked as channels. The
+depth stage does the stacking: per pixel, it outputs that pixel in each of the
+`depth_size` frames, side by side (or their max, for a pooling -- the max over
+depth and the max over the neighbourhood commute). In hardware it is a delay
+line of `depth_size - 1` frames, addressed by a pixel counter, with no
+arithmetic: the frames a 3D layer combines are `H*W` tokens apart in the stream,
+so this much storage is the least any streamed 3D layer can have. The 2D kernel
+then runs over the output frames one after the other, with the 3D weights laid
+out as `(k, depth_size * in_channels, filters)`.
+
+Everything the 2D kernel does is therefore available in 3D without a line of
+3D-specific arithmetic: any hex stride, depth stride and `depth_padding`,
+`share_neighbors`, `Strategy`, `ReuseFactor`, `Dataflow`, `hex_reuse_config`, the
+accumulator types and the HGQ2 bit-exact flow. The hardware of a 2D model is
+unchanged (same latency, clock and resources, checked on three configurations).
+
+Measured with Vitis HLS 2024.2 at a 4 ns clock, `ap_fixed<24,10>`:
+
+| | latency (cycles) | clock | DSP | FF | LUT | BRAM |
+|---|---|---|---|---|---|---|
+| `Conv3d(4, (3, 1))` on 8 frames of 12x12x4, `Resource`, RF=4, `Dataflow` | 3480 | 3.03 ns | 84 | 33 117 | 21 814 | 22 |
+| of which the depth stage (2 frames of delay) | | 3.03 ns | 0 | 1 635 | 960 | 6 |
+| the same layer, `Resource`, RF=1 (fused kernel) | 1157 | 3.03 ns | 108 | 44 420 | 26 209 | 22 |
+| `MaxPool3d((2, 1), strides=(2, 2))` on 8 frames of 12x12x4 | 1167 | 3.03 ns | 0 | 5 775 | 5 015 | 9 |
+
+A network `Conv3d -> MaxPool3d -> Conv3d (ring-shared, depth_padding="same") ->
+Flatten -> Dense` was co-simulated in RTL in four configurations (`Resource`
+RF=1, `Resource` RF=4 with `Dataflow`, `Latency` RF=1, `Latency` RF=4): the RTL
+gives the C simulation's values each time, and synthesis plus co-simulation take
+about two minutes. (The earlier single-kernel 3D export never finished a
+synthesis.) `tests/test_hex_3d_csim.py` compares the C simulation with Keras.
+
+The depth stage has one memory per frame of delay, the channels of a pixel packed
+in one word. The stream hls4ml puts after it is as deep as the whole output
+(`D_out * H * W` tokens of `depth_size * C` values) and can take more block RAM
+than the delay line itself: hls4ml's FIFO depth optimization (`fifo_opt`) shrinks
+it.
+
+What cannot follow a 3D layer directly, because hls4ml 1.3.0 has nothing for a
+`(D, H, W, C)` tensor: `BatchNormalization` (hls4ml would read its scale and bias
+out of bounds and give wrong values without an error) and `Concatenate`;
+`patch_model_for_hls` refuses both. `Dense` and the global poolings on that
+tensor are refused by hls4ml itself. Activations, `Add`, `Flatten` and `Reshape`
+are fine: reshape to `(D*H, W, C)` or flatten first, or fold the normalization
+into the convolution before it.
 
 A `Conv2d` built with `activation=` keeps it in the exported model: the
 activation is re-applied as a separate `keras.layers.Activation` after the
 layer's replacement.
 
+`Strategy` and `ReuseFactor` of a hex convolution (fused kernel): with `Latency`
+the per-pixel loop is pipelined at `II = ReuseFactor` and the whole MAC is
+unrolled in it; with `Resource` (what `hex_reuse_config` sets) the loop is not
+pipelined and the MAC folds its products over `ReuseFactor` cycles, the smallest
+hardware. At `ReuseFactor=1` both give the same pipeline at II=1. Above 1,
+`Latency` is about three times faster and larger for the same DSP count
+(measured at `ReuseFactor=4`: 1.75x the LUT on a 64-product layer, 2.7x on a
+448-product one, not measured beyond); it is hls4ml's default strategy, so
+`check_hls_config` warns when a hex convolution is left on it. A 3D layer
+follows the same rules: its hex part is the 2D kernel. The max pooling
+has no multiplier: it always runs at II=1, whatever the reuse factor. Its result
+type, when left to hls4ml, is the type of its input.
+
+Small feature maps (3x3, a single column...) are exported like the others.
+
 `hex_reuse_config` matters more than it looks: hls4ml's
 `config_from_keras_model(granularity="name")` writes `ReuseFactor=1` into every
-layer entry it recognises, which overrides the model-level value -- but custom
-layers get no entry and inherit the model-level one instead. Without an explicit
+layer entry it recognises, which overrides the model-level value -- but the entry
+of a custom layer has no `ReuseFactor` and inherits the model-level one instead. Without an explicit
 per-layer setting, a single model ends up mixing two different reuse factors.
 
 ### Accumulator width: `ExactAccumulator`, and the cost against a square layer
@@ -494,8 +574,9 @@ Against the square layer the hex layer has the cost its 7 taps promise: **755 DS
 and a latency of 195 cycles (14 x 13 pixel iterations: the 12x12 image plus the rows and columns that flush
 the pipeline) against 207. The `Dataflow` kernel reaches the same latency
 as the default one on this layer for 2 to 3 times the BRAM (the stream between its two processes), so the
-default is the one to use here; `Dataflow` was designed for larger layers and was not measured with a reuse
-factor above 1.
+default is the one to use here (that measurement predates the shift-register stream it now has, which
+removes that BRAM); `Dataflow` was designed for larger layers. With a reuse factor above 1 its MAC process
+reaches `II = ReuseFactor` (checked on small layers, ring-shared included).
 
 With narrow types the exact accumulator mostly moves work from LUTs to DSPs and flip-flops; with wide
 types it triples the LUTs. The latency and the clock are about the same. These are synthesis estimates,

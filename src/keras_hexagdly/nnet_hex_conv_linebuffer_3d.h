@@ -41,6 +41,7 @@ void hex_lb_pixel_mac_3d(
 ) {
     #pragma HLS INLINE
     typedef typename CONFIG_T::accum_t acc_T;
+    typedef typename CONFIG_T::ringsum_t ring_T;  // taps and ring sums: see ringsum_t
     constexpr unsigned n_rows = CONFIG_T::num_weight_rows;
     constexpr unsigned Cin    = CONFIG_T::n_chan;
     constexpr unsigned Cout   = CONFIG_T::n_filt;
@@ -56,28 +57,28 @@ void hex_lb_pixel_mac_3d(
 DepthTap:
     for (unsigned dd = 0; dd < DK; dd++) {
         #pragma HLS UNROLL
-        acc_T ring_sum[n_rows * Cin];
+        ring_T ring_sum[n_rows * Cin];
         #pragma HLS ARRAY_PARTITION variable=ring_sum complete
         for (unsigned rc = 0; rc < n_rows * Cin; rc++) {
             #pragma HLS UNROLL
-            ring_sum[rc] = (acc_T)0;
+            ring_sum[rc] = (ring_T)0;
         }
         for (unsigned ki = 0; ki < CONFIG_T::k; ki++) {
             #pragma HLS UNROLL
             const unsigned row = CONFIG_T::row_map[ki];
             for (unsigned c = 0; c < Cin; c++) {
                 #pragma HLS UNROLL
-                ring_sum[row * Cin + c] += (acc_T)taps[(dd * CONFIG_T::k + ki) * Cin + c];
+                ring_sum[row * Cin + c] += (ring_T)taps[(dd * CONFIG_T::k + ki) * Cin + c];
             }
         }
         for (unsigned row = 0; row < n_rows; row++) {
             #pragma HLS UNROLL
             for (unsigned c = 0; c < Cin; c++) {
                 #pragma HLS UNROLL
-                const acc_T s = ring_sum[row * Cin + c];
+                const ring_T s = ring_sum[row * Cin + c];
                 for (unsigned o = 0; o < Cout; o++) {
                     #pragma HLS UNROLL
-                    acc[o] += (acc_T)CONFIG_T::template product<acc_T, w_T>::product(
+                    acc[o] += (acc_T)CONFIG_T::template product<ring_T, w_T>::product(
                         s, weights[((dd * n_rows + row) * Cin + c) * Cout + o]);
                 }
             }
@@ -113,6 +114,7 @@ void hex_lb_pixel_mac_3d_reuse(
 ) {
     #pragma HLS INLINE
     typedef typename CONFIG_T::accum_t acc_T;
+    typedef typename CONFIG_T::ringsum_t ring_T;  // taps and ring sums: see ringsum_t
     constexpr unsigned n_rows = CONFIG_T::num_weight_rows;
     constexpr unsigned Cin    = CONFIG_T::n_chan;
     constexpr unsigned Cout   = CONFIG_T::n_filt;
@@ -121,12 +123,12 @@ void hex_lb_pixel_mac_3d_reuse(
     constexpr unsigned RF     = CONFIG_T::reuse_factor;
     constexpr unsigned IN_PER = DIV_ROUNDUP(N_IN, RF);
 
-    acc_T ring_sum[N_IN];
+    ring_T ring_sum[N_IN];
     #pragma HLS ARRAY_PARTITION variable=ring_sum complete
 RingReset3D:
     for (unsigned i = 0; i < N_IN; i++) {
         #pragma HLS UNROLL
-        ring_sum[i] = (acc_T)0;
+        ring_sum[i] = (ring_T)0;
     }
 RingSum3D:
     for (unsigned dd = 0; dd < DK; dd++) {
@@ -137,7 +139,7 @@ RingSum3D:
             for (unsigned c = 0; c < Cin; c++) {
                 #pragma HLS UNROLL
                 ring_sum[(dd * n_rows + row) * Cin + c] +=
-                    (acc_T)taps[(dd * CONFIG_T::k + ki) * Cin + c];
+                    (ring_T)taps[(dd * CONFIG_T::k + ki) * Cin + c];
             }
         }
     }
@@ -154,18 +156,29 @@ ReuseLoop3D:
     for (unsigned ir = 0; ir < RF; ir++) {
         // See the 2D sibling for why rewind is used and what it measured.
         #pragma HLS PIPELINE II=1 rewind
+        // Partial sum per iteration, then one add into acc: see the 2D sibling.
+        acc_T part[Cout];
+        #pragma HLS ARRAY_PARTITION variable=part complete
+        for (unsigned o = 0; o < Cout; o++) {
+            #pragma HLS UNROLL
+            part[o] = (acc_T)0;
+        }
     MultLoop3D:
         for (unsigned j = 0; j < IN_PER; j++) {
             #pragma HLS UNROLL
             const unsigned in_idx = ir * IN_PER + j;
             if (in_idx < N_IN) {  // only bites when RF does not divide N_IN
-                const acc_T s = ring_sum[in_idx];
+                const ring_T s = ring_sum[in_idx];
                 for (unsigned o = 0; o < Cout; o++) {
                     #pragma HLS UNROLL
-                    acc[o] += (acc_T)CONFIG_T::template product<acc_T, w_T>::product(
+                    part[o] += (acc_T)CONFIG_T::template product<ring_T, w_T>::product(
                         s, weights[in_idx * Cout + o]);
                 }
             }
+        }
+        for (unsigned o = 0; o < Cout; o++) {
+            #pragma HLS UNROLL
+            acc[o] += part[o];
         }
     }
 

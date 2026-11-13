@@ -3,6 +3,205 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.1] - 2026-11-13
+
+Fixes from four audits of the code (bugs and performance), with regression tests
+(`tests/test_robustness.py`, and new cases in `tests/test_hex_linebuffer_csim.py`,
+`tests/test_hls_bit_exact_csim.py` and `tests/test_hls_accum_type.py`). What only a Vitis HLS synthesis
+shows (II, clock, area) has no test in the suite; the numbers quoted are from Vitis HLS 2024.2.
+
+### Added
+
+- **hls4ml export of the 3D layers (`Conv3d`, `MaxPool3d`), `io_stream`, experimental.** Exact in C
+  simulation and validated by RTL co-simulation on small networks; listed as "supported (experimental)"
+  in the README.
+  `patch_model_for_hls` used to refuse them (`allow_unvalidated=True` gave a single 3D kernel, hex stride 1
+  and depth stride 1 only, whose synthesis never finished). A 3D layer is now exported as a depth stage
+  followed by the 2D layer: `HexDepthStack` + `HexConvLineBuffer` for a convolution (the frames of each
+  depth window stacked as channels, the 3D kernel laid out as `(k, depth_size * in_channels, filters)`),
+  `HexDepthPool` + `HexPoolLineBuffer` for a max pooling (the max over depth, then over the hex
+  neighbourhood). The depth stage (`nnet_hex_depth_stream.h`) is a delay line of `depth_size - 1` frames,
+  the least a streamed 3D layer can store, with no arithmetic; the 2D kernels gained a frame count
+  (`n_frames`) and run over the output frames one after the other. Any hex stride, depth stride and
+  `depth_padding`, `share_neighbors`, `Strategy`, `ReuseFactor`, `Dataflow`, `hex_reuse_config`, and the
+  HGQ2 bit-exact flow (`QConv3d`, `QMaxPool3d`) are inherited from the 2D kernels. `io_parallel` has no 3D
+  kernel: the conversion raises. `allow_unvalidated` of `patch_model_for_hls` is now ignored.
+  Vitis HLS 2024.2, 4 ns: a network `Conv3d -> MaxPool3d -> Conv3d -> Flatten -> Dense` co-simulated in RTL
+  in four configurations (`Resource` RF=1, `Resource` RF=4 with `Dataflow`, `Latency` RF=1 and RF=4), RTL
+  equal to the C simulation each time, about two minutes for synthesis and co-simulation; a
+  `Conv3d(4, (3, 1))` on 8 frames of 12x12x4 at RF=4 with `Dataflow`: 3480 cycles, 3.03 ns, 84 DSP,
+  33 117 FF, 21 814 LUT, 22 BRAM_18K, of which 6 BRAM, 1 635 FF and 960 LUT for the depth stage. The
+  hardware of a 2D model is unchanged (identical latency, clock and resources on three configurations).
+  A third loop nested over the frames set the clock of the pooling (4.78 ns for 4 frames of 12x12) and
+  held the fused convolution at II=2 with `Resource` at `ReuseFactor=1` (714 cycles where `Latency` took
+  361): with several frames both kernels run as one flat loop with narrow counters (3.03 ns; 365 cycles).
+  `patch_model_for_hls` refuses a `BatchNormalization` or a `Concatenate` applied to the `(D, H, W, C)`
+  output of a 3D layer: hls4ml 1.3.0 reads the scale and bias of the first out of bounds there (wrong
+  values, no error) and has no kernel for the second. `check_hls_config` refuses a 3D model under
+  `io_parallel`. `apply_quantized_types` puts the input type of a 3D layer on what feeds its depth stage
+  (so the delay line stores the quantized frames) and no longer gives a max pooling without an output
+  quantizer the wide type (it keeps the type of its input; 2D too). Tests: `tests/test_hex_3d_export.py`
+  (Keras), `tests/test_hex_3d_csim.py` and a 3D case in `tests/test_hls_bit_exact_csim.py` (C simulation).
+  `HexConvLineBuffer3D` / `HexPoolLineBuffer3D` and their kernels are no longer produced; they stay in the
+  package so that a model saved with them still loads.
+
+### Fixed
+
+- **hls4ml export: the hex convolution wrapped around with small weights and full-range inputs.** The MAC
+  cast each tap, and each ring sum of taps, into the accumulator type before multiplying. That type is
+  sized for the sum of the products `w * x`; with small weights (HGQ2's bit-exact flow, `ExactAccumulator`,
+  `AccumPrecision`) it is narrower than the data, the tap wrapped and the wrapped value was multiplied: the
+  C simulation differed from Keras (846 values of 1056 on a ring-shared `QConv2d` with weights 0.5 / -0.25
+  and inputs up to 3.9, off by up to 4; the tests used inputs in [0, 1]). The taps and ring sums now have
+  their own type (`ringsum_t`: the input type plus `ceil(log2(largest ring))` integer bits), the product is
+  taken at full precision and only the product enters the accumulator. Results are unchanged wherever
+  nothing wrapped, with one exception: an `AccumPrecision` with fewer fractional bits than the input used
+  to truncate each tap before the product and now truncates the product, which can differ by one LSB of
+  the accumulator. 2D and 3D kernels, `io_stream` and `io_parallel`.
+- **hls4ml export: the accumulator took its sign from the weight type alone.** Unsigned weights on signed
+  data (or with a negative bias) gave an `ap_ufixed` accumulator in which every negative sum wrapped (137
+  outputs of 320 wrong on a layer with `ap_ufixed<8,1>` weights and a wider result type). It is now signed
+  unless the weights, the input and the bias are all unsigned, and an unsigned bias gets its sign bit in a
+  signed accumulator (a bias of 12 typed `ap_ufixed<8,4>` came out as -4).
+- **hls4ml export: the `Dataflow` convolution missed its II with a `ReuseFactor` above 1.** The cap on
+  the adders of its MAC process was the number of multipliers, which left no adder for the per-cycle
+  accumulation nor for the ring sums of a `share_neighbors` layer: Vitis scheduled II=15 for a target of 4
+  on a ring-shared kernel-2 layer (1221 cycles for 81 pixels) and 3 for 2 on a plain one, without an error.
+  The cap now counts every addition of a pixel (`hex_lb_add_budget`): both reach their II (1223 -> 335
+  cycles for the test project). The same budget replaces the cap of the fused `Latency` variant.
+- **hls4ml export: `Dataflow`, `AccumPrecision` and `ExactAccumulator` set in `config["Model"]` or in a
+  `LayerType` entry were ignored** whenever the layer had a `LayerName` entry, which
+  `config_from_keras_model(granularity="name")` gives every layer. They are now read from the layer's
+  entry, else its type's, else the model's. `check_hls_config` reads `LayerType` entries too.
+- `patch_model_for_hls`: a model nested in the model raised an error that blamed a shared layer; it now
+  says nested models are not supported. A subclass of a hex layer went through unpatched without a word;
+  it is now replaced like its base class.
+- A hex convolution called on another number of channels than it was built for ran a grouped convolution
+  on the mismatched kernel, without an error; it is now refused, like `keras.layers.Conv2D` does, and so is
+  an input of the wrong rank. `filters` must be a positive integer. A 3D layer with fewer frames than its
+  depth size raises a `ValueError` (it returned an empty tensor on TensorFlow and JAX).
+- `Conv2d_CustomKernel` / `Conv3d_CustomKernel`: `layer.trainable = False` was lost by
+  `from_config(get_config())`.
+- `build_parity_offset_tables` checks the offsets against the whole neighbour table, border included, on
+  every grid (it did on small grids only).
+- **The neighbour table was wrong under a `mixed_float16` policy** on grids of more than 2048 pixels
+  (`build_neighbor_table` carries pixel indices as values through a probe layer, which followed the global
+  policy), and so was the model `patch_model_for_hls` built from it, without any error. The probe is now
+  float32 whatever the policy (as is the one behind `share_neighbors="ring"`).
+- **hls4ml export: the result type of the hex max pooling**, when left to hls4ml (`auto`), was the model
+  default precision instead of the type of its input: after a layer with a wider result type the pooled
+  values wrapped silently. It now takes the input type, like hls4ml's own pooling layers.
+- **hls4ml export: small grids** (no fully-interior output pixel of each column parity: 3x3 at kernel
+  size 1, 5x5 at kernel size 2, a single output column...) stopped the conversion with "Grid too small".
+  The tap offsets do not depend on the grid: they are then measured on a larger virtual grid and checked
+  against the real neighbour table.
+- **`register_hex_gather_layers()`** registered the templates and kernel sources with one backend only,
+  the first one asked for (default `"Vivado"`): a later `register_hex_gather_layers("Vitis")` did nothing
+  and the conversion failed on a missing header. Any of `"Vivado"`, `"Vitis"` or nothing now covers both:
+  the kernel sources go to both backends and the templates to `"Vivado"` only (the Vitis flow applies
+  them too; registered twice, every layer was formatted twice and its warnings printed twice).
+- **`Conv2d`, `Conv3d` and their quantized versions could not be built inside a traced function** on
+  TensorFlow and JAX: a `keras.Sequential` without an `Input`, built by its first `fit`, failed. `build`
+  drew the initial values itself and converted them to NumPy, which a symbolic tensor does not allow, and
+  kept the ring maps of a shared layer as backend tensors tied to that trace. The weights now have a real
+  initializer (He-normal scaled by the fan-in of the whole hex kernel, as before) and the ring maps stay
+  NumPy arrays. **The initial values for a given seed are not the ones of 0.7.0** (same distribution;
+  each weight has its own draw instead of a slice of a common one). `keras.utils.set_random_seed` still
+  makes them reproducible.
+- **Max pooling on TensorFlow: the gradient at ties.** Where several cells of a window hold the maximum
+  (zeros after a ReLU, the zero padding), `tf.maximum` gave the whole gradient to one of them; torch and
+  JAX share it. The three backends now share it (`MaxPool2d`, `MaxPool3d`): same values, and the same
+  gradients everywhere. Training a model with max pooling on TensorFlow can give slightly different
+  weights than with 0.7.0.
+- `Conv2d_CustomKernel` / `Conv3d_CustomKernel` check their input like the other layers: a wrong rank, an
+  unknown grid size or another channel count than the kernels' is a `ValueError` (the backend ran a
+  grouped convolution on the mismatched kernel, silently), and sub-kernels that disagree on their
+  channels are refused. Their kernels take the dtype of the layer: with `dtype="float64"` they were
+  float32 and the first call failed.
+- A max pooling under a float64 policy returned float32 on torch (`keras.ops.maximum` of two float64
+  tensors, Keras 3.12).
+- The hex layers have a `compute_output_shape`: `keras.layers.TimeDistributed` (and whatever else asks
+  for the shape without calling the layer) works on them.
+- `weight_maps_2d` / `ring_maps_2d` return copies: writing into the returned arrays changed the sharing
+  of every layer built afterwards.
+- `load_torch_state_dict`: a `Dense` of a subclassed model (no functional graph to read) was loaded
+  transposed only, without a word, also after a `Flatten` of a tensor with channels, where that is wrong.
+  It now warns and says what to do. A `bias` in the state dict for a `Dense` or `Conv2D` built with
+  `use_bias=False` is an error, as it already was for the hex layers.
+- `notebooks/hexplot.py`: the picture of an unshared (or `"sym"`) kernel was turned by 180 degrees (the
+  cell drawn above the centre held the weight applied to the cell below); it now shows each weight on the
+  neighbour it applies to. `kernel_to_hextensor` works on a `Conv2d_CustomKernel`. `plot_hextensor` set
+  the axis limits from the wrong dimensions (a grid much wider than tall was cut).
+- README: the `Conv3d` example of the same-padding section passed `in_channels` (a `TypeError`).
+- `load_torch_state_dict`: a `Dense` that reads a flattened tensor was loaded with a plain transpose,
+  although PyTorch flattens `(C, ...)` and Keras `(..., C)`: no error, a wrong model. The input features
+  are now reordered, for a `Flatten` (or a `Reshape` to a vector) of a tensor of any rank, also behind
+  layers that keep the shape (`Dropout`, an activation, a second `Flatten`...), inside or after a nested
+  model, and when the flattened features are concatenated with other vectors (only their columns move). The new argument
+  `flatten_order="channels_last"` turns it off, for a PyTorch model that permutes to channels-last itself
+  before flattening. `verify_against` warns when the PyTorch model is in training mode.
+- The line-buffer layers `patch_model_for_hls` builds masked the out-of-grid taps by a product with 0:
+  a non-finite value at pixel 0 (the placeholder those taps read) became NaN on every border output
+  (`inf * 0`). They are now selected out.
+- NumPy integers (`np.int64(1)`...) are accepted for `kernel_size`, `pool_size` and `strides` (an integer
+  array for the 3D pairs), and stored as plain ints, like `filters`.
+- Too few rows for the stride (e.g. one row at `strides=2`) is a `ValueError` that says so, instead of a
+  backend concatenation error (the `assert` guarding it was off by one).
+- The pooling layers on a dynamic spatial dimension raise the same clear `ValueError` as the convolutions.
+- `notebooks/hexplot.py`: `kernel_to_hextensor` showed `relu(w + b) - b` instead of the weights for a
+  `strides=1` layer with a fused activation, and weights re-quantized at 8 bits for a `QConv2d` (it now
+  shows the layer's quantized weights, ring-shared layers included). A weight that is exactly 0 (pruned)
+  was left out of the picture, and a fully pruned kernel raised an error: the footprint is now the
+  kernel's geometry.
+
+### Changed
+
+- **hls4ml export: `Strategy` now does what the documentation says for the fused `io_stream` convolution.**
+  The `#pragma HLS PIPELINE` selected by the strategy sat inside an `if`, where Vitis HLS ignores it
+  (warning HLS 207-5575): `Latency` and `Resource` gave the same hardware, never explicitly pipelined. The
+  loop now exists in versions chosen at compile time. `Latency` pipelines the per-pixel loop at
+  `II = ReuseFactor`; `Resource` is what both were before. At `ReuseFactor=1` nothing changes. **A model
+  exported with `Strategy="Latency"` and `ReuseFactor > 1` gets different hardware than before**: faster
+  (about three times on the two layers below), and larger. Measured at `ReuseFactor=4` against `Resource`, same DSP count: 735
+  cycles instead of 2214 for 1.75x the LUT on a 12x12, 4->4 layer (64 products); 369 instead of 1105 for
+  2.7x the LUT on an 8x8, 8->8 one (448 products); not measured beyond. Use `Resource` (what
+  `hex_reuse_config` sets) to keep the previous hardware; `check_hls_config` now says so for every hex
+  convolution left on `Latency` with a `ReuseFactor` above 1 (`Latency` is hls4ml's default). In that
+  variant the additions are capped like the multiplications: without it Vitis was still scheduling the
+  448-product layer after 7 minutes and 11.6 GB (39 s and 0.5 GB with it). The window process of the
+  `Dataflow` kernel is always at II=1. The 3D stream kernel is never pipelined, whatever the strategy: the
+  ignored pragma is removed and the header says so.
+- hls4ml export: the max pooling kernels are pipelined at II=1 instead of `II = ReuseFactor`. They have no
+  multiplier, and inheriting the model-level `ReuseFactor` only slowed them down (228 cycles instead of 62
+  on a 6x6x4 pooling at `ReuseFactor=4`). The `io_stream` 2D kernel derives the output row and column from
+  the loop indices instead of counting them: the counters were a loop-carried path that set the clock at
+  II=1 (estimated 3.57 ns on an 8x8x2 pooling, against 4.57 ns with them).
+- hls4ml export, `io_stream` kernels with a stride that is not a power of two: the traversal no longer
+  divides by the stride (Vitis built dividers: at stride 3, a window process 39 stages deep with 4 DSP and
+  5018 FF, now 6 stages, 0 DSP and 1317 FF, 140 -> 106 cycles). Same values.
+- hls4ml export, `Dataflow` convolution: the stream between its two processes is held in shift registers
+  instead of block RAM (Vitis HLS; it took one BRAM per 18 bits of width whatever the depth), and the
+  window process counts rows and columns in counters of the width they need (estimated clock 3.46 ->
+  3.05 ns at a 4 ns target).
+  On a 19x14 model with two ring-shared `QConv2d` (8 -> 16 and 16 -> 32 channels): 331 -> 236 BRAM_18K
+  for the same latency (353 cycles), and RTL co-simulation equal to the C simulation. The LUTs of the
+  shift registers (about one per bit of stream width) are not in the HLS estimate.
+- `check_hls_config`: the warning about `Strategy="Latency"` with `ReuseFactor=1` before a
+  `Flatten`/`Reshape` no longer calls the RTL wrong: the failure was seen with earlier kernels and both
+  cases tried now co-simulate correctly. It asks for a co-simulation instead. No warning about `Latency`
+  for a `Dataflow` layer, which has a single implementation.
+- hls4ml export: the folded MAC sums the products of a cycle on their own and adds them to the accumulator
+  once, so the loop-carried path is a single adder (a `ReuseFactor` that does not divide the number of ring
+  sums left a chain of adders and selects there, which missed timing). `recommended_reuse_factor` prefers a
+  nearby divisor of the number of ring sums (at most twice the smallest factor that fits: fewer
+  multipliers, up to twice the latency of that layer).
+- `AvgPool2d` computes the number of in-grid cells of its windows once per grid instead of at every call
+  (1.4x to 2x faster in eager mode). Under `jax.jit` the result can differ from before by one unit in
+  the last place (the count is now a constant).
+- `share_neighbors="ring"`: the ring maps come from one probe per kernel size instead of one per cell
+  (5.4 s -> 0.13 s at kernel size 5, in the layer's constructor). `build_neighbor_table` is vectorised.
+- `MaxPool2d` pads the border with zeros (inherited from HexagDLy): now documented.
+
 ## [0.7.0] - 2026-10-26
 
 ### Added

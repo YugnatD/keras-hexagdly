@@ -103,7 +103,7 @@ investigated: a mean needs one accumulator per channel, and whether hls4ml's `gl
 that cheap in this pipeline is not known. A sum (`QSum`) with the factor 1/(number of pixels) absorbed into the weights of
 the next dense layer is the first thing to try; a dedicated kernel in this library is the other.
 
-**Remaining.** The 3D layers (no export), and the dependence on a private function of hls4ml (`_produce_kif`): a version check or a test
+**Remaining.** The dependence on a private function of hls4ml (`_produce_kif`): a version check or a test
 against new hls4ml releases. Checked exact in the C simulation: default settings, `hex_reuse_config`,
 `ReuseFactor=4` with `Strategy='Resource'`, and the `Dataflow` kernel.
 
@@ -149,9 +149,13 @@ is what the quantization notebook does in six cells.
   types). It keeps a structural cost: BRAM (33, 51 and 78 for the narrow, mid and wide types, against 14, 19
   and 28 for the fused kernel), because of the stream between its two processes. Its reuse-factor > 1
   behaviour was not re-measured after the changes.
-* **3D kernels** (`nnet_hex_conv_linebuffer_3d_stream.h`, `nnet_hex_pool_linebuffer_3d_stream.h`) carry a
-  similar emit counter (`cur_emit_p`) but have a different structure (whole frames are buffered). They were
-  not looked at, and their export is not a validated path.
+* **3D layers** (0.7.1): exported as a depth stage (`nnet_hex_depth_stream.h`) in front of the 2D kernels,
+  `io_stream` only, experimental (see the README). Open: the one-row emission lag of the 2D kernels is not
+  needed (about 7 % of the cycles and 12 % of the FF of a pooling, measured, not co-simulated), the FIFO
+  hls4ml puts after the depth stage is large without `fifo_opt`, heterogeneous per-channel quantizers are
+  untested in 3D, and `BatchNormalization` / `Concatenate` on a `(D, H, W, C)` tensor are refused because
+  hls4ml 1.3.0 mishandles them. The former whole-frame kernels (`nnet_hex_*_linebuffer_3d_stream.h`) are no
+  longer produced and stay only so that old models load.
 * **Mixed precision** is not supported by HGQ2 on the TensorFlow backend.
 * **ReLU in hls4ml 1.3**: a `keras.layers.ReLU` becomes `nnet::thresholded_relu` with a threshold of type
   `ap_ufixed<2,32>` (the bit-exact flow's fallback for a zero parameter); the comparison `in > theta` is then true

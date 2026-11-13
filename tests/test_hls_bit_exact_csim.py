@@ -272,3 +272,83 @@ def test_the_exported_hex_nodes_have_an_image_shaped_output(tmp_path):
         "p1_linebuffer": (6, 6, 6),
         "c2_linebuffer": (3, 3, 5),
     }
+
+
+def _small_weight_layer(share, assign):
+    inp = keras.Input((H, W, 1), name="x")
+    layer = hgly.QConv2d(
+        2, kernel_size=1, share_neighbors=share, name="c1", kq_conf=weights(8, 1),
+        bq_conf=weights(8, 3), iq_conf=act(2, 3, 0),
+    )  # fmt: skip
+    model = keras.Model(inp, keras.layers.Flatten(name="flat")(layer(inp)))
+    assign(layer)
+    layer.bias_tensor.assign(np.zeros((2,), "float32"))
+    return model
+
+
+def _full_range_equals_keras(tmp_path, model):
+    """Like converted_equals_keras, with inputs over the whole range of the input quantizer."""
+    x = np.random.default_rng(0).uniform(0, 3.9, (4, H, W, 1)).astype("float32")
+    reference = keras.ops.convert_to_numpy(model(x))
+    frozen, _ = hgly.freeze(model)
+    register_hex_gather_layers("Vitis")
+    patched = patch_model_for_hls(frozen)
+    config = hls4ml.utils.config_from_keras_model(patched, granularity="name", backend="Vitis")
+    hls_model = hls4ml.converters.convert_from_keras_model(
+        patched, hls_config=config, io_type="io_stream", backend="Vitis",
+        output_dir=str(tmp_path / "prj"), part="xc7vx485tffg1927-2", clock_period=5,
+    )  # fmt: skip
+    hls_model.compile()
+    return hls_model.predict(np.ascontiguousarray(x)).reshape(reference.shape), reference
+
+
+def test_small_ring_weights_with_full_range_inputs_are_exact(tmp_path):
+    """The accumulator is sized for the sum of the products; with small weights it is narrower than
+    a ring sum of the inputs. The kernel formed that sum in the accumulator type: it wrapped before
+    the product (846 wrong values of 1056 here, off by up to 4)."""
+
+    def assign(layer):
+        rings = np.zeros(layer.ring_weights.shape, "float32")
+        rings[0], rings[1] = 0.5, -0.25
+        layer.ring_weights.assign(rings)
+
+    simulated, reference = _full_range_equals_keras(tmp_path, _small_weight_layer(True, assign))
+    np.testing.assert_array_equal(simulated, reference)
+
+
+def test_tiny_weights_with_full_range_inputs_are_exact(tmp_path):
+    """Same without weight sharing: a single input already exceeded the accumulator."""
+
+    def assign(layer):
+        rng = np.random.default_rng(1)
+        for kernel in layer._base_kernels:
+            kernel.assign(rng.choice([-0.0625, 0.0625, 0.03125], kernel.shape).astype("float32"))
+
+    simulated, reference = _full_range_equals_keras(tmp_path, _small_weight_layer(False, assign))
+    np.testing.assert_array_equal(simulated, reference)
+
+
+AXES_3D = (0, 1, 2, 3, 4)
+
+
+@pytest.mark.parametrize("tweak", [None, with_dataflow], ids=["defaults", "dataflow"])
+def test_quantized_3d_layers_and_an_hgq2_dense_head_export_together(tmp_path, tweak):
+    """The 3D layers take part in the bit-exact flow through their two exported stages: the depth
+    stage hands on the precision of the frames it stacks (or pools), the 2D layer does the rest."""
+    inp = keras.Input((5, 8, 7, 2), name="x")
+    x = hgly.QConv3d(
+        4, kernel_size=(2, 1), share_neighbors=True, activation="relu", name="c1",
+        kq_conf=weights(), bq_conf=weights(7, 2), iq_conf=act(2, 3, 0, AXES_3D),
+        oq_conf=act(3, 3, 0, AXES_3D),
+    )(inp)  # fmt: skip
+    x = hgly.QMaxPool3d(
+        kernel_size=(2, 1), strides=(2, 2), name="p1", iq_conf=act(3, 3, 0, AXES_3D),
+        oq_conf=act(3, 3, 0, AXES_3D),
+    )(x)  # fmt: skip
+    x = hgly.QConv3d(
+        3, kernel_size=(2, 1), depth_padding="same", activation="relu", name="c2",
+        kq_conf=weights(), iq_conf=act(3, 3, 0, AXES_3D), oq_conf=act(4, 2, 0, AXES_3D),
+    )(x)  # fmt: skip
+    model = keras.Model(inp, head()(keras.layers.Flatten(name="flat")(x)))
+    simulated, reference = converted_equals_keras(tmp_path, model, tweak)
+    np.testing.assert_array_equal(simulated, reference)

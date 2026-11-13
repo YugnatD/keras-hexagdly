@@ -61,8 +61,9 @@
 // ceiling sooner. The same treatment is now applied here:
 //   * hex_lb_pixel_mac_3d_reuse folds the products over reuse_factor cycles
 //     (only ceil(n_in/RF)*n_filt exist in hardware, n_in = DK*rows*n_chan);
-//   * the per-pixel loop is pipelined only under strategy='latency', so the
-//     reuse loop survives under 'resource';
+//   * the per-pixel loop is never pipelined, whatever the strategy, so the
+//     reuse loop survives: 'Latency' and 'Resource' give the same folded
+//     hardware here (unlike the 2D kernel, which pipelines under 'latency');
 //   * an ALLOCATION cap stops Vitis re-replicating the folded multipliers.
 // On the 2D layer this turned a synthesis that never finished into 3m11s at
 // 17% LUT. The 3D path has NOT yet been re-benchmarked at scale -- the
@@ -73,10 +74,9 @@
 //
 // Corresponds to the HexConvLineBuffer3D Keras layer (hex_gather.py).
 //
-// KNOWN LIMITATION (RTL correctness, io_stream + Strategy='Latency'+RF=1 +
-// a downstream repack_stream layer such as Flatten): see the detailed note
-// in nnet_hex_conv_linebuffer_stream.h (the 2D sibling). Workaround:
-// Strategy='Resource' with ReuseFactor>=2.
+// RTL correctness with Strategy='Latency' + ReuseFactor=1 on the hex convolutions
+// and a downstream repack_stream layer such as Flatten: see the historical note in
+// nnet_hex_conv_linebuffer_stream.h (not reproduced with the current kernels).
 
 namespace nnet {
 
@@ -215,12 +215,13 @@ ReadFrames:
     for (int r = 0; r < R_TOTAL; r++) {
     ReadFramePixels:
         for (unsigned p = 0; p < N; p++) {
-            // See the 2D kernel: pipelining here would swallow the MAC's
-            // reuse loop and re-unroll every product, which is exactly what
-            // made this kernel unschedulable at realistic sizes.
-            if (CONFIG_T::strategy == nnet::latency) {
-                #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-            }
+            // Not pipelined, whatever CONFIG_T::strategy: pipelining here would
+            // swallow the MAC's reuse loop and re-unroll every product, which is
+            // exactly what made this kernel unschedulable at realistic sizes.
+            // (A `PIPELINE` pragma used to sit here inside `if (strategy ==
+            // latency)`; Vitis ignores a pragma in an `if` -- HLS 207-5575 -- so
+            // it never had any effect. The 3D path has not been benchmarked
+            // pipelined, so it stays as measured.)
             if (r < D_in) {
                 data_T tok = input.read();
                 const unsigned fslot = ((unsigned)r) % DKBUF;
