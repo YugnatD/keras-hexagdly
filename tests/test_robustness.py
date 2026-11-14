@@ -280,8 +280,8 @@ def test_the_wrong_rtl_warning_is_for_latency_only():
 def test_latency_with_a_reuse_factor_says_what_it_costs():
     """'Latency' is the hls4ml default and now really pipelines the 2D kernel."""
     issues = _checked_config("Latency", 2, flatten=False)
-    assert any("pipelines" in issue and "Strategy='Resource'" in issue for issue in issues)
-    assert not any("pipelines" in issue for issue in _checked_config("Latency", 1))
+    assert any("pipelined loop" in issue and "Strategy='Resource'" in issue for issue in issues)
+    assert not any("pipelined loop" in issue for issue in _checked_config("Latency", 1))
 
 
 def test_check_hls_config_reads_layer_type_entries_and_knows_the_dataflow_kernel():
@@ -291,7 +291,7 @@ def test_check_hls_config_reads_layer_type_entries_and_knows_the_dataflow_kernel
     inputs = keras.Input((6, 6, 4))
     patched = patch_model_for_hls(keras.Model(inputs, hgly.Conv2d(4, 1, name="conv")(inputs)))
     by_type = {"LayerType": {"HHexConvLineBuffer": {"Strategy": "Latency", "ReuseFactor": 4}}}
-    with pytest.warns(UserWarning, match="pipelines"):
+    with pytest.warns(UserWarning, match="pipelined loop"):
         assert check_hls_config(by_type, patched)
     # the Dataflow kernel has a single implementation, whatever the strategy
     dataflow = {"Model": {"Strategy": "Latency", "ReuseFactor": 2, "Dataflow": True}}

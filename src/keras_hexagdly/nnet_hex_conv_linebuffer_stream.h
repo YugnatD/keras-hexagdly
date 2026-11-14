@@ -28,14 +28,14 @@
 //
 // How that loop is scheduled depends on CONFIG_T::strategy, exactly as in
 // hls4ml's native kernel:
-//   latency  -- the loop is pipelined at II=reuse_factor and the whole MAC is
-//               unrolled inside it: one pixel every reuse_factor cycles. With
-//               reuse_factor > 1 the products and the additions are shared
-//               back onto n_in*n_out/reuse_factor operators by ALLOCATION caps
-//               (see hex_lb_fused_loop), but the multiplexing this needs is
-//               paid in LUTs. Measured against 'resource' at reuse_factor 4,
-//               for a third of the latency: 1.75x the LUT on a 12x12, 4->4
-//               layer (64 products), 2.7x on an 8x8, 8->8 one (448 products).
+//   latency  -- reuse_factor 1: the loop is pipelined at II=1 with the whole MAC
+//               unrolled inside it, one pixel per cycle. reuse_factor > 1: one
+//               loop pipelined at II=1 in which a pixel that is emitted takes
+//               reuse_factor iterations, one block of products each
+//               (hex_lb_fused_folded). Until 0.7.1 that case was pipelined at
+//               II=reuse_factor with ALLOCATION caps that left the sharing to
+//               Vitis: it did not meet timing after logic synthesis (60 ns for a
+//               4 ns target on a three-layer network at reuse_factor 8).
 //   resource -- the loop is NOT pipelined, so the inlined emit body keeps its
 //               MAC's own reuse loop and only n_in*n_out/reuse_factor
 //               products exist in hardware: the smallest hardware, about
@@ -191,29 +191,20 @@ TapGather:
     output.write(tok);
 }
 
-// One iteration (r, c) of the fused traversal: read a pixel, advance the line
-// buffer and the window, emit the output pixel the window now holds (if any).
-// INLINE: it is the body of the loop in hex_lb_fused_loop below, which exists in
-// three versions that differ only by their pragmas.
-template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
-void hex_lb_fused_step(
+// Steps 1 and 2 of a traversal iteration: read the pixel at (r, c) (zero on the virtual rows and
+// columns), push it down the line buffers and slide the window by one column. INLINE: part of the
+// loop body of every fused variant.
+template <class data_T, typename CONFIG_T>
+void hex_lb_window_step(
     int r, int c,
     hls::stream<data_T> &input,
     ap_shift_reg<typename data_T::value_type, (int)CONFIG_T::in_width + CONFIG_T::dc_max>
         line_sr[CONFIG_T::rows_resident + 1][CONFIG_T::n_chan],
-    typename data_T::value_type win[CONFIG_T::rows_resident + 2][CONFIG_T::col_span][CONFIG_T::n_chan],
-    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
-    b_T bias[CONFIG_T::n_filt],
-    hls::stream<res_T> &output
+    typename data_T::value_type win[CONFIG_T::rows_resident + 2][CONFIG_T::col_span][CONFIG_T::n_chan]
 ) {
     #pragma HLS INLINE
     constexpr int      H     = (int)CONFIG_T::in_height;
     constexpr int      W     = (int)CONFIG_T::in_width;
-    constexpr int      W_OUT = (int)CONFIG_T::out_width;
-    constexpr int      S     = (int)CONFIG_T::stride;
-    constexpr int      DRMAX = CONFIG_T::dr_max;
-    constexpr int      DCMAX = CONFIG_T::dc_max;
-    constexpr int      OH    = (int)CONFIG_T::out_height;
     constexpr int      CSPAN = (int)CONFIG_T::col_span;
     constexpr unsigned Cin   = CONFIG_T::n_chan;
     constexpr unsigned NR    = CONFIG_T::rows_resident + 2;
@@ -257,6 +248,38 @@ void hex_lb_fused_step(
             win[i][CSPAN - 1][ic] = strip[i][ic];
         }
     }
+}
+
+// One iteration (r, c) of the fused traversal: read a pixel, advance the line
+// buffer and the window, emit the output pixel the window now holds (if any).
+// INLINE: it is the body of the loop in hex_lb_fused_loop below, which exists in
+// three versions that differ only by their pragmas.
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_step(
+    int r, int c,
+    hls::stream<data_T> &input,
+    ap_shift_reg<typename data_T::value_type, (int)CONFIG_T::in_width + CONFIG_T::dc_max>
+        line_sr[CONFIG_T::rows_resident + 1][CONFIG_T::n_chan],
+    typename data_T::value_type win[CONFIG_T::rows_resident + 2][CONFIG_T::col_span][CONFIG_T::n_chan],
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output
+) {
+    #pragma HLS INLINE
+    constexpr int      H     = (int)CONFIG_T::in_height;
+    constexpr int      W     = (int)CONFIG_T::in_width;
+    constexpr int      W_OUT = (int)CONFIG_T::out_width;
+    constexpr int      S     = (int)CONFIG_T::stride;
+    constexpr int      DRMAX = CONFIG_T::dr_max;
+    constexpr int      DCMAX = CONFIG_T::dc_max;
+    constexpr int      OH    = (int)CONFIG_T::out_height;
+    constexpr int      CSPAN = (int)CONFIG_T::col_span;
+    constexpr unsigned Cin   = CONFIG_T::n_chan;
+    constexpr unsigned NR    = CONFIG_T::rows_resident + 2;
+    typedef typename data_T::value_type dval;
+
+    // 1, 2. Read the pixel, push it down the line buffers, slide the window.
+    hex_lb_window_step<data_T, CONFIG_T>(r, c, input, line_sr, win);
 
     // 3. Emit the output pixel whose taps the window now holds. The
     //    read head is DCMAX columns past it, so its output column is
@@ -306,12 +329,10 @@ enum { HEX_LB_RESOURCE = 0, HEX_LB_LATENCY = 1, HEX_LB_LATENCY_SHARED = 2 };
 // HEX_LB_FRAMES_LOOP below.
 enum { HEX_LB_FRAMES = 3 };
 
-// How many adders a MAC pipelined at II=reuse_factor (> 1) may use, for the
-// `ALLOCATION operation instances=add` caps of HEX_LB_LATENCY_SHARED and of
-// hex_lb_mac_stream. A shared adder serves reuse_factor additions per pixel, so
-// the cap times reuse_factor must cover every addition of one pixel, or the loop
-// misses its II (measured: II=15 for a target of 4 when the cap was MAC_BLOCK
-// alone on a ring-shared layer). Per pixel there are
+// Adder budget of the MAC. Only `ring_adds` is still used (by the adder cap of
+// hex_lb_mac_stream_unrolled, reuse_factor 1). `shared` was the cap of the loops
+// pipelined at II=reuse_factor, which the folded loops replaced in 0.7.2; it is
+// kept for reference: per pixel there are
 //   * num_weight_rows*n_chan*n_filt accumulations of products  -> MAC_BLOCK per cycle,
 //   * n_filt `acc += part` per cycle                           -> n_filt,
 //   * (k - num_weight_rows)*n_chan ring sums of taps (share_neighbors only),
@@ -328,6 +349,15 @@ template <typename CONFIG_T> struct hex_lb_add_budget {
     static const unsigned shared = mac_block + CONFIG_T::n_filt +
                                    DIV_ROUNDUP(ring_adds, CONFIG_T::reuse_factor) + HEX_LB_ADD_MARGIN;
 };
+// The fused traversal with the MAC folded over reuse_factor cycles (defined after the tap
+// gathering it needs): see hex_lb_fused_folded.
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_folded(
+    hls::stream<data_T> &input,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output);
+
 #define HEX_LB_FUSED_STATE                                                            \
     constexpr int      C_TOTAL = (int)CONFIG_T::in_width + CONFIG_T::dc_max;          \
     constexpr unsigned NR      = CONFIG_T::rows_resident + 2;                         \
@@ -369,32 +399,10 @@ void hex_lb_fused_loop(
     std::integral_constant<int, HEX_LB_LATENCY_SHARED>
 ) {
     #pragma HLS INLINE
-    HEX_LB_FUSED_STATE
-    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
-    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
-    // Pipelining at II=reuse_factor unrolls the MAC's reuse loop: every product
-    // exists as an expression and the `mul` cap of the caller shares them onto
-    // MAC_BLOCK multipliers, but nothing shares the accumulation tree. Cap the
-    // additions too, as hex_lb_mac_stream does (it measured 265134 LUT of adders
-    // on a 19x16x32 layer at RF=16 without a cap). Measured here on an 8x8, 8->8
-    // layer (448 products) at RF=4: without the cap Vitis was still scheduling
-    // after 7 minutes and 11.6 GB; with it, 39 s and 0.5 GB.
-    // The cap is hex_lb_add_budget (see it), not MAC_BLOCK: at MAC_BLOCK the loop
-    // missed its II (5 instead of 4 on a 12x12, 4->4 layer, 9 on a ring-shared
-    // one). It lives in this function and not in the caller because an
-    // ALLOCATION pragma, even with a limit that binds nothing, changed the two
-    // other variants (reuse_factor 1: +10% LUT).
-    constexpr unsigned ADD_LIMIT = hex_lb_add_budget<CONFIG_T>::shared;
-    #pragma HLS ALLOCATION operation instances=add limit=ADD_LIMIT
-ReadRows:
-    for (int r = 0; r < R_TOTAL; r++) {
-    ReadCols:
-        for (int c = 0; c < C_TOTAL; c++) {
-            #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-            hex_lb_fused_step<data_T, w_T, b_T, res_T, CONFIG_T>(
-                r, c, input, line_sr, win, weights, bias, output);
-        }
-    }
+    // reuse_factor > 1 in the latency strategy: folded explicitly. Until 0.7.1 this loop was
+    // pipelined at II=reuse_factor with ALLOCATION caps that left the folding to Vitis, as the
+    // dataflow MAC process did; see hex_lb_mac_stream_folded for why that was replaced.
+    hex_lb_fused_folded<data_T, w_T, b_T, res_T, CONFIG_T>(input, weights, bias, output);
 }
 
 template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
@@ -474,17 +482,10 @@ void hex_lb_fused_loop(
     std::integral_constant<int, HEX_LB_FRAMES + HEX_LB_LATENCY_SHARED>
 ) {
     #pragma HLS INLINE
-    HEX_LB_FUSED_STATE
-    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
-    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
-    constexpr unsigned ADD_LIMIT = hex_lb_add_budget<CONFIG_T>::shared;  // see the 2D variant
-    #pragma HLS ALLOCATION operation instances=add limit=ADD_LIMIT
-    HEX_LB_FRAMES_COUNTERS
-Traverse:
-    for (int it = 0; it < (int)CONFIG_T::n_frames * R_TOTAL * C_TOTAL; it++) {
-        #pragma HLS PIPELINE II=CONFIG_T::reuse_factor
-        HEX_LB_FRAMES_STEP
-    }
+    // reuse_factor > 1 in the latency strategy: folded explicitly. Until 0.7.1 this loop was
+    // pipelined at II=reuse_factor with ALLOCATION caps that left the folding to Vitis, as the
+    // dataflow MAC process did; see hex_lb_mac_stream_folded for why that was replaced.
+    hex_lb_fused_folded<data_T, w_T, b_T, res_T, CONFIG_T>(input, weights, bias, output);
 }
 
 template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
@@ -505,9 +506,7 @@ Traverse:
         HEX_LB_FRAMES_STEP
     }
 }
-#undef HEX_LB_FRAMES_COUNTERS
-#undef HEX_LB_FRAMES_STEP
-#undef HEX_LB_FUSED_STATE
+// (HEX_LB_FUSED_STATE and the frame macros are still used by hex_lb_fused_folded, below.)
 
 template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
 void hex_conv_linebuffer_stream_fused(
@@ -546,7 +545,13 @@ void hex_conv_linebuffer_stream_fused(
     constexpr unsigned MAC_N_IN   = CONFIG_T::num_weight_rows * Cin;
     constexpr unsigned MAC_IN_PER = DIV_ROUNDUP(MAC_N_IN, CONFIG_T::reuse_factor);
     constexpr unsigned MAC_BLOCK  = MAC_IN_PER * CONFIG_T::n_filt;
-    #pragma HLS ALLOCATION operation instances=mul limit=MAC_BLOCK
+    // In the folded latency variant (reuse_factor > 1) the loop issues exactly MAC_BLOCK products
+    // per iteration by construction, and the cap must not bind: at MAC_BLOCK it also counted the
+    // small multiplications of the block indices (ir * IN_PER), could not be honoured at II=1
+    // (HLS 200-882) and the loop fell to II=2. Elsewhere the cap is what holds the products.
+    constexpr unsigned MUL_LIMIT =
+        (CONFIG_T::strategy == nnet::latency && CONFIG_T::reuse_factor > 1) ? 2 * MAC_BLOCK + 64 : MAC_BLOCK;
+    #pragma HLS ALLOCATION operation instances=mul limit=MUL_LIMIT
 
     // Weight storage is deliberately left unconstrained for RF > 1 -- measured,
     // not assumed. Iteration ir reads the contiguous slice
@@ -746,7 +751,10 @@ TapGather:
     }
 }
 
-// The MAC half: one output pixel per iteration, straight from the tap FIFO.
+// The MAC half at reuse_factor 1: one output pixel per iteration, straight from the tap FIFO.
+// (For reuse_factor > 1 see hex_lb_mac_stream_folded below, which replaced this process there:
+// the ALLOCATION-driven folding described in the comments of this function did not meet timing
+// after logic synthesis.)
 //
 // This is the old emit body, unchanged, in a loop of its own. That is the whole
 // point: it sees a flat trip count (N_OUT), no loop-carried state, and no index
@@ -760,7 +768,7 @@ TapGather:
 // docs/rom-investigation/attempt_fold_restructure.h.txt): there, reuse_factor
 // multiplied the cost of EVERY iteration, including the ~75% that emit nothing.
 template <class w_T, class b_T, class res_T, typename CONFIG_T, class dval>
-void hex_lb_mac_stream(
+void hex_lb_mac_stream_unrolled(
     hls::stream<nnet::array<dval, hex_tap_beats<CONFIG_T, dval>::SIZE>> &taps,
     w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
     b_T bias[CONFIG_T::n_filt],
@@ -836,6 +844,268 @@ MacPixels:
         }
         output.write(tok);
     }
+}
+
+// Ring fold of the taps of one pixel: K taps -> num_weight_rows sums per input channel (a rename
+// without weight sharing). Same operations as the head of hex_lb_pixel_mac_reuse.
+template <typename CONFIG_T, class dval>
+void hex_lb_ring_sums(
+    const dval t[CONFIG_T::k * CONFIG_T::n_chan],
+    typename CONFIG_T::ringsum_t ring_sum[CONFIG_T::num_weight_rows * CONFIG_T::n_chan]
+) {
+    #pragma HLS INLINE
+    typedef typename CONFIG_T::ringsum_t ring_T;
+    constexpr unsigned Cin  = CONFIG_T::n_chan;
+    constexpr unsigned N_IN = CONFIG_T::num_weight_rows * Cin;
+    ring_T rs[N_IN];
+    #pragma HLS ARRAY_PARTITION variable=rs complete
+    for (unsigned rc = 0; rc < N_IN; rc++) {
+        #pragma HLS UNROLL
+        rs[rc] = (ring_T)0;
+    }
+    for (unsigned ki = 0; ki < CONFIG_T::k; ki++) {
+        #pragma HLS UNROLL
+        const unsigned row = CONFIG_T::row_map[ki];
+        for (unsigned c = 0; c < Cin; c++) {
+            #pragma HLS UNROLL
+            rs[row * Cin + c] += (ring_T)t[ki * Cin + c];
+        }
+    }
+    for (unsigned rc = 0; rc < N_IN; rc++) {
+        #pragma HLS UNROLL
+        ring_sum[rc] = rs[rc];
+    }
+}
+
+// MAC iteration ir of one pixel, for the folded loops: block ir of the ring sums times its slice of
+// the weights, added to the accumulators (which start from the bias at ir == 0). `tok` receives the
+// accumulators cast to the output type; it is the pixel once ir == reuse_factor - 1. Same
+// operations, in the same order, as one iteration of the ReuseLoop of hex_lb_pixel_mac_reuse.
+template <class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_mac_block(
+    unsigned ir,
+    const typename CONFIG_T::ringsum_t ring_sum[CONFIG_T::num_weight_rows * CONFIG_T::n_chan],
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    typename CONFIG_T::accum_t acc[CONFIG_T::n_filt],
+    res_T &tok
+) {
+    #pragma HLS INLINE
+    typedef typename CONFIG_T::accum_t acc_T;
+    typedef typename CONFIG_T::ringsum_t ring_T;
+    constexpr unsigned Cout   = CONFIG_T::n_filt;
+    constexpr unsigned N_IN   = CONFIG_T::num_weight_rows * CONFIG_T::n_chan;
+    constexpr unsigned IN_PER = DIV_ROUNDUP(N_IN, CONFIG_T::reuse_factor);
+    // The products of this iteration are summed on their own, then added to acc once: the
+    // loop-carried path is a single adder.
+    acc_T part[Cout];
+    #pragma HLS ARRAY_PARTITION variable=part complete
+    for (unsigned o = 0; o < Cout; o++) {
+        #pragma HLS UNROLL
+        part[o] = (acc_T)0;
+    }
+    // The inputs and weights of iteration ir are read at the index ir * IN_PER + j, as in the
+    // ReuseLoop of hex_lb_pixel_mac_reuse. Do NOT replace this by an explicit reuse_factor:1
+    // selection over constant indices (`if (ir == r) w = weights[r * IN_PER + j ...]`): that form
+    // passed every C-simulation test and gave a WRONG RTL (constant outputs) in co-simulation
+    // with Vitis HLS 2024.2 (tests/smoke_cosim_dataflow.py --reuse 4,8), while this one passes.
+    for (unsigned j = 0; j < IN_PER; j++) {
+        #pragma HLS UNROLL
+        const unsigned in_idx = ir * IN_PER + j;
+        if (in_idx < N_IN) {  // only bites when RF does not divide N_IN
+            const ring_T s = ring_sum[in_idx];
+            for (unsigned o = 0; o < Cout; o++) {
+                #pragma HLS UNROLL
+                part[o] += (acc_T)CONFIG_T::template product<ring_T, w_T>::product(
+                    s, weights[in_idx * Cout + o]);
+            }
+        }
+    }
+    for (unsigned o = 0; o < Cout; o++) {
+        #pragma HLS UNROLL
+        const acc_T base = (ir == 0) ? (acc_T)bias[o] : acc[o];
+        acc[o] = base + part[o];
+        tok[o] = (typename res_T::value_type)acc[o];
+    }
+}
+
+// The fused kernel in the latency strategy with reuse_factor > 1: one loop pipelined at II=1 in
+// which an input token takes reuse_factor iterations. The first reads the pixel, moves the window
+// and, when this token emits an output pixel, forms its ring sums; the reuse_factor MAC iterations
+// (the first included) fold the products, and the last writes the pixel. Same rate as the loop it
+// replaces (pipelined at II=reuse_factor), for the 2D layers and for the frames of a 3D one.
+template <class data_T, class w_T, class b_T, class res_T, typename CONFIG_T>
+void hex_lb_fused_folded(
+    hls::stream<data_T> &input,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output
+) {
+    #pragma HLS INLINE
+    HEX_LB_FUSED_STATE
+    #pragma HLS ARRAY_PARTITION variable=line_sr complete dim=2
+    #pragma HLS ARRAY_PARTITION variable=win complete dim=0
+    HEX_LB_FRAMES_COUNTERS
+    constexpr unsigned Cin  = CONFIG_T::n_chan;
+    constexpr unsigned Cout = CONFIG_T::n_filt;
+    constexpr unsigned RF   = CONFIG_T::reuse_factor;
+    typename CONFIG_T::ringsum_t ring_sum[CONFIG_T::num_weight_rows * Cin];
+    #pragma HLS ARRAY_PARTITION variable=ring_sum complete
+    typename CONFIG_T::accum_t acc[Cout];
+    #pragma HLS ARRAY_PARTITION variable=acc complete
+    bool emitting = false;
+    ap_uint<hex_lb_bits(RF)> ir = 0;
+Traverse:
+    // Every token takes reuse_factor iterations, whether it emits a pixel or not. Letting a token
+    // that emits nothing take one iteration was tried and withdrawn: the counters then depend on
+    // `emitting`, which depends on the counters, and that loop of control (counters -> emit index
+    // -> emitting -> advance -> counters) has to close in one clock cycle. Vitis HLS estimated
+    // 6.1 ns for it at a 4 ns target, and with the clock given up there the operand selection in
+    // front of the multipliers was not registered: 4.2 to 4.9 ns after logic synthesis on 24-bit
+    // layers (delaying the MAC by one iteration did not help: 5.4 ns).
+    for (int it = 0; it < (int)CONFIG_T::n_frames * R_TOTAL * C_TOTAL * (int)RF; it++) {
+        #pragma HLS PIPELINE II=1
+        if (ir == 0) {
+            const int r = (int)r_count;
+            const int c = (int)c_count;
+            hex_lb_window_step<data_T, CONFIG_T>(r, c, input, line_sr, win);
+            int oh_emit, ow_emit;
+            emitting = hex_lb_emit_index<CONFIG_T>(r - 1 - CONFIG_T::dr_max, c - CONFIG_T::dc_max,
+                                                   oh_emit, ow_emit);
+            if (emitting) {
+                dval taps[CONFIG_T::k * Cin];
+                #pragma HLS ARRAY_PARTITION variable=taps complete
+                hex_lb_gather_taps<CONFIG_T, dval>(win, oh_emit, ow_emit, taps);
+                hex_lb_ring_sums<CONFIG_T, dval>(taps, ring_sum);
+            }
+        }
+        if (emitting) {
+            res_T tok;
+            PRAGMA_DATA_PACK(tok)
+            hex_lb_mac_block<w_T, b_T, res_T, CONFIG_T>((unsigned)ir, ring_sum, weights, bias, acc, tok);
+            if (ir == RF - 1) output.write(tok);
+        }
+        if (ir == RF - 1) {
+            ir = 0;
+            if (c_count == C_TOTAL - 1) {
+                c_count = 0;
+                if (r_count == R_TOTAL - 1) {
+                    r_count = 0;
+                } else {
+                    r_count = r_count + 1;
+                }
+            } else {
+                c_count = c_count + 1;
+            }
+        } else {
+            ir = ir + 1;
+        }
+    }
+}
+
+#undef HEX_LB_FRAMES_COUNTERS
+#undef HEX_LB_FRAMES_STEP
+#undef HEX_LB_FUSED_STATE
+
+// The MAC half for reuse_factor > 1: the products folded over reuse_factor cycles BY CONSTRUCTION.
+//
+// hex_lb_mac_stream_unrolled, pipelined at II=reuse_factor with ALLOCATION caps on the multipliers
+// and the adders, left the folding to the tool. Vitis met the caps by multiplexing operators, and
+// the multiplexed adders chained: after logic synthesis (Vivado 2024.2, out of context) the
+// critical path of a three-layer network at reuse_factor 8 was 14 to 56 ns for a 4 ns target, 33
+// to 158 logic levels, while Vitis HLS estimated 3.0 ns. Measured on HGQ-quantized networks and
+// on an ap_fixed<20,8> one; the single-loop kernel in the resource strategy, which folds
+// explicitly (hex_lb_pixel_mac_reuse), met the clock on the same networks.
+//
+// So this version folds explicitly too, and keeps the rate of one pixel per reuse_factor cycles:
+// ONE loop pipelined at II=1, in which a pixel takes STEPS = reuse_factor + COUNT - 1 iterations
+// (COUNT = beats of the tap pack, 1 for most layers). Step b < COUNT reads beat b; the last of
+// them also forms the ring sums; MAC iteration ir = step - (COUNT - 1) multiplies block ir of the
+// ring sums by its slice of the weights, exactly as the ReuseLoop of hex_lb_pixel_mac_reuse does,
+// and the last one writes the pixel. The loop-carried path is the accumulator: one adder.
+// Same arithmetic, in the same order, as hex_lb_pixel_mac_reuse: the outputs are bit-identical
+// (tests/test_hls_dataflow_csim.py).
+template <class w_T, class b_T, class res_T, typename CONFIG_T, class dval>
+void hex_lb_mac_stream_folded(
+    hls::stream<nnet::array<dval, hex_tap_beats<CONFIG_T, dval>::SIZE>> &taps,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output
+) {
+    typedef typename CONFIG_T::accum_t acc_T;
+    typedef typename CONFIG_T::ringsum_t ring_T;
+    typedef hex_tap_beats<CONFIG_T, dval> TB;
+    constexpr unsigned Cin    = CONFIG_T::n_chan;
+    constexpr unsigned Cout   = CONFIG_T::n_filt;
+    constexpr unsigned N_IN   = CONFIG_T::num_weight_rows * Cin;
+    constexpr unsigned RF     = CONFIG_T::reuse_factor;
+    constexpr unsigned N_OUT  = CONFIG_T::n_frames * CONFIG_T::out_height * CONFIG_T::out_width;
+    constexpr unsigned STEPS  = RF + TB::COUNT - 1;
+
+    #pragma HLS ARRAY_PARTITION variable=bias complete
+    #pragma HLS FUNCTION_INSTANTIATE variable=weights,bias
+
+    dval t[TB::COUNT * TB::SIZE];  // the taps of the current pixel, filled beat by beat
+    #pragma HLS ARRAY_PARTITION variable=t complete
+    ring_T ring_sum[N_IN];         // held for the reuse_factor MAC iterations of the pixel
+    #pragma HLS ARRAY_PARTITION variable=ring_sum complete
+    acc_T acc[Cout];
+    #pragma HLS ARRAY_PARTITION variable=acc complete
+    ap_uint<hex_lb_bits(STEPS)> step = 0;
+
+MacSteps:
+    for (unsigned it = 0; it < N_OUT * STEPS; it++) {
+        #pragma HLS PIPELINE II=1
+        if (step < TB::COUNT) {
+            nnet::array<dval, TB::SIZE> beat = taps.read();
+            for (unsigned b = 0; b < TB::COUNT; b++) {
+                #pragma HLS UNROLL
+                for (unsigned i = 0; i < TB::SIZE; i++) {
+                    #pragma HLS UNROLL
+                    if (step == b) t[b * TB::SIZE + i] = beat[i];
+                }
+            }
+        }
+        if (step == TB::COUNT - 1) {
+            hex_lb_ring_sums<CONFIG_T, dval>(t, ring_sum);
+        }
+        if (step >= TB::COUNT - 1) {
+            const unsigned ir = (unsigned)step - (TB::COUNT - 1);
+            res_T tok;
+            PRAGMA_DATA_PACK(tok)
+            hex_lb_mac_block<w_T, b_T, res_T, CONFIG_T>(ir, ring_sum, weights, bias, acc, tok);
+            if (ir == RF - 1) output.write(tok);
+        }
+        if (step == STEPS - 1) {
+            step = 0;
+        } else {
+            step = step + 1;
+        }
+    }
+}
+
+// Which MAC process a layer gets: the unrolled one at reuse_factor 1, the folded one above it.
+template <class w_T, class b_T, class res_T, typename CONFIG_T, class dval>
+void hex_lb_mac_stream(
+    hls::stream<nnet::array<dval, hex_tap_beats<CONFIG_T, dval>::SIZE>> &taps,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output,
+    std::true_type  // reuse_factor == 1
+) {
+    #pragma HLS INLINE
+    hex_lb_mac_stream_unrolled<w_T, b_T, res_T, CONFIG_T, dval>(taps, weights, bias, output);
+}
+template <class w_T, class b_T, class res_T, typename CONFIG_T, class dval>
+void hex_lb_mac_stream(
+    hls::stream<nnet::array<dval, hex_tap_beats<CONFIG_T, dval>::SIZE>> &taps,
+    w_T weights[CONFIG_T::num_weight_rows * CONFIG_T::n_chan * CONFIG_T::n_filt],
+    b_T bias[CONFIG_T::n_filt],
+    hls::stream<res_T> &output,
+    std::false_type  // reuse_factor > 1
+) {
+    #pragma HLS INLINE
+    hex_lb_mac_stream_folded<w_T, b_T, res_T, CONFIG_T, dval>(taps, weights, bias, output);
 }
 
 // The line-buffer half: streams the image in, emits one tap pack per output
@@ -1082,7 +1352,8 @@ void hex_conv_linebuffer_stream_dataflow(
 #endif
 
     hex_lb_window_stream<data_T, CONFIG_T>(input, taps);
-    hex_lb_mac_stream<w_T, b_T, res_T, CONFIG_T, dval>(taps, weights, bias, output);
+    hex_lb_mac_stream<w_T, b_T, res_T, CONFIG_T, dval>(
+        taps, weights, bias, output, std::integral_constant<bool, CONFIG_T::reuse_factor == 1>());
 }
 
 

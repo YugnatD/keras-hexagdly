@@ -102,13 +102,18 @@ void hex_lb_pixel_max(
     constexpr unsigned C = CONFIG_T::n_chan;
     for (unsigned c = 0; c < C; c++) {
         #pragma HLS UNROLL
-        dval acc = taps[c];  // slot 0
-        for (unsigned ki = 1; ki < CONFIG_T::k; ki++) {
+        // Balanced tree (hls4ml's nnet::reduce), not a running max: a chain of k - 1
+        // compare-selects is k - 1 levels deep, and since the window moves every cycle each tap
+        // still waiting for its comparison is carried in pipeline registers -- registers that
+        // grow as k^2 / 2 (0.7.1, k = 7, 16 channels of 24 bits: 16 657 FF for a 4 608-bit window).
+        dval column[CONFIG_T::k];
+        #pragma HLS ARRAY_PARTITION variable=column complete
+        for (unsigned ki = 0; ki < CONFIG_T::k; ki++) {
             #pragma HLS UNROLL
-            const dval v = taps[ki * C + c];
-            acc = (v > acc) ? v : acc;
+            column[ki] = taps[ki * C + c];
         }
-        res_out[c] = (rval)acc;
+        nnet::Op_max<dval> op_max;
+        res_out[c] = (rval)nnet::reduce<dval, CONFIG_T::k, nnet::Op_max<dval>>(column, op_max);
     }
 }
 

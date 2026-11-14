@@ -1056,12 +1056,13 @@ def check_hls_config(config, model, io_type="io_stream", allow_unvalidated=False
         # the Dataflow kernel has one implementation: it does not read the strategy
         if is_2d and strat == "latency" and rf > 1 and not dataflow:
             issues.append(
-                f"{layer.name}: Strategy='Latency' with ReuseFactor={rf} pipelines the per-pixel "
-                f"loop and shares its {products} products back onto {mac_block} multipliers. That "
-                "is faster than Strategy='Resource' (about 3x on plain layers at ReuseFactor=4) "
-                "but the sharing is paid in LUT: measured 1.75x on a 64-product layer and 2.7x "
-                "on a 448-product one, and not measured beyond. 'Latency' is hls4ml's default: "
-                "set Strategy='Resource' on this layer (hex_reuse_config does) for the smallest "
+                f"{layer.name}: Strategy='Latency' with ReuseFactor={rf} folds its {products} "
+                f"products onto {mac_block} multipliers in one pipelined loop: {rf} cycles per "
+                "output pixel (since 0.7.2; before, the folding was left to the HLS tool and did "
+                "not meet timing after logic synthesis). Strategy='Resource' is slower (the loop "
+                "waits for the "
+                "multiply-accumulate) and smaller; 'Latency' is hls4ml's default: set "
+                "Strategy='Resource' on this layer (hex_reuse_config does) for the smallest "
                 "hardware."
             )
         if mac_block > _MAX_MAC_BLOCK:

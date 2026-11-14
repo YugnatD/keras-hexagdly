@@ -1042,6 +1042,13 @@ class HexPoolLineBuffer3DHandler(KerasV3LayerHandler):
     handles = ("keras_hexagdly.hex_gather.HexPoolLineBuffer3D",)
 
     def handle(self, layer, in_tensors, out_tensors):
+        raise NotImplementedError(
+            "HexPoolLineBuffer3D is the single-layer 3D export of the first versions. It is no "
+            "longer produced by patch_model_for_hls, was never validated by a synthesis and its "
+            "kernel leaves the folding of the reuse factor to the HLS tool, which does not meet "
+            "timing (see the 0.7.2 changelog). Convert the Keras 3D layer with "
+            "patch_model_for_hls instead: it exports a depth stage followed by the 2D kernel."
+        )
         from keras_hexagdly.indexed import build_parity_offset_tables
 
         in_shape = list(in_tensors[0].shape[1:])  # (D_in, H, W, C)
@@ -1200,6 +1207,13 @@ class HexConvLineBuffer3DHandler(KerasV3LayerHandler):
     handles = ("keras_hexagdly.hex_gather.HexConvLineBuffer3D",)
 
     def handle(self, layer, in_tensors, out_tensors):
+        raise NotImplementedError(
+            "HexConvLineBuffer3D is the single-layer 3D export of the first versions. It is no "
+            "longer produced by patch_model_for_hls, was never validated by a synthesis and its "
+            "kernel leaves the folding of the reuse factor to the HLS tool, which does not meet "
+            "timing (see the 0.7.2 changelog). Convert the Keras 3D layer with "
+            "patch_model_for_hls instead: it exports a depth stage followed by the 2D kernel."
+        )
         from keras_hexagdly.indexed import build_parity_offset_tables
 
         in_shape = list(in_tensors[0].shape[1:])  # (D_in, H, W, Cin)

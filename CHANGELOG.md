@@ -3,6 +3,78 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.2] - 2026-11-14
+
+Hardware only: the Keras layers are unchanged, and so is the firmware of the convolutions at
+`ReuseFactor` 1. Every hardware figure below is from Vitis HLS 2024.2 followed by Vivado 2024.2 logic
+synthesis (out of context, xc7k160t-2, 4 ns target, no place and route), which the earlier versions
+were never given: their timing figures were Vitis HLS estimates.
+
+### Fixed
+
+- **`ReuseFactor` > 1 did not meet timing after logic synthesis, in the `Dataflow` kernel and in the fused
+  kernel with `Strategy='Latency'`.** Both unrolled the arithmetic of a pixel in a loop pipelined at
+  II = `ReuseFactor` and left the folding to Vitis, through `ALLOCATION` caps on the multipliers and the
+  adders. Vitis met the caps by multiplexing operators, and the multiplexed adders chained. Vitis HLS
+  estimated 3.0 to 3.4 ns; Vivado found critical paths of 14 to 60 ns, 33 to 158 logic levels, on a
+  three-layer network (27x27, 8/16/16 filters, one-ring kernels) at `ReuseFactor` 8: `Dataflow`, 14.3 ns
+  ring-shared and 55.9 ns unshared with HGQ2 types, 35.3 ns ring-shared in `ap_fixed<20,8>`; fused
+  `Latency`, 59.8 ns unshared with HGQ2 types. The fused kernel with `Strategy='Resource'`, and both
+  kernels at `ReuseFactor` 1, met the clock on the same networks.
+  The two kernels now fold explicitly (`hex_lb_mac_stream_folded`, `hex_lb_fused_folded`, sharing
+  `hex_lb_ring_sums` and `hex_lb_mac_block`): one loop pipelined at II = 1 in which a pixel takes
+  `ReuseFactor` iterations, each multiplying one block of inputs by its slice of the weights as the
+  `ReuseLoop` of the `Resource` kernel does; the loop-carried path is one adder. Same rate, same
+  arithmetic in the same order: bit-identical outputs. Same networks after the change: 3.98 ns (ring,
+  HGQ2, `Dataflow`), 4.17 ns (unshared, HGQ2, `Dataflow`) and 4.73 ns (unshared, HGQ2, fused `Latency`),
+  the critical path being in the Dense layer of hls4ml in the last two, and 2.90 ns (ring,
+  `ap_fixed<20,8>`, `Dataflow`); latency unchanged (5870 to 5887 cycles for 729 pixels in `Dataflow`,
+  6541 against 6528 fused). Resources move both ways, since the products are real multiplications again
+  instead of shift-and-add networks shared by the tool: `ap_fixed<20,8>` ring 47 143 -> 29 239 LUT and
+  304 -> 200 DSP; HGQ2 unshared 25 813 -> 25 517 LUT and 105 -> 366 DSP. `ReuseFactor` 1 keeps the
+  previous processes.
+- **Max pooling: the reduction over the cells was a chain of compare-selects.** It met timing, but each
+  tap waiting for its comparison was carried in pipeline registers, which grew as k^2 / 2 (k = 7,
+  16 channels of 24 bits: 16 657 FF for a window of 4 608 bits). It is now a balanced tree
+  (hls4ml's `nnet::reduce`).
+- **The single-layer 3D export of the first versions (`HexConvLineBuffer3D`, `HexPoolLineBuffer3D`) is
+  refused at conversion.** `patch_model_for_hls` has not produced it since 0.7.1, no test covered it, and
+  its kernels carried the tool-driven folding above and a frame buffer read at computed addresses in a
+  loop meant for II = 1. The classes remain; converting them raises with the way to convert a 3D layer.
+
+### Added
+
+- **`benchmarks/synth_audit/`: a synthesis audit of the kernels.** 81 configurations of a small layer
+  (12x12, 4 -> 8 channels, `ap_fixed<24,12>`: one and two rings, strides 1 and 2, the four sharing
+  modes, both kernels and both strategies, `ReuseFactor` 1 to 8, max pooling, 3D layers) through C
+  simulation against Keras, Vitis HLS, RTL co-simulation against the C simulation, and Vivado logic
+  synthesis. The two stages can run on different machines (`--stage hls`, `--stage vivado`). Result on
+  this version: C simulation equal to Keras and RTL equal to the C simulation in the 79 cases that
+  export (`AvgPool2d` has no export), and the 4 ns clock met after logic synthesis in all of them (longest critical path 3.74 ns).
+- `tests/test_hls_dataflow_csim.py`: four cases for the folded loops (ring and diag sharing, a reuse
+  factor that does not divide the number of inputs, `ReuseFactor` 8).
+
+### Changed
+
+- `check_hls_config`: the message for `Strategy='Latency'` with `ReuseFactor` > 1 describes the folded
+  loop instead of the tool-driven sharing and its LUT cost.
+
+### What the audit taught, and what is left
+
+- A C simulation cannot validate a change of these kernels. Two rewritings of the folded loops that were
+  equivalent in C and passed every bit-exact test were withdrawn: an explicit `ReuseFactor`:1 selection
+  of the inputs and weights gave a wrong RTL (constant outputs) in co-simulation with Vitis HLS 2024.2,
+  and letting an input pixel that emits nothing take one iteration instead of `ReuseFactor` closed a
+  loop of control that did not meet timing (4.2 to 4.9 ns on the audit layers). Comments in the code say
+  so where the temptation is.
+- Vitis HLS over-estimated the LUT of the audit layers by a factor of 1.4 to 2.9 (median 1.8), and its
+  clock estimate missed the defect above entirely. Figures quoted in this file and in the README for
+  earlier versions are Vitis HLS estimates unless they name Vivado.
+- Not changed, noted for later: `MaxPool3d` buffers its frames before the hexagonal pooling instead of
+  after it (stride^2 more memory); every kernel keeps one line-buffer row more than its taps need; the
+  tap FIFO of the `Dataflow` kernel is deeper than useful at stride 1; the `io_parallel` kernel still
+  leaves the folding of `ReuseFactor` > 1 to the tool (it is only reachable with `allow_unvalidated`).
+
 ## [0.7.1] - 2026-11-13
 
 Fixes from four audits of the code (bugs and performance), with regression tests

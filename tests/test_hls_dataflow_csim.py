@@ -89,6 +89,12 @@ def test_dataflow_is_ignored_with_a_warning_under_io_parallel(tmp_path):
         (2, 1, False, 1, 7, 6),
         (1, 2, "ring", 1, 7, 6),
         (2, 2, False, 3, 13, 12),  # the strided 19-cell kernel needs a larger grid
+        # reuse_factor > 1 takes the folded MAC process (hex_lb_mac_stream_folded): with ring
+        # sums, with a reuse factor that does not divide the number of inputs, and at 8
+        (1, 1, "ring", 4, 7, 6),
+        (2, 1, "ring", 3, 9, 8),
+        (1, 1, False, 5, 7, 6),
+        (1, 1, "diag", 8, 7, 6),
     ],
 )
 def test_dataflow_and_fused_kernels_agree(

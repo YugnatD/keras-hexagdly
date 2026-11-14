@@ -437,6 +437,11 @@ RTL co-simulation on a small network, with and without `share_neighbors="ring"`,
 C result like the fused kernel does (`tests/smoke_cosim_dataflow.py`, needs Vitis HLS). A C simulation
 only predicts the RTL while no type overflows: keep the types wide enough.
 
+With `ReuseFactor` > 1 the MAC process folds its products explicitly over `ReuseFactor` cycles (since
+0.7.2; before, the folding was left to Vitis and the result did not meet timing after logic synthesis,
+see the changelog). Resource figures of this README for `Dataflow` with `ReuseFactor` > 1 were measured
+with the earlier process.
+
 ### Supported scope
 
 **`io_stream` is the supported path**, for the 2D layers (`Conv2d`, `MaxPool2d`).

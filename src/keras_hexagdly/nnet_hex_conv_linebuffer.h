@@ -107,9 +107,9 @@ struct hex_conv_linebuffer_config {
 
     // Compute strategy (nnet::latency | nnet::resource), mirroring hls4ml's own
     // conv_2d_buffer_cl. In io_stream it decides whether the per-pixel loop is
-    // pipelined at II=reuse_factor (latency: everything unrolled) or left
-    // unpipelined with a single time-shared emit instance whose MAC is
-    // reuse-folded (resource). Ignored by the io_parallel kernel below.
+    // pipelined (latency: one pixel per reuse_factor cycles) or left unpipelined
+    // with a single time-shared emit instance whose MAC is reuse-folded
+    // (resource). Ignored by the io_parallel kernel below.
     static const unsigned strategy = nnet::latency;
 
     // io_stream only: run the line buffer and the MAC as two concurrent dataflow
