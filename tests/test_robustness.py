@@ -59,6 +59,20 @@ def test_the_neighbor_table_does_not_depend_on_the_dtype_policy():
         np.testing.assert_array_equal(got, expected)
 
 
+def test_the_neighbor_table_is_measured_without_a_convolution(monkeypatch):
+    """The table holds pixel numbers: it is read by indexing, not through a float convolution
+    (which, in the CI of 0.7.2, once returned a number that was not in its input). Pooling
+    layers here: for a convolution layer the output shape is taken from a forward pass."""
+
+    def no_convolution(*args, **kwargs):
+        raise AssertionError("build_neighbor_table went through keras.ops.conv")
+
+    monkeypatch.setattr(keras.ops, "conv", no_convolution)
+    for kernel, stride, grid in ((3, 1, (3, 1)), (3, 1, (4, 2)), (1, 2, (7, 6)), (2, 3, (9, 8))):
+        table = build_neighbor_table(hgly.MaxPool2d(kernel, stride), *grid)[0]
+        assert table.min() >= -1 and table.max() < grid[0] * grid[1]
+
+
 @pytest.mark.parametrize("kernel", [0, 1, 2, 3])
 @pytest.mark.parametrize("stride", [1, 2, 3])
 @pytest.mark.parametrize("height, width", [(3, 1), (4, 2), (5, 5), (7, 6), (9, 8)])

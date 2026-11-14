@@ -60,8 +60,41 @@ def _cell_list(kernel_size):
     return cells
 
 
+class _TapSelectProcess:
+    """What a convolution with a one-hot kernel computes, by indexing instead of convolving.
+
+    A sub-kernel of the probe is zero everywhere or one at a single cell (a, b); the valid
+    convolution of the padded input with it is then the input read at that cell of every window:
+    ``input[:, a * dh :: sh, b * dw :: sw]`` cut to the output size, or zeros. The neighbor table
+    is a table of integers, and this way no floating-point convolution stands between the pixel
+    numbers and it. (The convolution did: in the CI of 0.7.2, on one of nine jobs, a probe on a
+    3x1 grid returned 3310 where its input held 1 to 3, a value of an earlier, larger probe. It
+    was not reproduced elsewhere, and the max pooling, which is made of the same slices, was right
+    on the same machine.)
+    """
+
+    def __call__(self, input, kernel, dilation=None, stride=None, bias=None):
+        weights = np.asarray(keras.ops.convert_to_numpy(kernel))[
+            :, :, 0, 0
+        ]  # (kh, kw), in = out = 1
+        kh, kw = weights.shape
+        dh, dw = (1, 1) if dilation is None else (int(dilation[0]), int(dilation[1]))
+        sh, sw = (1, 1) if stride is None else (int(stride[0]), int(stride[1]))
+        out_h = (int(input.shape[1]) - (kh - 1) * dh - 1) // sh + 1
+        out_w = (int(input.shape[2]) - (kw - 1) * dw - 1) // sw + 1
+        hits = np.argwhere(weights != 0)
+        if len(hits) == 0 or out_h <= 0 or out_w <= 0:
+            return keras.ops.zeros(
+                (input.shape[0], max(out_h, 0), max(out_w, 0), 1), dtype=input.dtype
+            )
+        ((a, b),) = hits
+        return input[:, a * dh :: sh, b * dw :: sw, :][:, :out_h, :out_w, :]
+
+
 def _probe_layer(kernel_size, stride, i_active, r_active, c_active):
-    """Return a Conv2d_CustomKernel with weight=1.0 ONLY at cell (i,r,c)."""
+    """Return a Conv2d_CustomKernel with weight=1.0 ONLY at cell (i,r,c), whose convolutions are
+    done by indexing (_TapSelectProcess): it goes through the padding, slicing and stride
+    arithmetic of the layers, which is what the table measures, without their arithmetic."""
     n = kernel_size
     sub_kernels = []
     for ii in range(n + 1):
@@ -73,7 +106,9 @@ def _probe_layer(kernel_size, stride, i_active, r_active, c_active):
         sub_kernels.append(sk)
     # float32 whatever the global dtype policy: the probe carries pixel indices as
     # values (see build_neighbor_table), which float16 cannot hold beyond 2048.
-    return Conv2d_CustomKernel(sub_kernels=sub_kernels, strides=stride, bias=None, dtype="float32")
+    probe = Conv2d_CustomKernel(sub_kernels=sub_kernels, strides=stride, bias=None, dtype="float32")
+    probe.process = _TapSelectProcess()
+    return probe
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +181,15 @@ def build_neighbor_table(layer, H, W):
         # Nonzero (≥0.5) output: the value is the contributing flat input index +1.
         # Zero: this slot is zero-padded (border), leave as -1.
         neighbor_idx[:, k_idx] = np.where(out_flat > 0.5, np.rint(out_flat) - 1, -1)
+
+    # A table entry is -1 or the number of an input pixel: anything else means the backend
+    # returned a value the probe did not put in, and a model exported from it would be wrong.
+    if neighbor_idx.min() < -1 or neighbor_idx.max() >= H * W:
+        raise RuntimeError(
+            f"build_neighbor_table: the probe of a {H}x{W} grid returned pixel numbers outside "
+            f"[0, {H * W}) (from {int(neighbor_idx.min())} to {int(neighbor_idx.max())}). "
+            "The backend gave a wrong result; nothing can be exported from this table."
+        )
 
     return neighbor_idx, cells, (H_out, W_out)
 

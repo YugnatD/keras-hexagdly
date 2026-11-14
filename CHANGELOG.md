@@ -33,6 +33,18 @@ were never given: their timing figures were Vitis HLS estimates.
   instead of shift-and-add networks shared by the tool: `ap_fixed<20,8>` ring 47 143 -> 29 239 LUT and
   304 -> 200 DSP; HGQ2 unshared 25 813 -> 25 517 LUT and 105 -> 366 DSP. `ReuseFactor` 1 keeps the
   previous processes.
+- **`build_neighbor_table` no longer measures the table through a floating-point convolution.** The table
+  (which `patch_model_for_hls` exports from) was read by sending the pixel numbers through a convolution
+  with a one-hot kernel. In the CI of this version, on one job of nine (Python 3.10, PyTorch 2.14.1, CPU),
+  such a probe twice returned a number that was not in its input: 3310 on a 3x1 grid in one run, a wrong
+  neighbour on a 4x2 grid in another, both with a kernel of three rings. It could not be reproduced on
+  two other machines with the same packages, and the max pooling, made of the same slices, was right on
+  the failing machine. A convolution with a one-hot kernel is a shifted read of its input: the probe now
+  does that read by indexing (`_TapSelectProcess`), through the same padding, slicing and stride
+  arithmetic, with no arithmetic on the values. The tables are identical to the former ones on 216
+  configurations (0 to 3 rings, strides 1 to 3, nine grid sizes, pooling and convolution) with PyTorch,
+  and on 36 with TensorFlow and with JAX. A table that holds a pixel number outside the grid now raises
+  instead of being exported.
 - **Max pooling: the reduction over the cells was a chain of compare-selects.** It met timing, but each
   tap waiting for its comparison was carried in pipeline registers, which grew as k^2 / 2 (k = 7,
   16 channels of 24 bits: 16 657 FF for a window of 4 608 bits). It is now a balanced tree
